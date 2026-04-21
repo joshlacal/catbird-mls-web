@@ -82,6 +82,19 @@ pub struct WasmMLSContext {
     groups: RefCell<HashMap<Vec<u8>, MlsGroup>>,
     /// Cached signing keys: identity bytes → SignatureKeyPair.
     signers: RefCell<HashMap<Vec<u8>, SignatureKeyPair>>,
+    /// Task #56: receiver-side staged commits awaiting explicit merge.
+    ///
+    /// Keyed by `(group_id, target_epoch)`. Populated by `decrypt_message`
+    /// when a `StagedCommitMessage` is received; drained by
+    /// `merge_incoming_commit` (applies the commit and advances the local
+    /// epoch) or `discard_incoming_commit` (drops the entry, epoch is left
+    /// unchanged).
+    ///
+    /// Mirrors the `MLSContext::pending_incoming_merges` map in
+    /// `catbird-mls/src/api.rs` (task #33) so that the WASM client matches
+    /// the explicit stage/merge contract rather than auto-merging inside
+    /// `decrypt_message`.
+    pending_incoming_merges: RefCell<HashMap<(Vec<u8>, u64), StagedCommit>>,
 }
 
 impl WasmMLSContext {
@@ -102,6 +115,7 @@ impl WasmMLSContext {
             provider: WasmOpenMlsProvider { crypto, storage },
             groups: RefCell::new(HashMap::new()),
             signers: RefCell::new(HashMap::new()),
+            pending_incoming_merges: RefCell::new(HashMap::new()),
         })
     }
 
@@ -119,6 +133,7 @@ impl WasmMLSContext {
             provider: WasmOpenMlsProvider { crypto, storage },
             groups: RefCell::new(HashMap::new()),
             signers: RefCell::new(HashMap::new()),
+            pending_incoming_merges: RefCell::new(HashMap::new()),
         })
     }
 
@@ -473,6 +488,95 @@ impl WasmMLSContext {
     }
 
     // ------------------------------------------------------------------
+    // Receiver-side staged commits (task #56)
+    //
+    // `decrypt_message` stages incoming commits in `pending_incoming_merges`
+    // rather than auto-merging. Callers (see lib.rs and websocket.rs receive
+    // paths) must explicitly call one of the two methods below to advance
+    // the local epoch (`merge_incoming_commit`) or abandon the staged
+    // commit (`discard_incoming_commit`).
+    // ------------------------------------------------------------------
+
+    /// Merge any incoming staged commit currently pending for `group_id`.
+    ///
+    /// Returns the new (post-merge) local epoch. If multiple staged commits
+    /// are pending for the same group (e.g. rapid back-to-back commits from
+    /// different senders), they are merged in ascending target-epoch order.
+    ///
+    /// Returns `InvalidInput("no pending staged commit …")` if no staged
+    /// commit exists for the group — callers that saw a "commit message"
+    /// signal from `decrypt_message` should always have a match here unless
+    /// another caller already merged it.
+    pub(crate) fn merge_incoming_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+        // Pop the lowest-epoch entry for this group.
+        let (key, staged) = {
+            let mut pending = self.pending_incoming_merges.borrow_mut();
+            let key_opt = pending
+                .keys()
+                .filter(|(gid, _)| gid == &group_id)
+                .min_by_key(|(_, epoch)| *epoch)
+                .cloned();
+            match key_opt {
+                Some(k) => {
+                    let staged = pending.remove(&k).expect("just located");
+                    (k, staged)
+                }
+                None => {
+                    return Err(MLSError::invalid_input(format!(
+                        "no pending staged commit for group {} (not staged, or already merged/discarded)",
+                        base64::engine::general_purpose::STANDARD.encode(&group_id),
+                    )));
+                }
+            }
+        };
+
+        self.ensure_loaded(&group_id)?;
+        let mut groups = self.groups.borrow_mut();
+        let group = groups
+            .get_mut(&group_id)
+            .expect("ensure_loaded guarantees presence");
+
+        let epoch_before = group.epoch().as_u64();
+        group
+            .merge_staged_commit(&self.provider, staged)
+            .map_err(|e| MLSError::OpenMLS(format!("merge_staged_commit: {e:?}")))?;
+        let epoch_after = group.epoch().as_u64();
+
+        if epoch_after <= epoch_before {
+            web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[catbird-mls-web] ⚠️ merge_incoming_commit did not advance epoch for group {} (key epoch {}): {} -> {}",
+                base64::engine::general_purpose::STANDARD.encode(&group_id),
+                key.1,
+                epoch_before,
+                epoch_after,
+            )));
+        }
+
+        Ok(epoch_after)
+    }
+
+    /// Discard any pending staged commits for `group_id` without advancing
+    /// the local epoch. Idempotent — no-op if nothing is staged.
+    ///
+    /// Use this when recovery policy decides the staged commit should not
+    /// be applied (e.g. a fork/reset is being initiated and the client is
+    /// about to rejoin).
+    pub(crate) fn discard_incoming_commit(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        let mut pending = self.pending_incoming_merges.borrow_mut();
+        let before = pending.len();
+        pending.retain(|(gid, _), _| gid != &group_id);
+        let dropped = before - pending.len();
+        if dropped > 0 {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[catbird-mls-web] 🗑️ discard_incoming_commit: dropped {} staged commit(s) for group {}",
+                dropped,
+                base64::engine::general_purpose::STANDARD.encode(&group_id),
+            )));
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Group state queries
     // ------------------------------------------------------------------
 
@@ -718,10 +822,20 @@ impl WasmMLSContext {
             }),
 
             ProcessedMessageContent::StagedCommitMessage(commit) => {
-                // Auto-merge commits from other members.
-                group
-                    .merge_staged_commit(&self.provider, *commit)
-                    .map_err(|e| MLSError::OpenMLS(format!("merge_staged_commit: {e:?}")))?;
+                // Task #56: stage the incoming commit instead of auto-merging.
+                // Callers (`catbird_mls_fetch_new_messages`, the WebSocket loop)
+                // must explicitly invoke `merge_incoming_commit(group_id, target_epoch)`
+                // to advance the local epoch, or `discard_incoming_commit(...)` to
+                // abandon it. Mirrors the `MLSContext::decrypt_message` behavior in
+                // `catbird-mls/src/api.rs` under task #33.
+                //
+                // The error variant below is preserved verbatim — existing lib.rs
+                // and websocket.rs callers pattern-match on the "commit message"
+                // substring to distinguish control traffic from decrypt failures.
+                let target_epoch = commit.group_context().epoch().as_u64();
+                self.pending_incoming_merges
+                    .borrow_mut()
+                    .insert((group_id.clone(), target_epoch), *commit);
 
                 Err(MLSError::invalid_input(
                     "received a commit message (not application data)",

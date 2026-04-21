@@ -294,7 +294,7 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                             return None;
                         }
                     };
-                    match ctx.decrypt_message(gid, ct.clone()) {
+                    match ctx.decrypt_message(gid.clone(), ct.clone()) {
                         Ok(res) if !res.plaintext.is_empty() => {
                             use catbird_mls::orchestrator::types::MLSMessagePayload;
                             let (text, payload_json) = match MLSMessagePayload::decode(&res.plaintext) {
@@ -336,7 +336,26 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                                 sender,
                             ))
                         }
-                        Ok(_) => None, // commit/control message — epoch advanced
+                        Ok(_) => None, // empty plaintext (non-commit) — nothing to display
+                        Err(catbird_mls::MLSError::InvalidInput { ref message })
+                            if message.contains("commit message") =>
+                        {
+                            // Task #56: commit is staged in `pending_incoming_merges`;
+                            // drive the explicit merge so the local epoch advances.
+                            if let Err(e) = ctx.merge_incoming_commit(gid) {
+                                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                                    "[catmos-ws] merge_incoming_commit failed: {:?}",
+                                    e
+                                )));
+                            }
+                            None
+                        }
+                        Err(catbird_mls::MLSError::InvalidInput { ref message })
+                            if message.contains("proposal") =>
+                        {
+                            // Proposals never stage a commit; just skip.
+                            None
+                        }
                         Err(ref e) => {
                             let err_str = format!("{:?}", e);
                             if err_str.contains("CannotDecryptOwnMessage") {

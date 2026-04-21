@@ -1799,7 +1799,19 @@ pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue,
                                 if message.contains("commit message")
                                     || message.contains("proposal") =>
                             {
-                                // Commit/proposal was auto-merged — not a user message
+                                // Task #56: commit/proposal messages no longer auto-merge inside
+                                // `decrypt_message`. For commits, the staged commit is sitting in
+                                // `pending_incoming_merges`; drive the explicit merge here so the
+                                // local epoch advances. Proposals don't stage anything, so skip.
+                                if message.contains("commit message") {
+                                    if let Err(e) = ctx.merge_incoming_commit(gid.clone()) {
+                                        web_sys::console::warn_1(&js_err!(
+                                            "catbird-mls-web: merge_incoming_commit failed for msg {}: {:?}",
+                                            msg_id,
+                                            e
+                                        ));
+                                    }
+                                }
                                 return None;
                             }
                             Err(ref e) => {

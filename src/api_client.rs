@@ -13,6 +13,7 @@ use catbird_atproto::jacquard_common::IntoStatic;
 use reqwest::Client;
 use std::sync::RwLock;
 
+use catbird_atproto::blue_catbird::mlsChat::commit_group_change::CommitGroupChange;
 use catbird_atproto::catbird::mls_chat as lexicon;
 use catbird_atproto::types::string::{Datetime, Did};
 use catbird_mls::orchestrator::api_client::MLSAPIClient;
@@ -208,6 +209,47 @@ fn parse_conversation(c: &lexicon::defs::ConvoView) -> ConversationView {
         }),
         created_at: Some(c.created_at.as_ref().with_timezone(&chrono::Utc)),
         updated_at: None,
+    }
+}
+
+/// Build a `CommitGroupChange<'static>` for the wire **without** going through
+/// the buggy `InputData → Input` adapter in `catbird-atproto`.
+///
+/// Why not use `catbird_atproto::catbird::mls_chat::commit_group_change::InputData`?
+/// That adapter types `commit` / `welcome` / `group_info` / `confirmation_tag`
+/// as `Option<String>`, and its `From<InputData> for Input` impl maps them via
+/// `String → bytes::Bytes`. `bytes::Bytes::from(String)` takes the UTF-8 bytes
+/// of the string verbatim — so when callers pass a pre-base64 string, the
+/// bytes field ends up containing the ASCII of the base64 text and the
+/// jacquard serializer then wraps it as `{"$bytes": base64(ASCII-base64)}`,
+/// producing double-encoded commits the server rejects or silently mis-decodes.
+/// Building the lexicon struct directly lets us pass raw
+/// `bytes::Bytes::from(Vec<u8>)` so the single serializer layer does the one
+/// correct base64 encode.
+///
+/// Mirrors the fix shipped in catmos-cli (commit `1ecf9e4`) for the same
+/// class of bug.
+#[allow(clippy::too_many_arguments)]
+fn build_commit_group_change(
+    convo_id: &str,
+    action: &str,
+    commit: Option<Vec<u8>>,
+    welcome: Option<Vec<u8>>,
+    group_info: Option<Vec<u8>>,
+    confirmation_tag: Option<Vec<u8>>,
+    member_dids: Option<Vec<String>>,
+    idempotency_key: Option<String>,
+) -> CommitGroupChange<'static> {
+    CommitGroupChange {
+        convo_id: convo_id.to_string().into(),
+        action: action.to_string().into(),
+        commit: commit.map(bytes::Bytes::from),
+        welcome: welcome.map(bytes::Bytes::from),
+        group_info: group_info.map(bytes::Bytes::from),
+        confirmation_tag: confirmation_tag.map(bytes::Bytes::from),
+        member_dids: member_dids.map(|dids| dids.iter().map(|d| parse_did(d)).collect()),
+        idempotency_key: idempotency_key.map(Into::into),
+        ..Default::default()
     }
 }
 
@@ -666,21 +708,21 @@ impl MLSAPIClient for WasmApiClient {
         let token = self.auth_header()?;
         // TODO(A7): confirmation_tag + epoch_authenticator stubbed as None;
         // real values require MLS state computation (deferred with #15/#18).
-        let input: lexicon::commit_group_change::Input = lexicon::commit_group_change::InputData {
-            action: "addMembers".to_string(),
-            commit: Some(B64.encode(commit_data)),
-            confirmation_tag: None,
-            convo_id: convo_id.to_string(),
-            device_id: None,
-            epoch_authenticator: None,
-            group_info: None,
-            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-            key_package_hashes: None,
-            member_dids: Some(member_dids.iter().map(|did| parse_did(did)).collect()),
-            pending_addition_id: None,
-            welcome: welcome_data.map(|data| B64.encode(data)),
-        }
-        .into();
+        //
+        // NOTE: uses `build_commit_group_change` directly instead of the
+        // `InputData → Input` adapter in `catbird-atproto` to avoid the
+        // `String → bytes::Bytes` UTF-8-copy double-base64-encoding bug
+        // (see helper doc comment).
+        let input = build_commit_group_change(
+            convo_id,
+            "addMembers",
+            Some(commit_data.to_vec()),
+            welcome_data.map(|w| w.to_vec()),
+            None,
+            None,
+            Some(member_dids.to_vec()),
+            Some(uuid::Uuid::new_v4().to_string()),
+        );
         let resp = self
             .client
             .post(self.xrpc_url(lexicon::commit_group_change::NSID))
@@ -1055,21 +1097,18 @@ impl MLSAPIClient for WasmApiClient {
 
     async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
         let token = self.auth_header()?;
-        let input: lexicon::commit_group_change::Input = lexicon::commit_group_change::InputData {
-            action: "updateGroupInfo".to_string(),
-            commit: None,
-            confirmation_tag: None,
-            convo_id: convo_id.to_string(),
-            device_id: None,
-            epoch_authenticator: None,
-            group_info: Some(B64.encode(group_info)),
-            idempotency_key: None,
-            key_package_hashes: None,
-            member_dids: None,
-            pending_addition_id: None,
-            welcome: None,
-        }
-        .into();
+        // See `build_commit_group_change` doc: direct construction avoids the
+        // double-base64 bug in the InputData adapter's String → Bytes mapping.
+        let input = build_commit_group_change(
+            convo_id,
+            "updateGroupInfo",
+            None,
+            None,
+            Some(group_info.to_vec()),
+            None,
+            None,
+            None,
+        );
         let resp = self
             .client
             .post(self.xrpc_url(lexicon::commit_group_change::NSID))
@@ -1159,21 +1198,27 @@ impl MLSAPIClient for WasmApiClient {
         confirmation_tag: Option<&str>,
     ) -> Result<ProcessExternalCommitResult> {
         let token = self.auth_header()?;
-        let input: lexicon::commit_group_change::Input = lexicon::commit_group_change::InputData {
-            action: "externalCommit".to_string(),
-            commit: Some(B64.encode(commit_data)),
-            confirmation_tag: confirmation_tag.map(|s| s.to_string()),
-            convo_id: convo_id.to_string(),
-            device_id: None,
-            epoch_authenticator: None,
-            group_info: group_info.map(|value| B64.encode(value)),
-            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-            key_package_hashes: None,
-            member_dids: None,
-            pending_addition_id: None,
-            welcome: None,
-        }
-        .into();
+        // See `build_commit_group_change` doc: direct construction avoids the
+        // double-base64 bug in the InputData adapter's String → Bytes mapping.
+        //
+        // `confirmation_tag` is passed as `Option<&str>` from the orchestrator.
+        // Byte-preserving mapping: `s.as_bytes().to_vec()` produces the same
+        // wire bytes the buggy adapter was emitting (UTF-8 of the string).
+        // Whether the caller intends those bytes to be interpreted as ASCII
+        // or pre-base64 is a separate concern tracked outside this fix — the
+        // InputData adapter's behaviour was the same on that field, so this
+        // fix is strictly additive for that field. Commit/welcome/group_info
+        // are the wire-level correctness targets here.
+        let input = build_commit_group_change(
+            convo_id,
+            "externalCommit",
+            Some(commit_data.to_vec()),
+            None,
+            group_info.map(|value| value.to_vec()),
+            confirmation_tag.map(|s| s.as_bytes().to_vec()),
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+        );
         let resp = self
             .client
             .post(self.xrpc_url(lexicon::commit_group_change::NSID))

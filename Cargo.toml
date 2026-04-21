@@ -70,6 +70,7 @@ tls_codec = "0.4"
 
 # Utilities
 base64 = "0.22"
+bytes = "1"
 ciborium = "0.2"
 chrono = { version = "0.4", features = ["serde", "wasmbind"] }
 uuid = { version = "1", features = ["v4", "js"] }

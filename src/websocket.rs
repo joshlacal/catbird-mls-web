@@ -561,6 +561,166 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
         }
 
         // ------------------------------------------------------------------
+        // Group reset (spec §8.5 / §8.6) — server-driven RESET_PENDING.
+        //
+        // Persists the payload to the WASM storage backend (so deferred
+        // recovery survives reload), adopts the new MLS group id, flips the
+        // conversation state to ResetPending, and emits a `groupReset` event
+        // to the JS layer. The frontend is expected to call
+        // `catbird_mls_fetch_new_messages` (or the orchestrator's sync) so
+        // the deferred External Commit picks up the new group.
+        //
+        // Note: catbird-mls-web does NOT wrap `MLSOrchestrator`, so there is
+        // no in-process `RecoveryTracker` to clear here (that step in the
+        // catmos Tauri reference implementation is intentionally skipped).
+        // The JS layer drives sync.
+        // ------------------------------------------------------------------
+        "#groupResetEvent" => {
+            let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
+                .map_err(|e| format!("Failed to decode groupResetEvent CBOR: {}", e))?;
+
+            let CborValue::Map(ref top) = payload else {
+                return Ok(None);
+            };
+
+            let new_group_id = cbor_str(top, "newGroupId").unwrap_or_default();
+            let reset_generation = cbor_int(top, "resetGeneration").unwrap_or(0) as i32;
+            let reset_by = cbor_str(top, "resetBy").unwrap_or_default();
+            let reason = cbor_str(top, "reason");
+            let convo_id_owned = convo_id.to_string();
+            let notified_at_ms = chrono::Utc::now().timestamp_millis();
+
+            web_sys::console::log_1(&JsValue::from_str(&format!(
+                "[catmos-ws] groupReset: convo={} newGroupId={} gen={} by={}",
+                convo_id_owned,
+                new_group_id,
+                reset_generation,
+                short_id(&reset_by)
+            )));
+
+            // Side-effects: persist + adopt new group_id. spawn_local because
+            // MLSStorageBackend methods are async; the WASM event loop is
+            // single-threaded so STATE access from inside the future is safe
+            // as long as we don't hold a borrow across `await`.
+            let new_gid_for_task = new_group_id.clone();
+            let convo_id_for_task = convo_id_owned.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                use catbird_mls::orchestrator::storage::MLSStorageBackend;
+
+                let storage = crate::STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|st| std::sync::Arc::clone(&st.storage))
+                });
+                let Some(storage) = storage else {
+                    web_sys::console::warn_1(&JsValue::from_str(
+                        "[catmos-ws] groupReset: STATE not initialized; skipping persistence",
+                    ));
+                    return;
+                };
+
+                // 1. Persist the RESET_PENDING payload.
+                if let Err(e) = storage
+                    .mark_reset_pending(
+                        &convo_id_for_task,
+                        &new_gid_for_task,
+                        reset_generation,
+                        notified_at_ms,
+                    )
+                    .await
+                {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "[catmos-ws] mark_reset_pending failed for {}: {:?}",
+                        convo_id_for_task, e
+                    )));
+                }
+
+                // 2. Flip conversation state to ResetPending (carries payload).
+                if let Err(e) = storage
+                    .set_conversation_state(
+                        &convo_id_for_task,
+                        catbird_mls::orchestrator::types::ConversationState::ResetPending {
+                            new_group_id: new_gid_for_task.clone(),
+                            reset_generation,
+                            notified_at_ms,
+                        },
+                    )
+                    .await
+                {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "[catmos-ws] set ResetPending failed for {}: {:?}",
+                        convo_id_for_task, e
+                    )));
+                }
+
+                // 3. Mark needs_rejoin so deferred recovery picks it up.
+                if let Err(e) = storage.mark_needs_rejoin(&convo_id_for_task).await {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "[catmos-ws] mark_needs_rejoin failed for {}: {:?}",
+                        convo_id_for_task, e
+                    )));
+                }
+
+                // 4. Adopt the new group_id locally (so the next External
+                //    Commit targets the post-reset group). Empty newGroupId
+                //    means the server did not specify one — fall back to the
+                //    pre-reset lookup-by-conversation-id heuristic.
+                if !new_gid_for_task.is_empty() {
+                    if let Err(e) =
+                        storage.update_conversation_group_id(&convo_id_for_task, &new_gid_for_task)
+                    {
+                        web_sys::console::warn_1(&JsValue::from_str(&format!(
+                            "[catmos-ws] update_conversation_group_id failed for {} -> {}: {}",
+                            convo_id_for_task, new_gid_for_task, e
+                        )));
+                    }
+                }
+            });
+
+            // Build the JS event payload.
+            let obj = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("type"),
+                &JsValue::from_str("groupReset"),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("convoId"),
+                &JsValue::from_str(&convo_id_owned),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("newGroupId"),
+                &JsValue::from_str(&new_group_id),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("resetGeneration"),
+                &JsValue::from_f64(reset_generation as f64),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("resetBy"),
+                &JsValue::from_str(&reset_by),
+            )
+            .ok();
+            if let Some(ref r) = reason {
+                js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("reason"),
+                    &JsValue::from_str(r),
+                )
+                .ok();
+            }
+            Ok(Some(FrameOutput::Event("groupReset".to_string(), obj.into())))
+        }
+
+        // ------------------------------------------------------------------
         // Silent / no-op events.
         // ------------------------------------------------------------------
         "#readditionRequestedEvent" => Ok(None),

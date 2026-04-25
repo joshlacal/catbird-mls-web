@@ -45,13 +45,16 @@ impl WasmStorageBackend {
     pub fn ensure_schema(conn: &SqliteConn) -> std::result::Result<(), String> {
         conn.exec_raw(
             "CREATE TABLE IF NOT EXISTS conversations (
-                conversation_id TEXT NOT NULL,
-                user_did        TEXT NOT NULL,
-                group_id        TEXT NOT NULL,
-                join_method     TEXT,
-                join_epoch      INTEGER,
-                needs_rejoin    INTEGER DEFAULT 0,
-                state           TEXT DEFAULT 'active',
+                conversation_id        TEXT NOT NULL,
+                user_did               TEXT NOT NULL,
+                group_id               TEXT NOT NULL,
+                join_method            TEXT,
+                join_epoch             INTEGER,
+                needs_rejoin           INTEGER DEFAULT 0,
+                state                  TEXT DEFAULT 'active',
+                reset_new_group_id     TEXT,
+                reset_generation       INTEGER,
+                reset_notified_at_ms   INTEGER,
                 PRIMARY KEY (conversation_id, user_did)
             );",
         )
@@ -60,6 +63,19 @@ impl WasmStorageBackend {
         // Migration: add state column for existing databases.
         let _ = conn.exec_raw(
             "ALTER TABLE conversations ADD COLUMN state TEXT DEFAULT 'active';",
+        );
+
+        // Migration (spec §8.6 / §8.1 RESET_PENDING): persist the payload
+        // shipped by `GroupResetEvent` so deferred recovery survives reload.
+        // Three additive ALTERs — ignore errors if columns already exist.
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN reset_new_group_id TEXT;",
+        );
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN reset_generation INTEGER;",
+        );
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN reset_notified_at_ms INTEGER;",
         );
 
         conn.exec_raw(
@@ -107,6 +123,26 @@ impl WasmStorageBackend {
 
     fn store_err(e: impl std::fmt::Debug) -> OrchestratorError {
         OrchestratorError::Storage(format!("{:?}", e))
+    }
+
+    /// Adopt a new MLS group id for a conversation after a server-initiated
+    /// group reset (spec §8.5). The websocket handler calls this so the
+    /// subsequent External Commit (driven by deferred recovery / JS-triggered
+    /// sync) targets the new group instead of the pre-reset one.
+    ///
+    /// Inherent method (not on `MLSStorageBackend`) — mirrors the catmos
+    /// Tauri `Storage::update_conversation_group_id` shape.
+    pub fn update_conversation_group_id(
+        &self,
+        conversation_id: &str,
+        new_group_id_hex: &str,
+    ) -> std::result::Result<(), String> {
+        self.conn
+            .exec_with_text_params(
+                "UPDATE conversations SET group_id = ?1 WHERE conversation_id = ?2",
+                &[(1, new_group_id_hex), (2, conversation_id)],
+            )
+            .map_err(|e| format!("update_conversation_group_id: {:?}", e))
     }
 
     /// List all group IDs from the `group_states` table.
@@ -301,17 +337,128 @@ impl MLSStorageBackend for WasmStorageBackend {
         conversation_id: &str,
         state: ConversationState,
     ) -> Result<()> {
-        // Use the canonical tag() mapping from catbird_mls::orchestrator::types
-        // so new variants (ForkDetected, ResetPending) are handled automatically.
-        // TODO(§8.1): ResetPending payload (new_group_id, reset_generation,
-        // notified_at_ms) is currently dropped. Persist to conversation_states
-        // table during #15 pyramid wiring so server-driven group resets
-        // survive app restart.
+        // Spec §8.6 / §8.1: when state == ResetPending, persist the payload
+        // (new_group_id, reset_generation, notified_at_ms) alongside the tag
+        // so deferred recovery survives reload. For all other variants, NULL
+        // the reset columns to avoid stale payload bleed-through after a
+        // successful adoption.
         let state_str = state.tag();
+        match state {
+            ConversationState::ResetPending {
+                ref new_group_id,
+                reset_generation,
+                notified_at_ms,
+            } => self
+                .conn
+                .exec_with_mixed_params(
+                    "UPDATE conversations
+                     SET state = ?1,
+                         reset_new_group_id = ?2,
+                         reset_generation = ?3,
+                         reset_notified_at_ms = ?4
+                     WHERE conversation_id = ?5",
+                    &[(1, state_str), (2, new_group_id.as_str()), (5, conversation_id)],
+                    &[(3, reset_generation as i64), (4, notified_at_ms)],
+                )
+                .map_err(Self::store_err),
+            _ => self
+                .conn
+                .exec_with_text_params(
+                    "UPDATE conversations
+                     SET state = ?1,
+                         reset_new_group_id = NULL,
+                         reset_generation = NULL,
+                         reset_notified_at_ms = NULL
+                     WHERE conversation_id = ?2",
+                    &[(1, state_str), (2, conversation_id)],
+                )
+                .map_err(Self::store_err),
+        }
+    }
+
+    /// Read persisted state (spec §8.2). The WASM backend stores the state
+    /// tag in `state` and reset payload in three nullable columns; we
+    /// reconstruct `ConversationState` from whichever applies.
+    async fn get_conversation_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationState>> {
+        let rows = self
+            .conn
+            .query_text(
+                "SELECT state, reset_new_group_id, reset_generation, reset_notified_at_ms
+                 FROM conversations WHERE conversation_id = ?1 LIMIT 1",
+                &[(1, conversation_id)],
+                4,
+            )
+            .map_err(Self::store_err)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let tag = row.first().and_then(|c| c.as_deref()).unwrap_or("");
+        match tag {
+            "" => Ok(None),
+            "initializing" => Ok(Some(ConversationState::Initializing)),
+            "active" => Ok(Some(ConversationState::Active)),
+            "fork_detected" => Ok(Some(ConversationState::ForkDetected)),
+            "needs_rejoin" => Ok(Some(ConversationState::NeedsRejoin)),
+            "failed" => Ok(Some(ConversationState::Failed)),
+            "reset_pending" => {
+                let new_group_id = row.get(1).and_then(|c| c.clone());
+                let reset_generation = row.get(2).and_then(|c| c.as_deref()).and_then(|s| s.parse::<i32>().ok());
+                let notified_at_ms = row.get(3).and_then(|c| c.as_deref()).and_then(|s| s.parse::<i64>().ok());
+                match (new_group_id, reset_generation, notified_at_ms) {
+                    (Some(g), Some(r), Some(t)) if !g.is_empty() => {
+                        Ok(Some(ConversationState::ResetPending {
+                            new_group_id: g,
+                            reset_generation: r,
+                            notified_at_ms: t,
+                        }))
+                    }
+                    // Tag says reset_pending but payload columns are missing —
+                    // treat as NeedsRejoin so deferred recovery still runs.
+                    _ => Ok(Some(ConversationState::NeedsRejoin)),
+                }
+            }
+            _ => {
+                // Unknown tag (forward-compat): treat as no state.
+                Ok(None)
+            }
+        }
+    }
+
+    async fn mark_reset_pending(
+        &self,
+        conversation_id: &str,
+        new_group_id_hex: &str,
+        reset_generation: i32,
+        notified_at_ms: i64,
+    ) -> Result<()> {
+        // Spec §8.6: persist the GroupResetEvent payload so Phase-1 recovery
+        // can rehydrate ResetPending after orchestrator restart.
+        self.conn
+            .exec_with_mixed_params(
+                "UPDATE conversations
+                 SET state = 'reset_pending',
+                     reset_new_group_id = ?1,
+                     reset_generation = ?2,
+                     reset_notified_at_ms = ?3
+                 WHERE conversation_id = ?4",
+                &[(1, new_group_id_hex), (4, conversation_id)],
+                &[(2, reset_generation as i64), (3, notified_at_ms)],
+            )
+            .map_err(Self::store_err)
+    }
+
+    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
         self.conn
             .exec_with_text_params(
-                "UPDATE conversations SET state = ?1 WHERE conversation_id = ?2",
-                &[(1, state_str), (2, conversation_id)],
+                "UPDATE conversations
+                 SET reset_new_group_id = NULL,
+                     reset_generation = NULL,
+                     reset_notified_at_ms = NULL
+                 WHERE conversation_id = ?1",
+                &[(1, conversation_id)],
             )
             .map_err(Self::store_err)
     }

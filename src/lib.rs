@@ -2644,27 +2644,52 @@ pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
             continue;
         }
 
-        // 3c. Submit via createConvo with Idempotency-Key. Inline POST so we
-        // can attach the per-(convo, generation, did, op) header without
-        // touching MLSAPIClient's surface.
-        let self_did_lower = user_did.to_lowercase();
-        let initial_members: Vec<String> = roster
-            .iter()
-            .filter(|m| m.to_lowercase() != self_did_lower)
-            .cloned()
-            .collect();
+        // 3c. Export GroupInfo from the freshly-created group — required
+        // by `bootstrapResetGroup` (lexicon `groupInfo` field).
+        let group_info_bytes = with_state(|s| {
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.export_group_info(new_group_id_bytes.clone(), identity_bytes.clone())
+                .map_err(|e| js_err!("export_group_info failed: {:?}", e))
+        });
+        let group_info_bytes = match group_info_bytes {
+            Ok(b) => b,
+            Err(e) => {
+                web_sys::console::warn_1(&e);
+                let _ = with_state(|s| {
+                    if let Some(ctx) = s.mls_context.as_ref() {
+                        let _ = ctx.delete_group(new_group_id_bytes.clone());
+                    }
+                    Ok(())
+                });
+                continue;
+            }
+        };
+
+        // 3d. Submit via `bootstrapResetGroup` (server task #17 / spec §8.5).
+        // Server UPDATEs the post-reset row in place
+        // (id=originalConvoId, group_id=newGroupId) rather than INSERTing a
+        // new conversation — earlier fix-forward target was `createConvo`,
+        // but that orphaned the post-reset row (id mismatch). Members
+        // roster is preserved server-side; the lexicon `members` field is
+        // diagnostic-only but required. Idempotency-Key kept for
+        // client-side dedup of network retries.
         let idem_key = format!(
             "{}:{}:{}:bootstrap",
             convo_id, reset_generation, user_did
         );
-
         let body = serde_json::json!({
-            "groupId": &new_group_id_hex,
+            "originalConvoId": &convo_id,
+            "newGroupId": &new_group_id_hex,
             "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            "initialMembers": initial_members,
+            "groupInfo": &group_info_bytes,
+            "members": &roster,
+            "currentEpoch": 1,
         });
         let url = format!(
-            "{}/xrpc/blue.catbird.mlsChat.createConvo",
+            "{}/xrpc/blue.catbird.mlsChat.bootstrapResetGroup",
             base_url.trim_end_matches('/')
         );
         let client = proxy_client(&proxy_did);
@@ -2679,7 +2704,7 @@ pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
             Ok(r) => r,
             Err(e) => {
                 web_sys::console::warn_1(&js_err!(
-                    "[deferred-recovery] {}: createConvo network err: {} — dropping local pre-bootstrap group, keeping reset_pending",
+                    "[deferred-recovery] {}: bootstrapResetGroup network err: {} — dropping local pre-bootstrap group, keeping reset_pending",
                     convo_id,
                     e
                 ));
@@ -2695,7 +2720,7 @@ pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
-            // 3d. Race winner — clear reset_pending.
+            // 3e. Race winner — clear reset_pending.
             let _ = storage
                 .set_conversation_state(&convo_id, ConversationState::Active)
                 .await;
@@ -2719,9 +2744,9 @@ pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
         }
 
         let body_text = resp.text().await.unwrap_or_default();
-        let race_loss = status == 409 && body_text.contains("ConvoAlreadyExists");
+        let race_loss = status == 409 && body_text.contains("AlreadyBootstrapped");
 
-        // 3e. On 409 race-loss OR other server error: drop the local
+        // 3f. On 409 race-loss OR other server error: drop the local
         // pre-bootstrap group; leave reset_pending set so the next loop
         // retries Welcome.
         let _ = with_state(|s| {
@@ -2733,13 +2758,13 @@ pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
 
         if race_loss {
             web_sys::console::log_1(&js_err!(
-                "[deferred-recovery] {}: bootstrap LOST race (409 ConvoAlreadyExists, gen {}) — will retry Welcome",
+                "[deferred-recovery] {}: bootstrap LOST race (409 AlreadyBootstrapped, gen {}) — will retry Welcome",
                 convo_id,
                 reset_generation
             ));
         } else {
             web_sys::console::warn_1(&js_err!(
-                "[deferred-recovery] {}: createConvo {} -> {} — keeping reset_pending, will retry",
+                "[deferred-recovery] {}: bootstrapResetGroup {} -> {} — keeping reset_pending, will retry",
                 convo_id,
                 status,
                 body_text

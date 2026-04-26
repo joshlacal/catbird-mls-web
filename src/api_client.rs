@@ -1190,6 +1190,72 @@ impl MLSAPIClient for WasmApiClient {
         Ok(vec![])
     }
 
+    // TODO(test-gap): no unit coverage — `catbird-mls-web` has cdylib-only
+    // crate-type and uses sqlite-wasm-rs OPFS VFS that doesn't run on host.
+    // Verified by inspection against catmos/src-tauri/src/api_client.rs:567
+    // and catbird-mls/src/orchestrator/recovery.rs:898 (`report_unrecoverable_local`).
+    async fn report_recovery_failure(
+        &self,
+        convo_id: &str,
+        failure_type: &str,
+        epoch_authenticator: Option<&str>,
+        failure_mode: Option<&str>,
+    ) -> Result<()> {
+        let token = self.auth_header()?;
+
+        let mut body = serde_json::json!({
+            "convoId": convo_id,
+            "failureType": failure_type,
+        });
+        if let Some(auth) = epoch_authenticator {
+            body["epochAuthenticator"] = serde_json::Value::String(auth.to_string());
+        }
+        if let Some(mode) = failure_mode {
+            body["failureMode"] = serde_json::Value::String(mode.to_string());
+        }
+
+        let resp = self
+            .client
+            .post(self.xrpc_url("blue.catbird.mlsChat.reportRecoveryFailure"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let status_code = status.as_u16();
+        let body_text = resp.text().await.unwrap_or_default();
+
+        // 403 = caller is no longer a member; treat as soft-ack so the
+        // orchestrator's best-effort reporter doesn't keep retrying.
+        if status_code == 403 {
+            tracing::info!(
+                convo_id,
+                failure_type,
+                body = %body_text,
+                "report_recovery_failure: 403 (stale membership) — ignoring"
+            );
+            return Ok(());
+        }
+
+        tracing::warn!(
+            convo_id,
+            failure_type,
+            status = status_code,
+            body = %body_text,
+            "report_recovery_failure: server rejected report"
+        );
+        Err(OrchestratorError::ServerError {
+            status: status_code,
+            body: body_text,
+        })
+    }
+
     async fn process_external_commit(
         &self,
         convo_id: &str,

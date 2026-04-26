@@ -344,6 +344,53 @@ impl WasmMLSContext {
         })
     }
 
+    /// Create an MLS group at a **predetermined** `group_id` (RFC 9420 §11
+    /// `MlsGroup::new_with_group_id`). Used by the first-responder bootstrap
+    /// path (spec §8.5 / Phase 1) where every member must land on the same
+    /// `groupId` published by the server's `groupResetEvent`.
+    ///
+    /// `group_id` is the raw bytes of the target MLS group identifier (NOT
+    /// hex-encoded). Mirrors the native `MLSContext::create_group_with_id`
+    /// (`catbird-mls/src/mls_context.rs:1922`).
+    pub(crate) fn create_group_with_id(
+        &self,
+        identity_bytes: Vec<u8>,
+        group_id: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
+        let config = config.unwrap_or_else(Self::default_config);
+        let signer = self.get_or_create_signer(&identity_bytes)?;
+
+        let credential = BasicCredential::new(identity_bytes.clone());
+        let cred_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signer.public().into(),
+        };
+
+        let group_config = Self::make_create_config(&config);
+        let openmls_group_id = openmls::prelude::GroupId::from_slice(&group_id);
+        let group = MlsGroup::new_with_group_id(
+            &self.provider,
+            &signer,
+            &group_config,
+            openmls_group_id,
+            cred_with_key,
+        )
+        .map_err(|e| MLSError::OpenMLS(format!("MlsGroup::new_with_group_id: {e:?}")))?;
+
+        let stored_group_id = group.group_id().as_slice().to_vec();
+        self.groups
+            .borrow_mut()
+            .insert(stored_group_id.clone(), group);
+
+        Ok(GroupCreationResult {
+            group_id: stored_group_id,
+            encrypted_metadata_blob: None,
+            metadata_reference_json: None,
+            metadata_blob_locator: None,
+        })
+    }
+
     pub(crate) fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
         if let Some(mut group) = self.groups.borrow_mut().remove(&group_id) {
             let _ = group.delete(self.provider.storage());

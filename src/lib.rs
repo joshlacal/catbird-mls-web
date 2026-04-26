@@ -2495,3 +2495,288 @@ pub async fn catbird_mls_check_opt_in_status(dids: Array) -> Result<JsValue, JsV
 
     to_js(&statuses)
 }
+
+// ---------------------------------------------------------------------------
+// Deferred recovery — first-responder bootstrap for ResetPending convos
+// ---------------------------------------------------------------------------
+
+/// Drive the deferred-recovery state machine for any conversation in
+/// `ResetPending` (spec §8.5 Phase 1, plan task #24).
+///
+/// Browser apps should call this on a periodic timer (e.g. every 30s) and on
+/// `visibilitychange="visible"`. It:
+///
+/// 1. Iterates conversations with `state == ResetPending`.
+/// 2. For each, attempts the Welcome → External Commit ladder
+///    (`try_join_group_internal`) — if either succeeds, clears `reset_pending`.
+/// 3. If both fail, runs the first-responder bootstrap: fetches the roster via
+///    `getConvos`, builds a local MLS group at the predetermined `newGroupId`
+///    via `WasmMLSContext::create_group_with_id`, and submits via
+///    `createConvo` with an `Idempotency-Key` header
+///    (`<convoId>:<resetGeneration>:<callerDid>:bootstrap`, per Phase 0 Q4).
+/// 4. On 409 `ConvoAlreadyExists` (race-loss): deletes the local
+///    pre-bootstrap group and leaves `reset_pending` set so the next loop
+///    picks up the winner's Welcome. Other server errors: same.
+///
+/// Returns the count of conversations the loop touched.
+//
+// TODO(architecture): WASM bootstrap is currently inline-mirrored from
+// `catbird-mls/src/orchestrator/recovery.rs::try_first_responder_bootstrap`.
+// Long-term, WASM should migrate to driving `MLSOrchestrator` directly so
+// the ladder lives in one place across all platforms (Phase 4+ backlog).
+//
+// TODO(test-gap): no unit coverage — `catbird-mls-web` is `cdylib`-only and
+// uses sqlite-wasm-rs OPFS VFS that doesn't run on host. Verified by
+// inspection against `try_first_responder_bootstrap` (recovery.rs:1593) and
+// the catmos / catmos-cli inheritor implementations.
+#[wasm_bindgen]
+pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
+    use catbird_mls::orchestrator::storage::MLSStorageBackend;
+    use catbird_mls::orchestrator::types::ConversationState;
+
+    let (api_client, storage, user_did, base_url, auth_token, proxy_did) =
+        with_state(|s| {
+            let did = s
+                .user_did
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))?;
+            let token = s
+                .auth_token
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))?;
+            Ok((
+                Arc::clone(&s.api_client),
+                Arc::clone(&s.storage),
+                did,
+                s.base_url.clone(),
+                token,
+                s.proxy_did.clone(),
+            ))
+        })?;
+
+    // 1. Find ResetPending convos.
+    let convos = storage
+        .list_conversations(&user_did)
+        .await
+        .map_err(|e| js_err!("list_conversations failed: {:?}", e))?;
+
+    let mut pending: Vec<(String, String, i32)> = Vec::new();
+    for c in &convos {
+        if let Ok(Some(ConversationState::ResetPending {
+            new_group_id,
+            reset_generation,
+            ..
+        })) = storage.get_conversation_state(&c.conversation_id).await
+        {
+            pending.push((c.conversation_id.clone(), new_group_id, reset_generation));
+        }
+    }
+
+    if pending.is_empty() {
+        return to_js(&serde_json::json!({ "touched": 0 }));
+    }
+
+    let mut touched: usize = 0;
+    for (convo_id, new_group_id_hex, reset_generation) in pending {
+        touched += 1;
+
+        // 2. Try Welcome → External Commit ladder.
+        if try_join_group_internal(&convo_id).await.is_ok() {
+            let _ = storage
+                .set_conversation_state(&convo_id, ConversationState::Active)
+                .await;
+            let _ = storage.clear_reset_pending(&convo_id).await;
+            let _ = storage.clear_rejoin_flag(&convo_id).await;
+            web_sys::console::log_1(&js_err!(
+                "[deferred-recovery] {}: cleared via Welcome/ExternalCommit",
+                convo_id
+            ));
+            continue;
+        }
+
+        // 3. First-responder bootstrap fallback.
+        let new_group_id_bytes = match hex::decode(&new_group_id_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                web_sys::console::warn_1(&js_err!(
+                    "[deferred-recovery] {}: ResetPending.new_group_id is not valid hex ({}): {:?}",
+                    convo_id,
+                    new_group_id_hex,
+                    e
+                ));
+                continue;
+            }
+        };
+
+        // 3a. Fetch fresh roster (server clears membership atomically with
+        // reset; cached `group_states.members` is the pre-reset roster).
+        let roster = match fetch_roster_for_convo(&api_client, &convo_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                web_sys::console::warn_1(&js_err!(
+                    "[deferred-recovery] {}: fetch_roster failed: {}",
+                    convo_id,
+                    e
+                ));
+                continue;
+            }
+        };
+        if roster.is_empty() {
+            web_sys::console::warn_1(&js_err!(
+                "[deferred-recovery] {}: roster empty — cannot bootstrap",
+                convo_id
+            ));
+            continue;
+        }
+
+        // 3b. Build the local group at the predetermined id.
+        let identity_bytes = user_did.as_bytes().to_vec();
+        let creation = with_state(|s| {
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.create_group_with_id(identity_bytes.clone(), new_group_id_bytes.clone(), None)
+                .map_err(|e| js_err!("create_group_with_id failed: {:?}", e))
+        });
+        if let Err(e) = creation {
+            web_sys::console::warn_1(&e);
+            continue;
+        }
+
+        // 3c. Submit via createConvo with Idempotency-Key. Inline POST so we
+        // can attach the per-(convo, generation, did, op) header without
+        // touching MLSAPIClient's surface.
+        let self_did_lower = user_did.to_lowercase();
+        let initial_members: Vec<String> = roster
+            .iter()
+            .filter(|m| m.to_lowercase() != self_did_lower)
+            .cloned()
+            .collect();
+        let idem_key = format!(
+            "{}:{}:{}:bootstrap",
+            convo_id, reset_generation, user_did
+        );
+
+        let body = serde_json::json!({
+            "groupId": &new_group_id_hex,
+            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+            "initialMembers": initial_members,
+        });
+        let url = format!(
+            "{}/xrpc/blue.catbird.mlsChat.createConvo",
+            base_url.trim_end_matches('/')
+        );
+        let client = proxy_client(&proxy_did);
+        let resp = match client
+            .post(&url)
+            .bearer_auth(&auth_token)
+            .header("Idempotency-Key", &idem_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                web_sys::console::warn_1(&js_err!(
+                    "[deferred-recovery] {}: createConvo network err: {} — dropping local pre-bootstrap group, keeping reset_pending",
+                    convo_id,
+                    e
+                ));
+                let _ = with_state(|s| {
+                    if let Some(ctx) = s.mls_context.as_ref() {
+                        let _ = ctx.delete_group(new_group_id_bytes.clone());
+                    }
+                    Ok(())
+                });
+                continue;
+            }
+        };
+
+        let status = resp.status().as_u16();
+        if resp.status().is_success() {
+            // 3d. Race winner — clear reset_pending.
+            let _ = storage
+                .set_conversation_state(&convo_id, ConversationState::Active)
+                .await;
+            let _ = storage.clear_reset_pending(&convo_id).await;
+            let _ = storage.clear_rejoin_flag(&convo_id).await;
+            let local_epoch = with_state(|s| {
+                Ok(s.mls_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.get_epoch(new_group_id_bytes.clone()).ok())
+                    .unwrap_or(0))
+            })
+            .unwrap_or(0);
+            SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), local_epoch));
+            web_sys::console::log_1(&js_err!(
+                "[deferred-recovery] {}: bootstrap WON at epoch {} (gen {})",
+                convo_id,
+                local_epoch,
+                reset_generation
+            ));
+            continue;
+        }
+
+        let body_text = resp.text().await.unwrap_or_default();
+        let race_loss = status == 409 && body_text.contains("ConvoAlreadyExists");
+
+        // 3e. On 409 race-loss OR other server error: drop the local
+        // pre-bootstrap group; leave reset_pending set so the next loop
+        // retries Welcome.
+        let _ = with_state(|s| {
+            if let Some(ctx) = s.mls_context.as_ref() {
+                let _ = ctx.delete_group(new_group_id_bytes.clone());
+            }
+            Ok(())
+        });
+
+        if race_loss {
+            web_sys::console::log_1(&js_err!(
+                "[deferred-recovery] {}: bootstrap LOST race (409 ConvoAlreadyExists, gen {}) — will retry Welcome",
+                convo_id,
+                reset_generation
+            ));
+        } else {
+            web_sys::console::warn_1(&js_err!(
+                "[deferred-recovery] {}: createConvo {} -> {} — keeping reset_pending, will retry",
+                convo_id,
+                status,
+                body_text
+            ));
+        }
+    }
+
+    to_js(&serde_json::json!({ "touched": touched }))
+}
+
+/// Page through `getConvos` to find the membership roster for one
+/// conversation. Mirrors `MLSOrchestrator::fetch_roster_for_convo`
+/// (`catbird-mls/src/orchestrator/recovery.rs:1726`). Phase 0 Q3 confirms the
+/// `groupResetEvent` does NOT carry a roster, and the local
+/// `group_states.members` cache is the pre-reset roster (server clears
+/// membership atomically with reset).
+async fn fetch_roster_for_convo(
+    api_client: &Arc<WasmApiClient>,
+    convo_id: &str,
+) -> std::result::Result<Vec<String>, String> {
+    use catbird_mls::orchestrator::api_client::MLSAPIClient;
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = api_client
+            .get_conversations(50, cursor.as_deref())
+            .await
+            .map_err(|e| format!("get_conversations failed: {:?}", e))?;
+        for cv in &page.conversations {
+            if cv.conversation_id == convo_id {
+                return Ok(cv.members.iter().map(|m| m.did.clone()).collect());
+            }
+        }
+        cursor = page.cursor;
+        if cursor.is_none() {
+            return Err(format!(
+                "server did not return convo {convo_id} in pagination"
+            ));
+        }
+    }
+}

@@ -130,19 +130,72 @@ impl WasmStorageBackend {
     /// subsequent External Commit (driven by deferred recovery / JS-triggered
     /// sync) targets the new group instead of the pre-reset one.
     ///
+    /// Wraps the swap in BEGIN/COMMIT and deletes the orphaned `group_states`
+    /// row keyed by the old `group_id` (when it differs from the new one) so
+    /// stale OpenMLS state doesn't linger after adoption.
+    ///
     /// Inherent method (not on `MLSStorageBackend`) — mirrors the catmos
     /// Tauri `Storage::update_conversation_group_id` shape.
+    //
+    // TODO(test-gap): no unit coverage — `catbird-mls-web` has cdylib-only
+    // crate-type and uses sqlite-wasm-rs OPFS VFS that doesn't run on host.
+    // Adding a wasm-bindgen-test would require :memory: VFS shim. Tracked
+    // in spec docs/superpowers/specs/2026-04-26-mls-auto-reset-phase1-design.md
     pub fn update_conversation_group_id(
         &self,
         conversation_id: &str,
         new_group_id_hex: &str,
     ) -> std::result::Result<(), String> {
         self.conn
-            .exec_with_text_params(
-                "UPDATE conversations SET group_id = ?1 WHERE conversation_id = ?2",
-                &[(1, new_group_id_hex), (2, conversation_id)],
-            )
-            .map_err(|e| format!("update_conversation_group_id: {:?}", e))
+            .exec_raw("BEGIN")
+            .map_err(|e| format!("update_conversation_group_id BEGIN: {:?}", e))?;
+
+        let result = (|| -> std::result::Result<(), String> {
+            let rows = self
+                .conn
+                .query_text(
+                    "SELECT group_id FROM conversations WHERE conversation_id = ?1",
+                    &[(1, conversation_id)],
+                    1,
+                )
+                .map_err(|e| format!("update_conversation_group_id SELECT: {:?}", e))?;
+            let old_group_id: Option<String> = rows
+                .into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next().flatten());
+
+            self.conn
+                .exec_with_text_params(
+                    "UPDATE conversations SET group_id = ?1 WHERE conversation_id = ?2",
+                    &[(1, new_group_id_hex), (2, conversation_id)],
+                )
+                .map_err(|e| format!("update_conversation_group_id UPDATE: {:?}", e))?;
+
+            if let Some(old) = old_group_id {
+                if old != new_group_id_hex {
+                    self.conn
+                        .exec_with_text_params(
+                            "DELETE FROM group_states WHERE group_id = ?1",
+                            &[(1, &old)],
+                        )
+                        .map_err(|e| {
+                            format!("update_conversation_group_id DELETE: {:?}", e)
+                        })?;
+                }
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .exec_raw("COMMIT")
+                .map_err(|e| format!("update_conversation_group_id COMMIT: {:?}", e)),
+            Err(e) => {
+                let _ = self.conn.exec_raw("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// List all group IDs from the `group_states` table.

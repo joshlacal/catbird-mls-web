@@ -721,6 +721,270 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
         }
 
         // ------------------------------------------------------------------
+        // Reset requested (Phase 2.5, plan
+        // `docs/plans/phase-2-5-indirect-funneling.md` §3, §5 Stage 1) —
+        // server is funneling indirect-trigger resets (quorum vote, system
+        // sweep, inline_409, inline_groupinfo_404) through SSE WITHOUT
+        // minting an `mls_group_id` server-side. Subscribed clients elect a
+        // first responder, race-bootstrap their own pre-generated group_id,
+        // and the chokepoint's `crypto_sessions UNIQUE (conversation_id,
+        // generation)` constraint serializes the winner.
+        //
+        // This is the WASM-side companion to
+        // `MLSOrchestrator::record_reset_requested` (`catbird-mls/src/
+        // orchestrator/recovery.rs:1387`). Because catbird-mls-web does NOT
+        // wrap `MLSOrchestrator`, the orchestrator method's body is mirrored
+        // inline here against the `MLSStorageBackend` trait — exactly the
+        // same pattern as the legacy `#groupResetEvent` arm above.
+        //
+        // Behavior parity with the orchestrator method:
+        // 1. Idempotency: if the persisted state is already
+        //    `ResetPending { reset_generation: g, .. }` and the incoming
+        //    `generation` matches `g`, no storage writes happen — only the
+        //    JS event is emitted (for UI/debug visibility on reconnect
+        //    replays).
+        // 2. New group_id resolution: server-supplied
+        //    `expectedNewMlsGroupId` (when present and non-empty) is used
+        //    verbatim; otherwise a fresh UUIDv4-style 32-hex-char id is
+        //    minted client-side as the race-bootstrap candidate.
+        // 3. State writes mirror `persist_reset_pending_state` in the
+        //    orchestrator: `mark_reset_pending` + `set_conversation_state(
+        //    ResetPending)` + `mark_needs_rejoin` +
+        //    `update_conversation_group_id`. The deferred-recovery loop
+        //    drives the actual bootstrap.
+        // ------------------------------------------------------------------
+        "#resetRequestedEvent" => {
+            let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
+                .map_err(|e| format!("Failed to decode resetRequestedEvent CBOR: {}", e))?;
+
+            let CborValue::Map(ref top) = payload else {
+                return Ok(None);
+            };
+
+            let crypto_session_id = cbor_str(top, "cryptoSessionId").unwrap_or_default();
+            let reset_generation = cbor_int(top, "generation").unwrap_or(0) as i32;
+            let trigger = cbor_str(top, "trigger").unwrap_or_default();
+            let request_event_id = cbor_str(top, "requestEventId").unwrap_or_default();
+            let reason = cbor_str(top, "reason");
+            // `expectedNewMlsGroupId` is `Option<String>` on the wire — the
+            // common Phase 2.5 case is None (server has not minted). Treat
+            // empty string the same as None for robustness.
+            let expected_new_mls_group_id: Option<String> = cbor_str(top, "expectedNewMlsGroupId")
+                .filter(|s| !s.is_empty());
+            let convo_id_owned = convo_id.to_string();
+            let notified_at_ms = chrono::Utc::now().timestamp_millis();
+
+            web_sys::console::log_1(&JsValue::from_str(&format!(
+                "[catmos-ws] resetRequested: convo={} cryptoSession={} gen={} trigger={} reqId={} expected={}",
+                convo_id_owned,
+                short_id(&crypto_session_id),
+                reset_generation,
+                trigger,
+                request_event_id,
+                expected_new_mls_group_id
+                    .as_deref()
+                    .unwrap_or("<none>")
+            )));
+
+            let crypto_session_id_owned = crypto_session_id.clone();
+            let trigger_owned = trigger.clone();
+            let request_event_id_owned = request_event_id.clone();
+            let expected_for_task = expected_new_mls_group_id.clone();
+            let convo_id_for_task = convo_id_owned.clone();
+
+            // Side-effects: idempotency check + persist. spawn_local because
+            // MLSStorageBackend methods are async; the WASM event loop is
+            // single-threaded so STATE access from inside the future is safe
+            // as long as we don't hold a borrow across `await`.
+            wasm_bindgen_futures::spawn_local(async move {
+                use catbird_mls::orchestrator::storage::MLSStorageBackend;
+                use catbird_mls::orchestrator::types::ConversationState;
+
+                let storage = crate::STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|st| std::sync::Arc::clone(&st.storage))
+                });
+                let Some(storage) = storage else {
+                    web_sys::console::warn_1(&JsValue::from_str(
+                        "[catmos-ws] resetRequested: STATE not initialized; skipping persistence",
+                    ));
+                    return;
+                };
+
+                // 1. Idempotency: if we are already in ResetPending at the
+                //    same generation, drop the duplicate (mirrors
+                //    recovery.rs:1400-1412).
+                match storage.get_conversation_state(&convo_id_for_task).await {
+                    Ok(Some(ConversationState::ResetPending {
+                        reset_generation: existing_gen,
+                        new_group_id: existing_gid,
+                        ..
+                    })) if existing_gen == reset_generation => {
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "[catmos-ws] resetRequested: already in ResetPending at gen={} (existing newGroupId={}); idempotent no-op",
+                            reset_generation, existing_gid,
+                        )));
+                        return;
+                    }
+                    Ok(Some(ConversationState::ResetPending {
+                        reset_generation: existing_gen,
+                        ..
+                    })) => {
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "[catmos-ws] resetRequested: superseding ResetPending at old gen={} with new gen={}",
+                            existing_gen, reset_generation,
+                        )));
+                    }
+                    Ok(_) | Err(_) => {
+                        // No persisted state, or state read failed — fall
+                        // through and persist. A read error here is
+                        // non-fatal; the writes below are authoritative.
+                    }
+                }
+
+                // 2. Resolve new_group_id eagerly (mirrors
+                //    recovery.rs:1430-1456). Server-supplied wins; else mint
+                //    a UUIDv4-style 32-hex-char id locally for first-
+                //    responder race bootstrap.
+                let new_group_id_hex = match expected_for_task {
+                    Some(hex_id) if !hex_id.is_empty() => {
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "[catmos-ws] resetRequested: using server-supplied expectedNewMlsGroupId={}",
+                            hex_id,
+                        )));
+                        hex_id
+                    }
+                    _ => {
+                        let minted = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "[catmos-ws] resetRequested: server passed None; minting client-side candidate={}",
+                            minted,
+                        )));
+                        minted
+                    }
+                };
+
+                // 3. Persist the RESET_PENDING payload.
+                if let Err(e) = storage
+                    .mark_reset_pending(
+                        &convo_id_for_task,
+                        &new_group_id_hex,
+                        reset_generation,
+                        notified_at_ms,
+                    )
+                    .await
+                {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "[catmos-ws] mark_reset_pending failed for {}: {:?}",
+                        convo_id_for_task, e
+                    )));
+                }
+
+                // 4. Flip conversation state to ResetPending (carries
+                //    payload).
+                if let Err(e) = storage
+                    .set_conversation_state(
+                        &convo_id_for_task,
+                        ConversationState::ResetPending {
+                            new_group_id: new_group_id_hex.clone(),
+                            reset_generation,
+                            notified_at_ms,
+                        },
+                    )
+                    .await
+                {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "[catmos-ws] set ResetPending failed for {}: {:?}",
+                        convo_id_for_task, e
+                    )));
+                }
+
+                // 5. Mark needs_rejoin so deferred recovery picks it up.
+                if let Err(e) = storage.mark_needs_rejoin(&convo_id_for_task).await {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "[catmos-ws] mark_needs_rejoin failed for {}: {:?}",
+                        convo_id_for_task, e
+                    )));
+                }
+
+                // 6. Adopt the new group_id locally (so the next External
+                //    Commit / first-responder bootstrap targets the post-
+                //    reset group). Always non-empty here because step 2
+                //    minted one when server passed None.
+                if let Err(e) =
+                    storage.update_conversation_group_id(&convo_id_for_task, &new_group_id_hex)
+                {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "[catmos-ws] update_conversation_group_id failed for {} -> {}: {}",
+                        convo_id_for_task, new_group_id_hex, e
+                    )));
+                }
+            });
+
+            // Build the JS event payload. Surfaced to the UI so a "Repairing
+            // conversation…" banner can render while deferred recovery
+            // bootstraps the new group.
+            let obj = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("type"),
+                &JsValue::from_str("resetRequested"),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("convoId"),
+                &JsValue::from_str(&convo_id_owned),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("cryptoSessionId"),
+                &JsValue::from_str(&crypto_session_id_owned),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("generation"),
+                &JsValue::from_f64(reset_generation as f64),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("trigger"),
+                &JsValue::from_str(&trigger_owned),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("requestEventId"),
+                &JsValue::from_str(&request_event_id_owned),
+            )
+            .ok();
+            if let Some(ref expected) = expected_new_mls_group_id {
+                js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("expectedNewMlsGroupId"),
+                    &JsValue::from_str(expected),
+                )
+                .ok();
+            }
+            if let Some(ref r) = reason {
+                js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("reason"),
+                    &JsValue::from_str(r),
+                )
+                .ok();
+            }
+            Ok(Some(FrameOutput::Event(
+                "resetRequested".to_string(),
+                obj.into(),
+            )))
+        }
+
+        // ------------------------------------------------------------------
         // Silent / no-op events.
         // ------------------------------------------------------------------
         "#readditionRequestedEvent" => Ok(None),

@@ -881,6 +881,7 @@ impl MLSAPIClient for WasmApiClient {
         let input: lexicon::publish_key_packages::Input =
             lexicon::publish_key_packages::InputData {
                 action: "publish".to_string(),
+                convo_id: None,
                 device_id: None,
                 key_packages: Some(vec![lexicon::publish_key_packages::KeyPackageItemData {
                     cipher_suite: cipher_suite.to_string(),
@@ -889,6 +890,8 @@ impl MLSAPIClient for WasmApiClient {
                 }
                 .into()]),
                 local_hashes: None,
+                reason: None,
+                target_dids: None,
             }
             .into();
         let resp = self

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use base64::Engine as _;
+use openmls::component::ComponentData;
 use openmls::prelude::tls_codec::Serialize as TlsSerialize;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -501,6 +502,214 @@ impl WasmMLSContext {
         commit_msg
             .tls_serialize_detached()
             .map_err(|e| MLSError::OpenMLS(format!("commit serialize: {e:?}")))
+    }
+
+    // ------------------------------------------------------------------
+    // Group metadata (encrypted-only path; MLS metadata cutover)
+    // ------------------------------------------------------------------
+
+    /// Stage a `GroupContextExtensions` commit that updates only the
+    /// AppDataDictionary `MetadataReference` (component 0x8001) — used for
+    /// the encrypted-blob metadata path.
+    ///
+    /// Mirrors `MLSContext::update_group_metadata` in catbird-mls/src/mls_context.rs:
+    /// - Rebuilds RequiredCapabilities WITHOUT the retired plaintext 0xff00
+    ///   extension (defensively prunes legacy entries).
+    /// - Replaces any leftover plaintext 0xff00 extension with an empty
+    ///   payload during the same commit.
+    /// - Plans the next `MetadataReference` (fresh UUID locator,
+    ///   incremented version, empty hash) and writes it into the
+    ///   AppDataDictionary as an `AppDataUpdate` proposal AND directly via
+    ///   the commit-stage's `app_data_dictionary_updater`.
+    ///
+    /// Returns the serialized commit message bytes. Caller must:
+    ///   1. Send commit to server (action = "updateMetadata").
+    ///   2. On success, call `merge_pending_commit` to advance epoch.
+    ///   3. After merge, derive metadata key via
+    ///      `derive_metadata_key_from_group` against the post-merge epoch
+    ///      and upload the encrypted blob via `putGroupMetadataBlob`.
+    ///   4. On server failure, call `clear_pending_commit`.
+    pub(crate) fn update_group_metadata(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        use catbird_mls::group_metadata::CATBIRD_METADATA_EXTENSION_TYPE;
+        use catbird_mls::metadata;
+
+        self.ensure_loaded(&group_id)?;
+        let mut groups = self.groups.borrow_mut();
+        let group = groups
+            .get_mut(&group_id)
+            .expect("ensure_loaded guarantees presence");
+
+        let (identity, pub_key) = {
+            let leaf = group
+                .own_leaf()
+                .ok_or_else(|| MLSError::invalid_input("group has no own leaf"))?;
+            (
+                leaf.credential().serialized_content().to_vec(),
+                leaf.signature_key().as_slice().to_vec(),
+            )
+        };
+        let signer = self.signer_from_identity(identity, pub_key)?;
+
+        // Clone existing extensions; we must preserve any not-our-business
+        // extensions (e.g. RequiredCapabilities for AppData/RatchetTree).
+        let mut extensions = group.extensions().clone();
+
+        // Rebuild RequiredCapabilities WITHOUT the retired 0xff00.
+        let existing_rc = extensions.required_capabilities().cloned();
+        let mut ext_types: Vec<ExtensionType> = existing_rc
+            .as_ref()
+            .map(|rc| {
+                rc.extension_types()
+                    .iter()
+                    .copied()
+                    .filter(|t| {
+                        !matches!(t, ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !ext_types.contains(&ExtensionType::AppDataDictionary) {
+            ext_types.push(ExtensionType::AppDataDictionary);
+        }
+        if !ext_types.contains(&ExtensionType::RatchetTree) {
+            ext_types.push(ExtensionType::RatchetTree);
+        }
+
+        let mut proposal_types = existing_rc
+            .as_ref()
+            .map(|rc| rc.proposal_types().to_vec())
+            .unwrap_or_default();
+        if !proposal_types.contains(&ProposalType::AppDataUpdate) {
+            proposal_types.push(ProposalType::AppDataUpdate);
+        }
+        let credential_types = existing_rc
+            .as_ref()
+            .map(|rc| rc.credential_types().to_vec())
+            .unwrap_or_default();
+
+        extensions
+            .add_or_replace(Extension::RequiredCapabilities(
+                RequiredCapabilitiesExtension::new(
+                    &ext_types,
+                    &proposal_types,
+                    &credential_types,
+                ),
+            ))
+            .map_err(|e| {
+                MLSError::OpenMLS(format!(
+                    "Failed to add required capabilities extension: {e:?}"
+                ))
+            })?;
+
+        // Replace any pre-existing plaintext 0xff00 extension with empty.
+        if extensions
+            .unknown(CATBIRD_METADATA_EXTENSION_TYPE)
+            .is_some()
+        {
+            let _ = extensions.add_or_replace(Extension::Unknown(
+                CATBIRD_METADATA_EXTENSION_TYPE,
+                UnknownExtension(Vec::new()),
+            ));
+        }
+
+        // Always advance the encrypted MetadataReference for this commit.
+        // `metadata_changed = true` because each call should bump version.
+        // `had_metadata_before` reflects whether any plaintext 0xff00 was
+        // ever set on this group (legacy concern; mostly false post-cutover).
+        let had_metadata_before =
+            catbird_mls::group_metadata::GroupMetadata::from_group(group).is_some();
+        let planned_reference_json = metadata::planned_metadata_reference_json(
+            metadata::current_metadata_reference(group).as_ref(),
+            had_metadata_before,
+            true,
+        )
+        .map_err(|e| MLSError::OpenMLS(format!("plan metadata reference: {e:?}")))?;
+
+        let mut commit_builder = group
+            .commit_builder()
+            .propose_group_context_extensions(extensions)
+            .map_err(|e| {
+                MLSError::OpenMLS(format!("propose_group_context_extensions: {e:?}"))
+            })?;
+
+        if let Some(ref ref_json) = planned_reference_json {
+            commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
+                AppDataUpdateProposal::update(
+                    metadata::METADATA_REFERENCE_COMPONENT_ID,
+                    ref_json.clone(),
+                ),
+            )));
+        }
+
+        let mut commit_stage = commit_builder
+            .load_psks(self.provider.storage())
+            .map_err(|e| MLSError::OpenMLS(format!("load_psks: {e:?}")))?;
+
+        if let Some(ref_json) = planned_reference_json {
+            let mut updater = commit_stage.app_data_dictionary_updater();
+            updater.set(ComponentData::from_parts(
+                metadata::METADATA_REFERENCE_COMPONENT_ID,
+                ref_json.into(),
+            ));
+            commit_stage.with_app_data_dictionary_updates(updater.changes());
+        }
+
+        let commit_bundle = commit_stage
+            .build(self.provider.rand(), self.provider.crypto(), &signer, |_| true)
+            .map_err(|e| MLSError::OpenMLS(format!("build metadata commit: {e:?}")))?
+            .stage_commit(&self.provider)
+            .map_err(|e| MLSError::OpenMLS(format!("stage metadata commit: {e:?}")))?;
+
+        let (commit_msg, _welcome, _group_info) = commit_bundle.into_contents();
+
+        commit_msg
+            .tls_serialize_detached()
+            .map_err(|e| MLSError::OpenMLS(format!("commit serialize: {e:?}")))
+    }
+
+    /// Read the current `MetadataReference` (encrypted-blob path) from the
+    /// group's AppDataDictionary together with the metadata encryption key
+    /// derived from the current epoch's exporter secret.
+    ///
+    /// Returns `None` if the group is not loaded or has no
+    /// `MetadataReference` set yet (typical for groups that haven't had a
+    /// metadata commit yet — e.g. just after Welcome).
+    ///
+    /// The returned tuple is `(metadata_key_32_bytes, epoch, reference)`.
+    pub(crate) fn current_metadata_info(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<Option<(Vec<u8>, u64, Option<catbird_mls::metadata::MetadataReference>)>, MLSError> {
+        use catbird_mls::metadata;
+
+        self.ensure_loaded(&group_id)?;
+        let mut groups = self.groups.borrow_mut();
+        let group = match groups.get_mut(&group_id) {
+            Some(g) => g,
+            None => return Ok(None),
+        };
+        let epoch = group.epoch().as_u64();
+        let reference = metadata::current_metadata_reference(group);
+
+        let key = match metadata::derive_metadata_key_from_group(
+            group,
+            self.provider.crypto(),
+            self.provider.storage(),
+            &group_id,
+            epoch,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                return Err(MLSError::OpenMLS(format!(
+                    "derive_metadata_key_from_group: {e:?}"
+                )));
+            }
+        };
+
+        Ok(Some((key.to_vec(), epoch, reference)))
     }
 
     // ------------------------------------------------------------------

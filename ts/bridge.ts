@@ -237,3 +237,149 @@ export async function checkOptInStatus(
   const wasm = await getWasm()
   return wasm.catbird_mls_check_opt_in_status(dids)
 }
+
+// ---------------------------------------------------------------------------
+// Group metadata (encrypted-only path; MLS metadata cutover)
+// ---------------------------------------------------------------------------
+
+/**
+ * Decrypted group metadata payload returned by `bootstrapGroupMetadata`
+ * and `getGroupMetadata`. Mirrors `GroupMetadataV1` in the Rust core.
+ *
+ * `avatarBytesBase64` is the raw decoded avatar image bytes encoded as
+ * base64 — render via `Blob`/`URL.createObjectURL`. See
+ * `avatarBytesToObjectUrl` below.
+ */
+export interface GroupMetadata {
+  title: string
+  description: string
+  avatarBlobLocator?: string | null
+  avatarContentType?: string | null
+  avatarBytesBase64?: string | null
+  metadataVersion?: number
+  epoch?: number
+}
+
+export interface UpdateMetadataResult {
+  commitBytes: string
+  ciphertext: string
+  reference: {
+    schema: string
+    metadata_version: number
+    blob_locator: string
+    ciphertext_hash: number[]
+  }
+  metadataVersion: number
+  epoch: number
+}
+
+/**
+ * Bootstrap group metadata after a Welcome / external join / commit-merge.
+ *
+ * Hosts MUST call this:
+ *   - After `process_welcome` returns successfully (new group joined).
+ *   - After `merge_incoming_commit` for any incoming commit (an
+ *     `updateMetadata` commit from a peer is otherwise invisible in JS).
+ *   - After `create_external_commit` + merge during rejoin / first-responder
+ *     reset bootstrap.
+ *
+ * Returns `null` if the group has no `MetadataReference` set (typical for
+ * groups that haven't yet had an `updateMetadata` commit).
+ *
+ * The decrypted result is also persisted to the local OPFS-SQLite cache
+ * so subsequent `listConversations` / `getGroupMetadata` calls return
+ * the title / description / avatar without re-fetching.
+ */
+export async function bootstrapGroupMetadata(
+  groupIdHex: string,
+): Promise<GroupMetadata | null> {
+  const wasm = await getWasm()
+  const result = await wasm.wasm_bootstrap_group_metadata(groupIdHex)
+  return result ?? null
+}
+
+/**
+ * Update a group's title / description / avatar via the encrypted-blob
+ * path. Stages a `GroupContextExtensions` commit, sends `updateMetadata`
+ * to the server, merges locally, then encrypts and uploads the new blob.
+ *
+ * `avatarBytes` is raw image bytes (e.g. the contents of a File). If you
+ * pass `avatarBytes`, also pass `avatarBlobLocator` (a fresh UUIDv4 lower-
+ * case string) and `avatarContentType` (e.g. `"image/jpeg"`).
+ */
+export async function updateGroupMetadata(args: {
+  conversationId: string
+  title?: string
+  description?: string
+  avatarBlobLocator?: string
+  avatarContentType?: string
+  avatarBytes?: Uint8Array
+}): Promise<UpdateMetadataResult> {
+  const wasm = await getWasm()
+  return wasm.catbird_mls_update_group_metadata(
+    args.conversationId,
+    args.title,
+    args.description,
+    args.avatarBlobLocator,
+    args.avatarContentType,
+    args.avatarBytes,
+  )
+}
+
+/**
+ * Read locally cached decrypted metadata for a group. Returns `null` if no
+ * bootstrap has run yet for this group.
+ */
+export async function getGroupMetadata(
+  conversationId: string,
+): Promise<GroupMetadata | null> {
+  const wasm = await getWasm()
+  const result = wasm.catbird_mls_get_group_metadata(conversationId)
+  return result ?? null
+}
+
+/**
+ * Re-publish encrypted metadata after a server-initiated group reset.
+ *
+ * Call this from the reset-handling flow once the new group is joined and
+ * the local epoch is stable. Re-encrypts the previously cached title /
+ * description / avatar under the new group's epoch exporter and uploads
+ * the blobs to the server.
+ *
+ * Returns `null` if there's nothing to republish (e.g. the conversation
+ * never had any metadata).
+ */
+export async function republishMetadataAfterReset(
+  newGroupIdHex: string,
+  resetGeneration?: number | bigint,
+): Promise<GroupMetadata | null> {
+  const wasm = await getWasm()
+  const arg =
+    typeof resetGeneration === 'number'
+      ? BigInt(resetGeneration)
+      : resetGeneration
+  const result = await wasm.wasm_republish_metadata_after_reset(
+    newGroupIdHex,
+    arg,
+  )
+  return result ?? null
+}
+
+/**
+ * Convert base64-encoded avatar bytes (as returned by `bootstrapGroupMetadata`
+ * / `getGroupMetadata`) into a Blob URL suitable for `<img src>`. Caller is
+ * responsible for `URL.revokeObjectURL` when the avatar is no longer
+ * displayed (e.g. on conversation header unmount).
+ */
+export function avatarBytesToObjectUrl(
+  avatarBytesBase64: string,
+  contentType: string | null | undefined,
+): string {
+  const binary = atob(avatarBytesBase64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  const blob = new Blob([bytes], { type: contentType ?? 'application/octet-stream' })
+  return URL.createObjectURL(blob)
+}

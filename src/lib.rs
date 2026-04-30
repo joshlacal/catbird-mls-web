@@ -1042,21 +1042,23 @@ pub async fn catbird_mls_list_conversations() -> Result<JsValue, JsValue> {
         .into_iter()
         .map(|c| {
             let member_dids: Vec<String> = c.members.iter().map(|m| m.did.clone()).collect();
-            // Decrypt MLS group metadata (name/description stored in encrypted extensions)
-            let mls_metadata = with_state(|s| {
-                if let Some(ctx) = &s.mls_context {
-                    if let Some(gid) = decode_group_id(&c.group_id) {
-                        return Ok(ctx.get_group_metadata(gid));
-                    }
-                }
-                Ok(None)
+            // MLS metadata cutover: read display name from the local
+            // decrypted-blob cache only. The plaintext 0xff00 extension and
+            // server-visible `convoView.metadata.name` are both retired —
+            // bootstrap (`wasm_bootstrap_group_metadata`) populates the
+            // `conversations.title` column from the encrypted blob path
+            // after every Welcome / commit-merge that touches metadata.
+            let cached_title: Option<String> = with_state(|s| {
+                Ok(s.storage
+                    .get_metadata_text(&c.group_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|(title, _desc)| title))
             })
             .ok()
             .flatten();
-            let display_name = mls_metadata
-                .as_ref()
-                .and_then(|m| m.name.clone())
-                .or_else(|| c.metadata.as_ref().and_then(|m| m.name.clone()))
+            let display_name = cached_title
+                .filter(|t: &String| !t.is_empty())
                 .unwrap_or_else(|| member_dids.join(", "));
             Conversation {
                 id: c.group_id,
@@ -2292,42 +2294,568 @@ pub async fn catbird_mls_promote_member(
     Ok(())
 }
 
-/// Read MLS group metadata (name/description/avatar) from local state.
+/// Read MLS group metadata (title/description/avatar) from local decrypted
+/// state.
+///
+/// Post-cutover this reads from the locally persisted decrypted blob
+/// (populated by `wasm_bootstrap_group_metadata` after every Welcome /
+/// commit-merge). Returns `null` if no bootstrap has run for this group.
 #[wasm_bindgen]
 pub fn catbird_mls_get_group_metadata(conversation_id: String) -> Result<JsValue, JsValue> {
-    let metadata = with_state(|s| {
-        if let Some(ctx) = &s.mls_context {
-            if let Some(gid) = decode_group_id(&conversation_id) {
-                return Ok(ctx.get_group_metadata(gid));
-            }
-        }
-        Ok(None)
+    let group_id_hex = match decode_group_id(&conversation_id) {
+        Some(b) => hex::encode(b),
+        None => return Ok(JsValue::NULL),
+    };
+
+    let text = with_state(|s| {
+        Ok(s.storage
+            .get_metadata_text(&group_id_hex)
+            .ok()
+            .flatten())
+    })?;
+    let avatar = with_state(|s| {
+        Ok(s.storage
+            .get_metadata_avatar(&group_id_hex)
+            .ok()
+            .flatten())
     })?;
 
-    match metadata {
-        Some(m) => to_js(&serde_json::json!({
-            "name": m.name,
-            "description": m.description,
-            "avatarBlobHash": m.avatar_hash,
-        })),
+    match text {
+        Some((title, description)) => {
+            let avatar_b64 = avatar
+                .as_ref()
+                .map(|(b, _ct)| base64::engine::general_purpose::STANDARD.encode(b));
+            let avatar_ct = avatar.as_ref().and_then(|(_, ct)| ct.clone());
+            to_js(&serde_json::json!({
+                "title": title,
+                "description": description,
+                "avatarBytesBase64": avatar_b64,
+                "avatarContentType": avatar_ct,
+            }))
+        }
         None => Ok(JsValue::NULL),
     }
 }
 
-/// Update MLS group metadata via encrypted extension.
+/// Update MLS group metadata via the encrypted-blob path (post-cutover).
 ///
-/// NOTE: Full implementation requires porting group-extension commit logic to
-/// `WasmMLSContext`. For now this is a stub.
+/// Mirrors the iOS / Android contract: stages a `GroupContextExtensions`
+/// commit that bumps the `MetadataReference` in AppDataDictionary 0x8001,
+/// sends it to the server with `action = "updateMetadata"`, merges locally
+/// on success, then derives the post-merge metadata key from the new
+/// epoch's exporter, encrypts `GroupMetadataV1` (and optionally an avatar
+/// blob), and uploads via `putGroupMetadataBlob`.
+///
+/// Returns a JS object with `commitBytes` (base64), `ciphertext` (base64),
+/// `reference` (the `MetadataReference` JSON), and `metadataVersion`.
+/// The ciphertext echo is informational — uploading happens internally.
 #[wasm_bindgen]
 pub async fn catbird_mls_update_group_metadata(
-    _conversation_id: String,
-    _name: Option<String>,
-    _description: Option<String>,
-    _avatar_hash: Option<String>,
-) -> Result<(), JsValue> {
-    Err(js_err!(
-        "update_group_metadata is not yet supported in the browser runtime"
-    ))
+    conversation_id: String,
+    title: Option<String>,
+    description: Option<String>,
+    avatar_blob_locator: Option<String>,
+    avatar_content_type: Option<String>,
+    avatar_bytes: Option<Vec<u8>>,
+) -> Result<JsValue, JsValue> {
+    use catbird_mls::metadata;
+
+    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
+    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+
+    let group_id_bytes = decode_group_id(&conversation_id)
+        .ok_or_else(|| js_err!("Invalid conversation/group ID: {}", conversation_id))?;
+    let group_id_hex = hex::encode(&group_id_bytes);
+
+    // 1. Stage the GroupContextExtensions commit locally.
+    let commit_bytes = with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+        ctx.update_group_metadata(group_id_bytes.clone())
+            .map_err(|e| js_err!("update_group_metadata stage failed: {:?}", e))
+    })?;
+
+    // 2. Send commit to server (action = "updateMetadata").
+    let (success, new_epoch) = match api_client
+        .commit_update_metadata(&conversation_id, &commit_bytes)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Server rejected — clear pending so the group isn't stuck.
+            let _ = with_state(|s| {
+                if let Some(ctx) = s.mls_context.as_ref() {
+                    let _ = ctx.clear_pending_commit(group_id_bytes.clone());
+                }
+                Ok(())
+            });
+            return Err(js_err!("commit_update_metadata server call failed: {:?}", e));
+        }
+    };
+    if !success {
+        let _ = with_state(|s| {
+            if let Some(ctx) = s.mls_context.as_ref() {
+                let _ = ctx.clear_pending_commit(group_id_bytes.clone());
+            }
+            Ok(())
+        });
+        return Err(js_err!("Server rejected updateMetadata commit"));
+    }
+
+    // 3. Merge pending commit locally (epoch advances).
+    let local_epoch = with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+        ctx.merge_pending_commit(group_id_bytes.clone())
+            .map_err(|e| js_err!("merge_pending_commit failed: {:?}", e))
+    })?;
+
+    // 4. Cache server epoch.
+    if new_epoch > 0 {
+        SERVER_EPOCHS.with(|m| {
+            m.borrow_mut()
+                .insert(conversation_id.clone(), new_epoch)
+        });
+    }
+
+    // 5. Read post-merge MetadataReference + derive metadata key from new
+    //    epoch's exporter secret.
+    let (metadata_key_vec, epoch_used, reference) = with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+        ctx.current_metadata_info(group_id_bytes.clone())
+            .map_err(|e| js_err!("current_metadata_info failed: {:?}", e))?
+            .ok_or_else(|| js_err!("MetadataReference missing after metadata commit merge"))
+    })?;
+    let reference = reference
+        .ok_or_else(|| js_err!("MetadataReference missing in AppDataDictionary post-merge"))?;
+    let metadata_version = reference.metadata_version;
+    let blob_locator = reference.blob_locator.clone();
+
+    let mut metadata_key = [0u8; 32];
+    if metadata_key_vec.len() != 32 {
+        return Err(js_err!(
+            "Derived metadata key has wrong length: {} (expected 32)",
+            metadata_key_vec.len()
+        ));
+    }
+    metadata_key.copy_from_slice(&metadata_key_vec);
+
+    // 6. Build GroupMetadataV1 payload + encrypt.
+    let payload = metadata::GroupMetadataV1 {
+        version: 1,
+        title: title.clone().unwrap_or_default(),
+        description: description.clone().unwrap_or_default(),
+        avatar_blob_locator: avatar_blob_locator.clone(),
+        avatar_content_type: avatar_content_type.clone(),
+    };
+
+    let ciphertext = metadata::encrypt_metadata_blob(
+        &metadata_key,
+        &group_id_bytes,
+        epoch_used,
+        metadata_version,
+        &payload,
+    )
+    .map_err(|e| js_err!("encrypt_metadata_blob failed: {:?}", e))?;
+
+    // 7. Upload metadata blob.
+    let (_confirmed_locator, _size) = api_client
+        .put_group_metadata_blob(
+            &blob_locator,
+            &group_id_hex,
+            &ciphertext,
+            Some(metadata_version),
+            None,
+        )
+        .await
+        .map_err(|e| {
+            // Non-fatal: commit already merged. Surface as error so JS knows
+            // the title/description are temporarily unavailable to peers,
+            // but the group is otherwise healthy. Mirrors iOS warning path.
+            js_err!("put_group_metadata_blob failed: {:?}", e)
+        })?;
+
+    // 8. Optional avatar encrypt + upload.
+    if let (Some(av_locator), Some(av_bytes)) =
+        (avatar_blob_locator.as_deref(), avatar_bytes.as_deref())
+    {
+        let av_ct = metadata::encrypt_avatar_blob(
+            &metadata_key,
+            &group_id_bytes,
+            epoch_used,
+            metadata_version,
+            av_bytes,
+        )
+        .map_err(|e| js_err!("encrypt_avatar_blob failed: {:?}", e))?;
+        let _ = api_client
+            .put_group_metadata_blob(
+                av_locator,
+                &group_id_hex,
+                &av_ct,
+                Some(metadata_version),
+                Some("avatar"),
+            )
+            .await
+            .map_err(|e| js_err!("put_group_metadata_blob (avatar) failed: {:?}", e))?;
+    }
+
+    // 9. Persist the decrypted state locally so the conversation list /
+    //    header render the new title/description without a re-fetch.
+    let _ = storage.upsert_metadata(
+        &group_id_hex,
+        Some(&payload.title),
+        Some(&payload.description),
+        metadata_version as i64,
+        avatar_blob_locator.as_deref(),
+        avatar_content_type.as_deref(),
+        avatar_bytes.as_deref(),
+    );
+
+    // 10. Echo result back to JS.
+    let reference_json = serde_json::to_value(&reference)
+        .map_err(|e| js_err!("serialize MetadataReference: {}", e))?;
+    let _ = local_epoch; // currently unused beyond the merge guarantee
+    to_js(&serde_json::json!({
+        "commitBytes": base64::engine::general_purpose::STANDARD.encode(&commit_bytes),
+        "ciphertext": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+        "reference": reference_json,
+        "metadataVersion": metadata_version,
+        "epoch": epoch_used,
+    }))
+}
+
+/// Bootstrap (decrypt and persist locally) the current group metadata after
+/// a Welcome / external join / commit-merge that touched metadata.
+///
+/// Reads the `MetadataReference` from AppDataDictionary, derives the
+/// metadata key from the current epoch's exporter, fetches the encrypted
+/// blob via `getGroupMetadataBlob`, decrypts it, persists title /
+/// description / avatar locator to local storage, and returns
+/// `{title, description, avatarBlobLocator, metadataVersion}` to JS for
+/// immediate UI updates. Also fetches+decrypts the avatar blob if a
+/// locator is present and persists the raw bytes.
+///
+/// Returns `null` if the group has no `MetadataReference` yet (e.g. just
+/// after a fresh group creation that hasn't run an `updateMetadata` commit).
+#[wasm_bindgen]
+pub async fn wasm_bootstrap_group_metadata(
+    group_id_hex: String,
+) -> Result<JsValue, JsValue> {
+    use catbird_mls::metadata;
+
+    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
+    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+
+    let group_id_bytes = decode_group_id(&group_id_hex)
+        .ok_or_else(|| js_err!("Invalid group_id_hex: {}", group_id_hex))?;
+    let group_id_hex_norm = hex::encode(&group_id_bytes);
+
+    let info = with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+        ctx.current_metadata_info(group_id_bytes.clone())
+            .map_err(|e| js_err!("current_metadata_info failed: {:?}", e))
+    })?;
+
+    let (metadata_key_vec, epoch, reference) = match info {
+        Some(t) => t,
+        None => return Ok(JsValue::NULL),
+    };
+    let reference = match reference {
+        Some(r) => r,
+        None => return Ok(JsValue::NULL),
+    };
+    let metadata_version = reference.metadata_version;
+
+    let mut metadata_key = [0u8; 32];
+    if metadata_key_vec.len() != 32 {
+        return Err(js_err!(
+            "Derived metadata key has wrong length: {} (expected 32)",
+            metadata_key_vec.len()
+        ));
+    }
+    metadata_key.copy_from_slice(&metadata_key_vec);
+
+    // Fetch encrypted blob from server.
+    let ciphertext = api_client
+        .get_group_metadata_blob(
+            &reference.blob_locator,
+            &group_id_hex_norm,
+            Some(metadata_version),
+            None,
+        )
+        .await
+        .map_err(|e| js_err!("get_group_metadata_blob failed: {:?}", e))?;
+
+    // Decrypt.
+    let payload = metadata::decrypt_metadata_blob(
+        &metadata_key,
+        &group_id_bytes,
+        epoch,
+        metadata_version,
+        &ciphertext,
+    )
+    .map_err(|e| js_err!("decrypt_metadata_blob failed: {:?}", e))?;
+
+    // Optionally fetch + decrypt avatar.
+    let mut avatar_bytes: Option<Vec<u8>> = None;
+    if let Some(ref av_locator) = payload.avatar_blob_locator {
+        if !av_locator.is_empty() {
+            match api_client
+                .get_group_metadata_blob(
+                    av_locator,
+                    &group_id_hex_norm,
+                    Some(metadata_version),
+                    Some("avatar"),
+                )
+                .await
+            {
+                Ok(av_ct) => match metadata::decrypt_avatar_blob(
+                    &metadata_key,
+                    &group_id_bytes,
+                    epoch,
+                    metadata_version,
+                    &av_ct,
+                ) {
+                    Ok(av_bytes) => avatar_bytes = Some(av_bytes),
+                    Err(e) => {
+                        web_sys::console::warn_1(&JsValue::from_str(&format!(
+                            "[bootstrap] avatar decrypt failed: {:?}",
+                            e
+                        )));
+                    }
+                },
+                Err(e) => {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "[bootstrap] avatar fetch failed: {:?}",
+                        e
+                    )));
+                }
+            }
+        }
+    }
+
+    // Persist locally.
+    let _ = storage.upsert_metadata(
+        &group_id_hex_norm,
+        Some(&payload.title),
+        Some(&payload.description),
+        metadata_version as i64,
+        payload.avatar_blob_locator.as_deref(),
+        payload.avatar_content_type.as_deref(),
+        avatar_bytes.as_deref(),
+    );
+
+    // Build JS object.
+    let avatar_b64 = avatar_bytes
+        .as_ref()
+        .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
+    to_js(&serde_json::json!({
+        "title": payload.title,
+        "description": payload.description,
+        "avatarBlobLocator": payload.avatar_blob_locator,
+        "avatarContentType": payload.avatar_content_type,
+        "avatarBytesBase64": avatar_b64,
+        "metadataVersion": metadata_version,
+        "epoch": epoch,
+    }))
+}
+
+/// Re-publish encrypted metadata after a group reset (`bootstrap_reset_group`
+/// or first-responder reset). The new MLS group has a fresh epoch, so we
+/// must derive a new metadata key, re-encrypt the existing title /
+/// description / avatar payload (read from local storage) under that key,
+/// and upload the blobs to the server's reset_generation slot.
+///
+/// Caller must already have:
+/// - Joined / created the post-reset group.
+/// - Persisted the desired title / description / avatar to local storage
+///   via a prior bootstrap or update.
+///
+/// `reset_generation` is currently informational — the server's
+/// `putGroupMetadataBlob` accepts it as an optional query param.
+#[wasm_bindgen]
+pub async fn wasm_republish_metadata_after_reset(
+    new_group_id_hex: String,
+    reset_generation: Option<u64>,
+) -> Result<JsValue, JsValue> {
+    use catbird_mls::metadata;
+
+    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
+    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+
+    let group_id_bytes = decode_group_id(&new_group_id_hex)
+        .ok_or_else(|| js_err!("Invalid new_group_id_hex: {}", new_group_id_hex))?;
+    let group_id_hex_norm = hex::encode(&group_id_bytes);
+
+    // 1. Read locally cached title/description/avatar from previous group.
+    let (title_opt, desc_opt) = storage
+        .get_metadata_text(&group_id_hex_norm)
+        .map_err(|e| js_err!("get_metadata_text: {}", e))?
+        .unwrap_or((None, None));
+    let avatar = storage
+        .get_metadata_avatar(&group_id_hex_norm)
+        .map_err(|e| js_err!("get_metadata_avatar: {}", e))?;
+
+    let title = title_opt.unwrap_or_default();
+    let description = desc_opt.unwrap_or_default();
+
+    if title.is_empty() && description.is_empty() && avatar.is_none() {
+        // Nothing to republish — no-op for first-time creators.
+        return Ok(JsValue::NULL);
+    }
+
+    // 2. Stage an updateMetadata commit on the new group so we have a fresh
+    //    MetadataReference (locator + version=1) to upload against.
+    let commit_bytes = with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+        ctx.update_group_metadata(group_id_bytes.clone())
+            .map_err(|e| js_err!("update_group_metadata stage failed: {:?}", e))
+    })?;
+
+    let (success, new_epoch) = api_client
+        .commit_update_metadata(&group_id_hex_norm, &commit_bytes)
+        .await
+        .map_err(|e| {
+            let _ = with_state(|s| {
+                if let Some(ctx) = s.mls_context.as_ref() {
+                    let _ = ctx.clear_pending_commit(group_id_bytes.clone());
+                }
+                Ok(())
+            });
+            js_err!("commit_update_metadata (reset republish) failed: {:?}", e)
+        })?;
+    if !success {
+        let _ = with_state(|s| {
+            if let Some(ctx) = s.mls_context.as_ref() {
+                let _ = ctx.clear_pending_commit(group_id_bytes.clone());
+            }
+            Ok(())
+        });
+        return Err(js_err!("Server rejected reset-republish updateMetadata"));
+    }
+
+    let _ = with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+        ctx.merge_pending_commit(group_id_bytes.clone())
+            .map_err(|e| js_err!("merge_pending_commit failed: {:?}", e))
+    })?;
+    let _ = new_epoch;
+
+    // 3. Read post-merge MetadataReference + derive new metadata key.
+    let (metadata_key_vec, epoch_used, reference) = with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+        ctx.current_metadata_info(group_id_bytes.clone())
+            .map_err(|e| js_err!("current_metadata_info failed: {:?}", e))?
+            .ok_or_else(|| js_err!("MetadataReference missing after reset-republish merge"))
+    })?;
+    let reference = reference
+        .ok_or_else(|| js_err!("MetadataReference missing in AppDataDictionary post-merge"))?;
+    let metadata_version = reference.metadata_version;
+    let mut metadata_key = [0u8; 32];
+    if metadata_key_vec.len() != 32 {
+        return Err(js_err!("metadata key wrong length"));
+    }
+    metadata_key.copy_from_slice(&metadata_key_vec);
+
+    let avatar_bytes = avatar.as_ref().map(|(b, _ct)| b.clone());
+    let avatar_content_type = avatar.as_ref().and_then(|(_, ct)| ct.clone());
+    let avatar_blob_locator = if avatar_bytes.is_some() {
+        Some(uuid::Uuid::new_v4().to_string().to_lowercase())
+    } else {
+        None
+    };
+
+    let payload = metadata::GroupMetadataV1 {
+        version: 1,
+        title: title.clone(),
+        description: description.clone(),
+        avatar_blob_locator: avatar_blob_locator.clone(),
+        avatar_content_type: avatar_content_type.clone(),
+    };
+
+    // 4. Encrypt + upload metadata blob (under fresh epoch's key).
+    let metadata_ct = metadata::encrypt_metadata_blob(
+        &metadata_key,
+        &group_id_bytes,
+        epoch_used,
+        metadata_version,
+        &payload,
+    )
+    .map_err(|e| js_err!("encrypt_metadata_blob (reset): {:?}", e))?;
+    let _ = api_client
+        .put_group_metadata_blob(
+            &reference.blob_locator,
+            &group_id_hex_norm,
+            &metadata_ct,
+            Some(metadata_version),
+            None,
+        )
+        .await
+        .map_err(|e| js_err!("put_group_metadata_blob (reset metadata): {:?}", e))?;
+
+    // 5. Re-encrypt + upload avatar blob if we have one.
+    if let (Some(av_bytes), Some(av_locator)) =
+        (avatar_bytes.as_deref(), avatar_blob_locator.as_deref())
+    {
+        let av_ct = metadata::encrypt_avatar_blob(
+            &metadata_key,
+            &group_id_bytes,
+            epoch_used,
+            metadata_version,
+            av_bytes,
+        )
+        .map_err(|e| js_err!("encrypt_avatar_blob (reset): {:?}", e))?;
+        let _ = api_client
+            .put_group_metadata_blob(
+                av_locator,
+                &group_id_hex_norm,
+                &av_ct,
+                Some(metadata_version),
+                Some("avatar"),
+            )
+            .await
+            .map_err(|e| js_err!("put_group_metadata_blob (reset avatar): {:?}", e))?;
+    }
+
+    // 6. Persist the (possibly-new-locator) avatar metadata so subsequent
+    //    bootstraps round-trip cleanly.
+    let _ = storage.upsert_metadata(
+        &group_id_hex_norm,
+        Some(&title),
+        Some(&description),
+        metadata_version as i64,
+        avatar_blob_locator.as_deref(),
+        avatar_content_type.as_deref(),
+        avatar_bytes.as_deref(),
+    );
+
+    let _ = reset_generation;
+    to_js(&serde_json::json!({
+        "title": title,
+        "description": description,
+        "avatarBlobLocator": avatar_blob_locator,
+        "metadataVersion": metadata_version,
+        "epoch": epoch_used,
+    }))
 }
 
 // ---------------------------------------------------------------------------

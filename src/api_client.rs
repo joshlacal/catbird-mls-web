@@ -425,18 +425,36 @@ impl WasmApiClient {
     }
 
     /// Upload an encrypted group metadata blob keyed by a client-generated locator.
+    ///
+    /// Optional `metadata_version` and `kind` query params let the server bind
+    /// the upload to a specific epoch/version (so concurrent committers don't
+    /// clobber each other) and distinguish metadata blobs from avatar blobs
+    /// (`kind = "avatar"` mirrors the iOS contract).
     pub async fn put_group_metadata_blob(
         &self,
         blob_locator: &str,
         group_id: &str,
         encrypted_blob: &[u8],
+        metadata_version: Option<u64>,
+        kind: Option<&str>,
     ) -> Result<(String, usize)> {
         let token = self.auth_header()?;
+        let version_str = metadata_version.map(|v| v.to_string());
+        let mut query: Vec<(&str, &str)> = vec![
+            ("blobLocator", blob_locator),
+            ("groupId", group_id),
+        ];
+        if let Some(ref v) = version_str {
+            query.push(("metadataVersion", v.as_str()));
+        }
+        if let Some(k) = kind {
+            query.push(("kind", k));
+        }
         let resp = self
             .client
             .post(self.xrpc_url(lexicon::put_group_metadata_blob::NSID))
             .bearer_auth(&token)
-            .query(&[("blobLocator", blob_locator), ("groupId", group_id)])
+            .query(&query)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(encrypted_blob.to_vec())
             .send()
@@ -461,17 +479,32 @@ impl WasmApiClient {
     }
 
     /// Fetch an encrypted group metadata blob by locator.
+    ///
+    /// Optional `metadata_version` and `kind` mirror the iOS contract.
     pub async fn get_group_metadata_blob(
         &self,
         blob_locator: &str,
         group_id: &str,
+        metadata_version: Option<u64>,
+        kind: Option<&str>,
     ) -> Result<Vec<u8>> {
         let token = self.auth_header()?;
+        let version_str = metadata_version.map(|v| v.to_string());
+        let mut query: Vec<(&str, &str)> = vec![
+            ("blobLocator", blob_locator),
+            ("groupId", group_id),
+        ];
+        if let Some(ref v) = version_str {
+            query.push(("metadataVersion", v.as_str()));
+        }
+        if let Some(k) = kind {
+            query.push(("kind", k));
+        }
         let resp = self
             .client
             .get(self.xrpc_url(lexicon::get_group_metadata_blob::NSID))
             .bearer_auth(&token)
-            .query(&[("blobLocator", blob_locator), ("groupId", group_id)])
+            .query(&query)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -561,6 +594,56 @@ impl WasmApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         Ok(body.to_vec())
+    }
+
+    /// Send an `updateMetadata` commit to the server (MLS metadata cutover).
+    ///
+    /// Mirrors `add_members` in the trait impl below: uses
+    /// `build_commit_group_change` directly with `action = "updateMetadata"`
+    /// to avoid the `String → bytes::Bytes` UTF-8 double-encoding bug from
+    /// the catbird-atproto adapter.
+    ///
+    /// Returns `(success, new_epoch)` so callers can decide whether to merge
+    /// the local pending commit, clear it, or surface an error.
+    pub async fn commit_update_metadata(
+        &self,
+        convo_id: &str,
+        commit_data: &[u8],
+    ) -> Result<(bool, u64)> {
+        let token = self.auth_header()?;
+        let input = build_commit_group_change(
+            convo_id,
+            "updateMetadata",
+            Some(commit_data.to_vec()),
+            None, // no welcome
+            None, // no group_info
+            None, // confirmation_tag stubbed (TODO A7)
+            None, // no member_dids change
+            Some(uuid::Uuid::new_v4().to_string()),
+        );
+        let resp = self
+            .client
+            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
+            .bearer_auth(&token)
+            .json(&input)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(self.handle_error(resp).await);
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let output = parse_lexicon_json::<
+            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<'_>,
+        >(body.as_ref())?;
+        let new_epoch = output
+            .new_epoch
+            .and_then(|epoch| u64::try_from(epoch).ok())
+            .unwrap_or(0);
+        Ok((output.success, new_epoch))
     }
 }
 

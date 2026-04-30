@@ -78,6 +78,30 @@ impl WasmStorageBackend {
             "ALTER TABLE conversations ADD COLUMN reset_notified_at_ms INTEGER;",
         );
 
+        // Migration (MLS metadata cutover): persist decrypted group metadata
+        // locally. Server has no plaintext title / description / avatar; the
+        // encrypted-blob path (catbird_mls::metadata) is the only source of
+        // truth. We store the decrypted result here so the conversation
+        // list can render display names without re-fetching every load.
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN title TEXT;",
+        );
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN description TEXT;",
+        );
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN metadata_version INTEGER;",
+        );
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN avatar_blob_locator TEXT;",
+        );
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN avatar_content_type TEXT;",
+        );
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN avatar_bytes BLOB;",
+        );
+
         conn.exec_raw(
             "CREATE TABLE IF NOT EXISTS messages (
                 id              TEXT PRIMARY KEY,
@@ -196,6 +220,147 @@ impl WasmStorageBackend {
                 Err(e)
             }
         }
+    }
+
+    /// Upsert decrypted metadata for a conversation (MLS metadata cutover).
+    ///
+    /// `title`, `description`, `metadata_version`, `avatar_blob_locator`
+    /// come from `GroupMetadataV1` after decrypting the server blob.
+    /// `avatar_bytes` and `avatar_content_type` are persisted so the UI
+    /// can render the avatar from a locally stored Blob URL without
+    /// re-fetching every load.
+    ///
+    /// Looks up the conversation_id by group_id_hex (works for both pre-
+    /// and post-reset groups since the conversations row's group_id is
+    /// kept in sync via `update_conversation_group_id`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_metadata(
+        &self,
+        group_id_hex: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        metadata_version: i64,
+        avatar_blob_locator: Option<&str>,
+        avatar_content_type: Option<&str>,
+        avatar_bytes: Option<&[u8]>,
+    ) -> std::result::Result<(), String> {
+        let title_val = title.unwrap_or("");
+        let desc_val = description.unwrap_or("");
+        let avatar_locator_val = avatar_blob_locator.unwrap_or("");
+        let avatar_ct_val = avatar_content_type.unwrap_or("");
+
+        if let Some(bytes) = avatar_bytes {
+            self.conn
+                .exec_with_text_and_blob_params(
+                    "UPDATE conversations
+                       SET title = ?1,
+                           description = ?2,
+                           metadata_version = ?3,
+                           avatar_blob_locator = ?4,
+                           avatar_content_type = ?5,
+                           avatar_bytes = ?6
+                     WHERE group_id = ?7",
+                    &[
+                        (1, title_val),
+                        (2, desc_val),
+                        (4, avatar_locator_val),
+                        (5, avatar_ct_val),
+                        (7, group_id_hex),
+                    ],
+                    &[(6, bytes)],
+                )
+                .map_err(|e| format!("upsert_metadata UPDATE: {:?}", e))?;
+            // The mixed_params helper wraps text+int; emulate version write
+            // separately so we don't need a 4-way binder.
+            self.conn
+                .exec_with_mixed_params(
+                    "UPDATE conversations SET metadata_version = ?1 WHERE group_id = ?2",
+                    &[(2, group_id_hex)],
+                    &[(1, metadata_version)],
+                )
+                .map_err(|e| format!("upsert_metadata version: {:?}", e))?;
+        } else {
+            self.conn
+                .exec_with_text_params(
+                    "UPDATE conversations
+                       SET title = ?1,
+                           description = ?2,
+                           avatar_blob_locator = ?3,
+                           avatar_content_type = ?4
+                     WHERE group_id = ?5",
+                    &[
+                        (1, title_val),
+                        (2, desc_val),
+                        (3, avatar_locator_val),
+                        (4, avatar_ct_val),
+                        (5, group_id_hex),
+                    ],
+                )
+                .map_err(|e| format!("upsert_metadata UPDATE: {:?}", e))?;
+            self.conn
+                .exec_with_mixed_params(
+                    "UPDATE conversations SET metadata_version = ?1 WHERE group_id = ?2",
+                    &[(2, group_id_hex)],
+                    &[(1, metadata_version)],
+                )
+                .map_err(|e| format!("upsert_metadata version: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Read decrypted title/description for a conversation by group_id_hex.
+    /// Returns `(title, description)` tuple of optional strings; both may
+    /// be `None` if the conversation row exists but no metadata bootstrap
+    /// has run yet.
+    pub fn get_metadata_text(
+        &self,
+        group_id_hex: &str,
+    ) -> std::result::Result<Option<(Option<String>, Option<String>)>, String> {
+        let rows = self
+            .conn
+            .query_text(
+                "SELECT title, description FROM conversations WHERE group_id = ?1",
+                &[(1, group_id_hex)],
+                2,
+            )
+            .map_err(|e| format!("get_metadata_text: {:?}", e))?;
+        Ok(rows.into_iter().next().map(|row| {
+            let mut iter = row.into_iter();
+            let title = iter.next().flatten();
+            let description = iter.next().flatten();
+            (title, description)
+        }))
+    }
+
+    /// Read decrypted avatar bytes + content type for a group_id_hex.
+    pub fn get_metadata_avatar(
+        &self,
+        group_id_hex: &str,
+    ) -> std::result::Result<Option<(Vec<u8>, Option<String>)>, String> {
+        let bytes = self
+            .conn
+            .query_blob(
+                "SELECT avatar_bytes FROM conversations WHERE group_id = ?1",
+                &[(1, group_id_hex)],
+            )
+            .map_err(|e| format!("get_metadata_avatar bytes: {:?}", e))?;
+        let bytes = match bytes {
+            Some(b) if !b.is_empty() => b,
+            _ => return Ok(None),
+        };
+        let ct_rows = self
+            .conn
+            .query_text(
+                "SELECT avatar_content_type FROM conversations WHERE group_id = ?1",
+                &[(1, group_id_hex)],
+                1,
+            )
+            .map_err(|e| format!("get_metadata_avatar content_type: {:?}", e))?;
+        let content_type = ct_rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next().flatten());
+        Ok(Some((bytes, content_type)))
     }
 
     /// List all group IDs from the `group_states` table.

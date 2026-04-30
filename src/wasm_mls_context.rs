@@ -533,8 +533,8 @@ impl WasmMLSContext {
         &self,
         group_id: Vec<u8>,
     ) -> Result<Vec<u8>, MLSError> {
-        use catbird_mls::group_metadata::CATBIRD_METADATA_EXTENSION_TYPE;
         use catbird_mls::metadata;
+        use catbird_mls::metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE as CATBIRD_METADATA_EXTENSION_TYPE;
 
         self.ensure_loaded(&group_id)?;
         let mut groups = self.groups.borrow_mut();
@@ -617,13 +617,12 @@ impl WasmMLSContext {
 
         // Always advance the encrypted MetadataReference for this commit.
         // `metadata_changed = true` because each call should bump version.
-        // `had_metadata_before` reflects whether any plaintext 0xff00 was
-        // ever set on this group (legacy concern; mostly false post-cutover).
-        let had_metadata_before =
-            catbird_mls::group_metadata::GroupMetadata::from_group(group).is_some();
+        // Phase F: legacy 0xff00 reader removed; post-cutover + DB wipe,
+        // no group ever has the retired plaintext extension, so
+        // `had_metadata_before` is always false here.
         let planned_reference_json = metadata::planned_metadata_reference_json(
             metadata::current_metadata_reference(group).as_ref(),
-            had_metadata_before,
+            false,
             true,
         )
         .map_err(|e| MLSError::OpenMLS(format!("plan metadata reference: {e:?}")))?;
@@ -845,17 +844,10 @@ impl WasmMLSContext {
         Ok(group.epoch().as_u64())
     }
 
-    pub(crate) fn get_group_metadata(
-        &self,
-        group_id: Vec<u8>,
-    ) -> Option<catbird_mls::group_metadata::GroupMetadata> {
-        if self.ensure_loaded(&group_id).is_err() {
-            return None;
-        }
-        let groups = self.groups.borrow();
-        let group = groups.get(&group_id)?;
-        catbird_mls::group_metadata::GroupMetadata::from_group(group)
-    }
+    // `get_group_metadata` (legacy 0xff00 reader on the WASM context)
+    // removed in Phase F. The `catbird_mls_get_group_metadata` JS export
+    // (lib.rs) now reads from local OPFS-SQLite storage that's populated
+    // by `wasm_bootstrap_group_metadata` after every Welcome / commit-merge.
 
     pub(crate) fn export_group_info(
         &self,

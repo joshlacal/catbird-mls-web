@@ -923,6 +923,19 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
                     }).unwrap_or(0);
                     SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.to_string(), welcome_epoch));
 
+                    // MLS metadata cutover: bootstrap encrypted metadata so
+                    // the conversation list / header render the title +
+                    // description + avatar without waiting for a UI nudge.
+                    // Best-effort — never block the join path on this.
+                    let group_id_hex_for_bootstrap = jr.group_id
+                        .iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                    if let Err(e) = wasm_bootstrap_group_metadata(group_id_hex_for_bootstrap).await {
+                        web_sys::console::warn_1(&JsValue::from_str(&format!(
+                            "[bootstrap] post-Welcome bootstrap failed (non-fatal): {:?}",
+                            e
+                        )));
+                    }
+
                     return Ok(serde_json::json!({
                         "status": "joined_via_welcome",
                         "groupId": jr.group_id.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
@@ -1015,6 +1028,21 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
         server_result.epoch,
         local_epoch
     ));
+
+    // MLS metadata cutover: bootstrap encrypted metadata after external
+    // commit so the just-joined conversation displays title/description
+    // /avatar immediately. Best-effort — never block the join path.
+    let group_id_hex_for_bootstrap = ext_commit
+        .group_id
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    if let Err(e) = wasm_bootstrap_group_metadata(group_id_hex_for_bootstrap).await {
+        web_sys::console::warn_1(&JsValue::from_str(&format!(
+            "[bootstrap] post-ExternalCommit bootstrap failed (non-fatal): {:?}",
+            e
+        )));
+    }
 
     Ok(serde_json::json!({
         "status": "joined_via_external_commit",

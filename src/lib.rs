@@ -3361,3 +3361,125 @@ async fn fetch_roster_for_convo(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Field-level encryption — JS exports
+//
+// In-memory only at this layer (Task 5 of the MLS field-level encryption
+// plan). The platform layer is responsible for unlocking the content root
+// key from secure storage and pushing it in via `setContentRootKey`.
+// Persistence of the root key is Task 23 (storage.rs).
+// ---------------------------------------------------------------------------
+
+/// Set the 32-byte content root key used for per-conversation field
+/// encryption / HMAC. Must be exactly `KEY_LEN` bytes.
+#[wasm_bindgen(js_name = setContentRootKey)]
+pub fn catbird_mls_set_content_root_key(key: Vec<u8>) -> Result<(), JsValue> {
+    with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized — run catbird_mls_init()"))?;
+        ctx.set_content_root_key(key)
+            .map_err(|e| js_err!("setContentRootKey failed: {:?}", e))
+    })
+}
+
+/// Clear the cached content root key. Use on logout.
+#[wasm_bindgen(js_name = clearContentRootKey)]
+pub fn catbird_mls_clear_content_root_key() -> Result<(), JsValue> {
+    with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized — run catbird_mls_init()"))?;
+        ctx.clear_content_root_key();
+        Ok(())
+    })
+}
+
+/// Encrypt a message payload under the conversation-scoped content key
+/// derived from the cached content root key. Returns the on-the-wire
+/// bytes (version byte + nonce + ciphertext + tag).
+#[wasm_bindgen(js_name = encryptMessagePayload)]
+pub fn catbird_mls_encrypt_message_payload(
+    conversation_id: String,
+    plaintext: Vec<u8>,
+) -> Result<Vec<u8>, JsValue> {
+    with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized — run catbird_mls_init()"))?;
+        ctx.encrypt_message_payload(&conversation_id, &plaintext)
+            .map_err(|e| js_err!("encryptMessagePayload failed: {:?}", e))
+    })
+}
+
+/// Decrypt an on-the-wire message payload previously produced by
+/// `encryptMessagePayload` for the same conversation.
+#[wasm_bindgen(js_name = decryptMessagePayload)]
+pub fn catbird_mls_decrypt_message_payload(
+    conversation_id: String,
+    wire: Vec<u8>,
+) -> Result<Vec<u8>, JsValue> {
+    with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized — run catbird_mls_init()"))?;
+        ctx.decrypt_message_payload(&conversation_id, &wire)
+            .map_err(|e| js_err!("decryptMessagePayload failed: {:?}", e))
+    })
+}
+
+/// Compute the HMAC chain entry for a message. `prev_hmac` is the previous
+/// entry's HMAC (or `None` for the first entry in the chain — the spec
+/// seed will be used internally).
+#[wasm_bindgen(js_name = computeMessageHmac)]
+pub fn catbird_mls_compute_message_hmac(
+    conversation_id: String,
+    prev_hmac: Option<Vec<u8>>,
+    message_id: String,
+    payload_wire: Vec<u8>,
+) -> Result<Vec<u8>, JsValue> {
+    with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized — run catbird_mls_init()"))?;
+        ctx.compute_message_hmac(
+            &conversation_id,
+            prev_hmac.as_deref(),
+            &message_id,
+            &payload_wire,
+        )
+        .map_err(|e| js_err!("computeMessageHmac failed: {:?}", e))
+    })
+}
+
+/// Verify an HMAC chain entry. Returns `true` if `expected` matches the
+/// computed HMAC under the cached content root key.
+#[wasm_bindgen(js_name = verifyMessageHmac)]
+pub fn catbird_mls_verify_message_hmac(
+    conversation_id: String,
+    prev_hmac: Option<Vec<u8>>,
+    message_id: String,
+    payload_wire: Vec<u8>,
+    expected: Vec<u8>,
+) -> Result<bool, JsValue> {
+    with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized — run catbird_mls_init()"))?;
+        ctx.verify_message_hmac(
+            &conversation_id,
+            prev_hmac.as_deref(),
+            &message_id,
+            &payload_wire,
+            &expected,
+        )
+        .map_err(|e| js_err!("verifyMessageHmac failed: {:?}", e))
+    })
+}

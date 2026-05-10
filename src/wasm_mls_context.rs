@@ -96,6 +96,13 @@ pub struct WasmMLSContext {
     /// the explicit stage/merge contract rather than auto-merging inside
     /// `decrypt_message`.
     pending_incoming_merges: RefCell<HashMap<(Vec<u8>, u64), StagedCommit>>,
+    /// Field-level encryption: cached content root key for the current
+    /// user (32 bytes). Populated by `set_content_root_key`, cleared on
+    /// logout. Used by `encrypt_message_payload` / `decrypt_message_payload`
+    /// / `compute_message_hmac` / `verify_message_hmac` which delegate to
+    /// `catbird_mls::field_encryption`. In-memory only — persistence is
+    /// owned by the platform layer (Task 23, storage.rs).
+    content_root_key: RefCell<Option<Vec<u8>>>,
 }
 
 impl WasmMLSContext {
@@ -117,6 +124,7 @@ impl WasmMLSContext {
             groups: RefCell::new(HashMap::new()),
             signers: RefCell::new(HashMap::new()),
             pending_incoming_merges: RefCell::new(HashMap::new()),
+            content_root_key: RefCell::new(None),
         })
     }
 
@@ -135,6 +143,7 @@ impl WasmMLSContext {
             groups: RefCell::new(HashMap::new()),
             signers: RefCell::new(HashMap::new()),
             pending_incoming_merges: RefCell::new(HashMap::new()),
+            content_root_key: RefCell::new(None),
         })
     }
 
@@ -1139,5 +1148,102 @@ impl WasmMLSContext {
             hash_ref,
             signature_public_key,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Field-level encryption (per-conversation content key path).
+    //
+    // Delegates to `catbird_mls::field_encryption` for the actual crypto.
+    // The `content_root_key` is a 32-byte secret derived/fetched by the
+    // platform layer (e.g. unlocked from secure storage) and pushed into
+    // the WASM context via `set_content_root_key`. The context never
+    // persists it — that is the platform's responsibility (Task 23).
+    // ------------------------------------------------------------------
+
+    pub(crate) fn set_content_root_key(&self, key: Vec<u8>) -> Result<(), MLSError> {
+        if key.len() != catbird_mls::field_encryption::KEY_LEN {
+            return Err(MLSError::invalid_input(format!(
+                "content root key must be {} bytes, got {}",
+                catbird_mls::field_encryption::KEY_LEN,
+                key.len(),
+            )));
+        }
+        *self.content_root_key.borrow_mut() = Some(key);
+        Ok(())
+    }
+
+    pub(crate) fn clear_content_root_key(&self) {
+        *self.content_root_key.borrow_mut() = None;
+    }
+
+    pub(crate) fn encrypt_message_payload(
+        &self,
+        conversation_id: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MLSError> {
+        let guard = self.content_root_key.borrow();
+        let root = guard
+            .as_ref()
+            .ok_or_else(|| MLSError::invalid_input("content root key not set"))?;
+        catbird_mls::field_encryption::encrypt_payload(root, conversation_id, plaintext)
+            .map_err(|e| MLSError::invalid_input(e.to_string()))
+    }
+
+    pub(crate) fn decrypt_message_payload(
+        &self,
+        conversation_id: &str,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, MLSError> {
+        let guard = self.content_root_key.borrow();
+        let root = guard
+            .as_ref()
+            .ok_or_else(|| MLSError::invalid_input("content root key not set"))?;
+        catbird_mls::field_encryption::decrypt_payload(root, conversation_id, wire)
+            .map_err(|e| MLSError::invalid_input(e.to_string()))
+    }
+
+    pub(crate) fn compute_message_hmac(
+        &self,
+        conversation_id: &str,
+        prev_hmac: Option<&[u8]>,
+        message_id: &str,
+        payload_wire: &[u8],
+    ) -> Result<Vec<u8>, MLSError> {
+        let guard = self.content_root_key.borrow();
+        let root = guard
+            .as_ref()
+            .ok_or_else(|| MLSError::invalid_input("content root key not set"))?;
+        let h = catbird_mls::field_encryption::compute_entry_hmac(
+            root,
+            conversation_id,
+            prev_hmac,
+            message_id,
+            payload_wire,
+        )
+        .map_err(|e| MLSError::invalid_input(e.to_string()))?;
+        Ok(h.to_vec())
+    }
+
+    pub(crate) fn verify_message_hmac(
+        &self,
+        conversation_id: &str,
+        prev_hmac: Option<&[u8]>,
+        message_id: &str,
+        payload_wire: &[u8],
+        expected: &[u8],
+    ) -> Result<bool, MLSError> {
+        let guard = self.content_root_key.borrow();
+        let root = guard
+            .as_ref()
+            .ok_or_else(|| MLSError::invalid_input("content root key not set"))?;
+        catbird_mls::field_encryption::verify_entry_hmac(
+            root,
+            conversation_id,
+            prev_hmac,
+            message_id,
+            payload_wire,
+            expected,
+        )
+        .map_err(|e| MLSError::invalid_input(e.to_string()))
     }
 }

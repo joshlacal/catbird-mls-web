@@ -3380,8 +3380,15 @@ pub fn catbird_mls_set_content_root_key(key: Vec<u8>) -> Result<(), JsValue> {
             .mls_context
             .as_ref()
             .ok_or_else(|| js_err!("MLS context not initialized — run catbird_mls_init()"))?;
-        ctx.set_content_root_key(key)
-            .map_err(|e| js_err!("setContentRootKey failed: {:?}", e))
+        // Push into the MLS context first so validation (length check)
+        // runs before storage adopts the key. Storage holds an independent
+        // copy of the 32 bytes so the message write/read paths don't have
+        // to reach back into the `RefCell<Option<WasmMLSContext>>` (which
+        // would risk re-entrant borrows on the thread-local STATE).
+        ctx.set_content_root_key(key.clone())
+            .map_err(|e| js_err!("setContentRootKey failed: {:?}", e))?;
+        s.storage.set_content_root_key(key);
+        Ok(())
     })
 }
 
@@ -3394,6 +3401,7 @@ pub fn catbird_mls_clear_content_root_key() -> Result<(), JsValue> {
             .as_ref()
             .ok_or_else(|| js_err!("MLS context not initialized — run catbird_mls_init()"))?;
         ctx.clear_content_root_key();
+        s.storage.clear_content_root_key();
         Ok(())
     })
 }

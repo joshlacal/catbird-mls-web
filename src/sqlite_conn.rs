@@ -382,6 +382,89 @@ impl SqliteConn {
     }
 
     /// Prepare a SQL statement, bind text and blob parameters, execute.
+    /// Exec a statement with text + int + blob params. Each `(idx, value)`
+    /// tuple binds the value at the 1-based SQL placeholder index.
+    /// Indices must be globally unique across the three slices.
+    ///
+    /// Used by the encrypted message insert path which needs to bind the
+    /// row's text columns (id, conv, ...), int columns (sequence, epoch,
+    /// payload_key_version), and BLOB columns (payload_encrypted,
+    /// entry_hmac) in a single statement.
+    pub fn exec_with_text_int_blob_params(
+        &self,
+        sql: &str,
+        text_params: &[(i32, &str)],
+        int_params: &[(i32, i64)],
+        blob_params: &[(i32, &[u8])],
+    ) -> Result<(), WasmSqliteError> {
+        let c_sql =
+            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
+
+        let ret = unsafe {
+            sqlite3_prepare_v2(
+                self.db,
+                c_sql.as_ptr().cast(),
+                -1,
+                &mut stmt,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret != SQLITE_OK {
+            return Err(self.last_error(ret));
+        }
+
+        for &(idx, val) in text_params {
+            let c_val =
+                CString::new(val).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+            let ret = unsafe {
+                sqlite3_bind_text(
+                    stmt,
+                    idx,
+                    c_val.as_ptr().cast(),
+                    val.len() as i32,
+                    sqlite_transient(),
+                )
+            };
+            if ret != SQLITE_OK {
+                unsafe { sqlite3_finalize(stmt) };
+                return Err(self.last_error(ret));
+            }
+        }
+
+        for &(idx, val) in int_params {
+            let ret = unsafe { sqlite3_bind_int64(stmt, idx, val) };
+            if ret != SQLITE_OK {
+                unsafe { sqlite3_finalize(stmt) };
+                return Err(self.last_error(ret));
+            }
+        }
+
+        for &(idx, val) in blob_params {
+            let ret = unsafe {
+                sqlite3_bind_blob(
+                    stmt,
+                    idx,
+                    val.as_ptr().cast(),
+                    val.len() as i32,
+                    sqlite_transient(),
+                )
+            };
+            if ret != SQLITE_OK {
+                unsafe { sqlite3_finalize(stmt) };
+                return Err(self.last_error(ret));
+            }
+        }
+
+        let step = unsafe { sqlite3_step(stmt) };
+        unsafe { sqlite3_finalize(stmt) };
+
+        if step != SQLITE_DONE {
+            return Err(self.last_error(step));
+        }
+        Ok(())
+    }
+
     pub fn exec_with_text_and_blob_params(
         &self,
         sql: &str,
@@ -580,6 +663,112 @@ impl SqliteConn {
                     } else {
                         let c_str = unsafe { std::ffi::CStr::from_ptr(ptr.cast()) };
                         row.push(Some(c_str.to_string_lossy().into_owned()));
+                    }
+                }
+                rows.push(row);
+            } else if step == SQLITE_DONE {
+                break;
+            } else {
+                unsafe { sqlite3_finalize(stmt) };
+                return Err(self.last_error(step));
+            }
+        }
+
+        unsafe { sqlite3_finalize(stmt) };
+        Ok(rows)
+    }
+
+    /// Query rows with text + int params, returning a heterogeneous row
+    /// shape where some columns are textual and some are BLOBs.
+    ///
+    /// `text_cols` is the set of column indices (0-based) that should be
+    /// decoded as UTF-8 strings via `sqlite3_column_text`. Every other
+    /// column up to `col_count` is read as a raw BLOB via
+    /// `sqlite3_column_blob`. Each row is returned as a vector of
+    /// `(Option<String>, Option<Vec<u8>>)` where exactly one side of the
+    /// tuple is populated per column.
+    ///
+    /// Used by the message read path so the same SELECT can pull metadata
+    /// (id, sender_did, ...) plus the encrypted `payload_encrypted` /
+    /// `entry_hmac` BLOBs in a single statement.
+    pub fn query_text_int_blob(
+        &self,
+        sql: &str,
+        text_params: &[(i32, &str)],
+        int_params: &[(i32, i64)],
+        col_count: usize,
+        blob_cols: &[usize],
+    ) -> Result<Vec<Vec<(Option<String>, Option<Vec<u8>>)>>, WasmSqliteError> {
+        let c_sql =
+            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
+
+        let ret = unsafe {
+            sqlite3_prepare_v2(
+                self.db,
+                c_sql.as_ptr().cast(),
+                -1,
+                &mut stmt,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret != SQLITE_OK {
+            return Err(self.last_error(ret));
+        }
+
+        for &(idx, val) in text_params {
+            let c_val =
+                CString::new(val).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+            let ret = unsafe {
+                sqlite3_bind_text(
+                    stmt,
+                    idx,
+                    c_val.as_ptr().cast(),
+                    val.len() as i32,
+                    sqlite_transient(),
+                )
+            };
+            if ret != SQLITE_OK {
+                unsafe { sqlite3_finalize(stmt) };
+                return Err(self.last_error(ret));
+            }
+        }
+
+        for &(idx, val) in int_params {
+            let ret = unsafe { sqlite3_bind_int64(stmt, idx, val) };
+            if ret != SQLITE_OK {
+                unsafe { sqlite3_finalize(stmt) };
+                return Err(self.last_error(ret));
+            }
+        }
+
+        let blob_set: std::collections::HashSet<usize> = blob_cols.iter().copied().collect();
+        let mut rows = Vec::new();
+        loop {
+            let step = unsafe { sqlite3_step(stmt) };
+            if step == SQLITE_ROW {
+                let mut row = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    if blob_set.contains(&i) {
+                        let blob_ptr = unsafe { sqlite3_column_blob(stmt, i as i32) };
+                        let blob_len =
+                            unsafe { sqlite3_column_bytes(stmt, i as i32) } as usize;
+                        if blob_ptr.is_null() || blob_len == 0 {
+                            row.push((None, None));
+                        } else {
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(blob_ptr.cast::<u8>(), blob_len)
+                            };
+                            row.push((None, Some(slice.to_vec())));
+                        }
+                    } else {
+                        let ptr = unsafe { sqlite3_column_text(stmt, i as i32) };
+                        if ptr.is_null() {
+                            row.push((None, None));
+                        } else {
+                            let c_str = unsafe { std::ffi::CStr::from_ptr(ptr.cast()) };
+                            row.push((Some(c_str.to_string_lossy().into_owned()), None));
+                        }
                     }
                 }
                 rows.push(row);

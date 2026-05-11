@@ -24,12 +24,44 @@ use async_trait::async_trait;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 use catbird_mls::orchestrator::storage::MLSStorageBackend;
 use catbird_mls::orchestrator::types::*;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::sqlite_conn::SqliteConn;
 
+/// JSON-shaped canonical plaintext sealed by the field-level encryption
+/// layer before persistence. Mirrors the catmos-desktop format so encrypted
+/// rows produced by either client are wire-compatible. Storing the rich
+/// payload (rather than the bare `text` column) preserves `payload_json`
+/// across an encrypt/decrypt round-trip while the legacy `text NOT NULL`
+/// constraint is satisfied by writing an empty string in the legacy column.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CanonicalMessageBody<'a> {
+    text: &'a str,
+    payload_json: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct CanonicalMessageBodyOwned {
+    text: String,
+    payload_json: Option<String>,
+}
+
+/// Version tag stamped into `payload_key_version` on every encrypted row.
+const PAYLOAD_KEY_VERSION_V1: i64 = 1;
+
 pub struct WasmStorageBackend {
     conn: Rc<SqliteConn>,
+    /// Per-user 32-byte content root key for the field-level (envelope)
+    /// encryption layer. Installed via `set_content_root_key` after the
+    /// platform layer resolves it (localStorage on web) and the WASM
+    /// context has it. Held by-value here so storage methods don't have to
+    /// reach back into `STATE` (avoiding re-entrant `RefCell` borrows).
+    ///
+    /// `None` during the bootstrap window before login completes; in that
+    /// case write/read paths fall back to legacy plaintext columns so the
+    /// orchestrator can keep functioning.
+    content_root_key: RefCell<Option<Vec<u8>>>,
 }
 
 impl WasmStorageBackend {
@@ -38,7 +70,142 @@ impl WasmStorageBackend {
     /// The caller must have already called [`Self::ensure_schema`] on this
     /// connection.
     pub fn new(conn: Rc<SqliteConn>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            content_root_key: RefCell::new(None),
+        }
+    }
+
+    /// Install the per-user 32-byte content root key. Called from
+    /// `catbird_mls_set_content_root_key` in `lib.rs` so the same key
+    /// already pushed into the WASM MLS context is also available to the
+    /// storage layer for write-time encryption + read-time decryption.
+    /// Idempotent; later calls replace the binding.
+    pub fn set_content_root_key(&self, key: Vec<u8>) {
+        *self.content_root_key.borrow_mut() = Some(key);
+    }
+
+    /// Clear the cached content root key. Called on logout via
+    /// `catbird_mls_clear_content_root_key` in `lib.rs`.
+    pub fn clear_content_root_key(&self) {
+        *self.content_root_key.borrow_mut() = None;
+    }
+
+    /// Snapshot the content root key (cloned) so callers can use it without
+    /// holding the `RefCell` borrow for the duration of the SQLite I/O.
+    fn content_root_key_snapshot(&self) -> Option<Vec<u8>> {
+        self.content_root_key.borrow().clone()
+    }
+
+    /// Read the most recent (highest sequence_number) `entry_hmac` for a
+    /// conversation so the next encrypted row can extend the HMAC chain.
+    /// Returns `None` for the first row in a conversation (chain seed = 32
+    /// zero bytes is supplied by the Rust core when `prev_hmac=None`) or
+    /// when prior rows are legacy plaintext (no chain).
+    fn last_entry_hmac(&self, conversation_id: &str) -> Option<Vec<u8>> {
+        self.conn
+            .query_blob(
+                "SELECT entry_hmac FROM messages
+                 WHERE conversation_id = ?1 AND entry_hmac IS NOT NULL
+                 ORDER BY sequence_number DESC LIMIT 1",
+                &[(1, conversation_id)],
+            )
+            .ok()
+            .flatten()
+            .filter(|b| !b.is_empty())
+    }
+
+    /// Seal a `Message` body for storage. Returns `None` when the content
+    /// root key isn't installed yet — callers fall back to legacy plaintext
+    /// columns with a warning so the orchestrator can keep functioning
+    /// during the bootstrap window (initial sync may run before the JS
+    /// layer pushes the key in).
+    fn try_encrypt_message_body(&self, message: &Message) -> Option<(Vec<u8>, Vec<u8>)> {
+        let root = self.content_root_key_snapshot()?;
+        let body = CanonicalMessageBody {
+            text: &message.text,
+            payload_json: message.payload_json.as_deref(),
+        };
+        let plaintext = match serde_json::to_vec(&body) {
+            Ok(v) => v,
+            Err(err) => {
+                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[catbird-mls-web] try_encrypt_message_body: canonical body serialize failed: {} (falling back to plaintext)",
+                    err
+                )));
+                return None;
+            }
+        };
+        let encrypted = match catbird_mls::field_encryption::encrypt_payload(
+            &root,
+            &message.conversation_id,
+            &plaintext,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[catbird-mls-web] try_encrypt_message_body: encrypt_payload failed: {:?} (falling back to plaintext)",
+                    err
+                )));
+                return None;
+            }
+        };
+        let prev_hmac = self.last_entry_hmac(&message.conversation_id);
+        let entry_hmac = match catbird_mls::field_encryption::compute_entry_hmac(
+            &root,
+            &message.conversation_id,
+            prev_hmac.as_deref(),
+            &message.id,
+            &encrypted,
+        ) {
+            Ok(tag) => tag.to_vec(),
+            Err(err) => {
+                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[catbird-mls-web] try_encrypt_message_body: compute_entry_hmac failed: {:?} (falling back to plaintext)",
+                    err
+                )));
+                return None;
+            }
+        };
+        Some((encrypted, entry_hmac))
+    }
+
+    /// Attempt to decrypt a sealed message body. Returns the canonical
+    /// (text, payload_json) tuple on success. Returns `None` when the
+    /// content root key isn't installed or the wire bytes don't match.
+    /// Callers fall back to the legacy `text` / `payload_json` columns in
+    /// that case.
+    fn try_decrypt_message_body(
+        &self,
+        conversation_id: &str,
+        wire: &[u8],
+        message_id: &str,
+    ) -> Option<(String, Option<String>)> {
+        let root = self.content_root_key_snapshot()?;
+        let plaintext = match catbird_mls::field_encryption::decrypt_payload(
+            &root,
+            conversation_id,
+            wire,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[catbird-mls-web] decrypt_payload failed for {}: {:?} (falling back to legacy columns)",
+                    message_id, err
+                )));
+                return None;
+            }
+        };
+        match serde_json::from_slice::<CanonicalMessageBodyOwned>(&plaintext) {
+            Ok(body) => Some((body.text, body.payload_json)),
+            Err(err) => {
+                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[catbird-mls-web] canonical body deserialize failed for {}: {} (falling back to legacy columns)",
+                    message_id, err
+                )));
+                None
+            }
+        }
     }
 
     /// Create all required tables on the shared connection.
@@ -122,6 +289,59 @@ impl WasmStorageBackend {
                 ON messages(conversation_id, sequence_number);",
         )
         .map_err(|e| format!("messages index: {}", e))?;
+
+        // Migration (MLS field-level encryption): persist the sealed
+        // canonical body alongside the HMAC chain so the on-disk
+        // representation matches catmos desktop / iOS / Android. ALTER
+        // calls are idempotent — if the column already exists SQLite errors
+        // and we swallow it via `let _ =`, matching the established pattern
+        // for additive migrations above.
+        let _ = conn.exec_raw("ALTER TABLE messages ADD COLUMN payload_encrypted BLOB;");
+        let _ = conn.exec_raw("ALTER TABLE messages ADD COLUMN entry_hmac BLOB;");
+        let _ = conn.exec_raw("ALTER TABLE messages ADD COLUMN payload_key_version INTEGER;");
+        // `payload_json` lives in the canonical body once sealed; persist it
+        // on the row too so legacy plaintext writes (bootstrap window) and
+        // the catmos-desktop schema stay aligned.
+        let _ = conn.exec_raw("ALTER TABLE messages ADD COLUMN payload_json TEXT;");
+        // Tombstone parity with iOS/Android: catmos-web doesn't yet expose
+        // user-initiated deletes, but the columns ship now so a later
+        // soft-delete path can land without another schema migration
+        // breaking the HMAC chain.
+        let _ = conn.exec_raw(
+            "ALTER TABLE messages ADD COLUMN is_tombstone INTEGER NOT NULL DEFAULT 0;",
+        );
+        let _ = conn.exec_raw("ALTER TABLE messages ADD COLUMN deleted_at INTEGER;");
+
+        // One-shot drop of any pre-field-encryption rows. Matches the
+        // `MLSPlaintextHeaderMigration` precedent on iOS / Android / desktop:
+        // existing transcripts cannot satisfy the encrypted-row invariants
+        // (no HMAC chain seed, no per-conversation content key derivation
+        // history), so we drop them once and record the migration in a
+        // `migration_status` table so it is never re-run.
+        conn.exec_raw(
+            "CREATE TABLE IF NOT EXISTS migration_status (
+                name TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            );",
+        )
+        .map_err(|e| format!("migration_status table: {}", e))?;
+        let already = conn
+            .query_text(
+                "SELECT name FROM migration_status WHERE name = ?1",
+                &[(1, "MLSMessageFieldMigrationV1")],
+                1,
+            )
+            .map_err(|e| format!("migration_status query: {}", e))?;
+        if already.is_empty() {
+            conn.exec_raw("DELETE FROM messages;")
+                .map_err(|e| format!("migration v1 DELETE messages: {}", e))?;
+            conn.exec_with_text_params(
+                "INSERT INTO migration_status (name, applied_at) \
+                 VALUES (?1, strftime('%s','now'))",
+                &[(1, "MLSMessageFieldMigrationV1")],
+            )
+            .map_err(|e| format!("migration_status INSERT: {}", e))?;
+        }
 
         conn.exec_raw(
             "CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -725,26 +945,68 @@ impl MLSStorageBackend for WasmStorageBackend {
         let timestamp_str = message.timestamp.to_rfc3339();
         let is_own_str = if message.is_own { "1" } else { "0" };
 
-        self.conn
-            .exec_with_mixed_params(
-                "INSERT OR REPLACE INTO messages
-                 (id, conversation_id, sender_did, text, sequence_number, epoch, created_at, is_own, delivery_status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                &[
-                    (1, &*message.id),
-                    (2, &*message.conversation_id),
-                    (3, &*message.sender_did),
-                    (4, &*message.text),
-                    (7, &*timestamp_str),
-                    (8, is_own_str),
-                    (9, &*delivery_status_str),
-                ],
-                &[
-                    (5, message.sequence_number as i64),
-                    (6, message.epoch as i64),
-                ],
-            )
-            .map_err(Self::store_err)
+        // Field-level encryption (Phase F): try to seal the canonical body
+        // under the per-DID content root key. Falls back to legacy plaintext
+        // columns when the key isn't installed yet (bootstrap window). The
+        // helper emits a console warning in the fallback path.
+        let sealed = self.try_encrypt_message_body(message);
+
+        match sealed {
+            Some((encrypted, entry_hmac)) => {
+                // text/payload_json stay blank when the sealed payload is
+                // the source of truth — `text NOT NULL` forces empty string.
+                self.conn
+                    .exec_with_text_int_blob_params(
+                        "INSERT OR REPLACE INTO messages
+                         (id, conversation_id, sender_did, text, sequence_number, epoch,
+                          created_at, is_own, delivery_status, payload_json,
+                          payload_encrypted, entry_hmac, payload_key_version)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12)",
+                        &[
+                            (1, &*message.id),
+                            (2, &*message.conversation_id),
+                            (3, &*message.sender_did),
+                            (4, ""),
+                            (7, &*timestamp_str),
+                            (8, is_own_str),
+                            (9, &*delivery_status_str),
+                        ],
+                        &[
+                            (5, message.sequence_number as i64),
+                            (6, message.epoch as i64),
+                            (12, PAYLOAD_KEY_VERSION_V1),
+                        ],
+                        &[(10, &encrypted[..]), (11, &entry_hmac[..])],
+                    )
+                    .map_err(Self::store_err)
+            }
+            None => {
+                let payload_json = message.payload_json.as_deref().unwrap_or("");
+                self.conn
+                    .exec_with_mixed_params(
+                        "INSERT OR REPLACE INTO messages
+                         (id, conversation_id, sender_did, text, sequence_number, epoch,
+                          created_at, is_own, delivery_status, payload_json,
+                          payload_encrypted, entry_hmac, payload_key_version)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, NULL)",
+                        &[
+                            (1, &*message.id),
+                            (2, &*message.conversation_id),
+                            (3, &*message.sender_did),
+                            (4, &*message.text),
+                            (7, &*timestamp_str),
+                            (8, is_own_str),
+                            (9, &*delivery_status_str),
+                            (10, payload_json),
+                        ],
+                        &[
+                            (5, message.sequence_number as i64),
+                            (6, message.epoch as i64),
+                        ],
+                    )
+                    .map_err(Self::store_err)
+            }
+        }
     }
 
     async fn get_messages(
@@ -753,32 +1015,42 @@ impl MLSStorageBackend for WasmStorageBackend {
         limit: u32,
         before_sequence: Option<u64>,
     ) -> Result<Vec<Message>> {
+        // Columns (0-based): 0 id, 1 conv, 2 sender, 3 text, 4 seq, 5 epoch,
+        // 6 created_at, 7 is_own, 8 delivery_status, 9 payload_json (TEXT),
+        // 10 payload_encrypted (BLOB).
+        // `is_tombstone` filtered server-side via COALESCE so legacy rows
+        // (with the column NULL pre-migration) still surface.
+        let blob_cols = [10usize];
         let rows = if let Some(before) = before_sequence {
             self.conn
-                .query_text_mixed(
+                .query_text_int_blob(
                     "SELECT id, conversation_id, sender_did, text, sequence_number, epoch,
-                            created_at, is_own, delivery_status
+                            created_at, is_own, delivery_status, payload_json, payload_encrypted
                      FROM messages
                      WHERE conversation_id = ?1 AND sequence_number < ?2
+                       AND COALESCE(is_tombstone, 0) = 0
                      ORDER BY sequence_number DESC
                      LIMIT ?3",
                     &[(1, conversation_id)],
                     &[(2, before as i64), (3, limit as i64)],
-                    9,
+                    11,
+                    &blob_cols,
                 )
                 .map_err(Self::store_err)?
         } else {
             self.conn
-                .query_text_mixed(
+                .query_text_int_blob(
                     "SELECT id, conversation_id, sender_did, text, sequence_number, epoch,
-                            created_at, is_own, delivery_status
+                            created_at, is_own, delivery_status, payload_json, payload_encrypted
                      FROM messages
                      WHERE conversation_id = ?1
+                       AND COALESCE(is_tombstone, 0) = 0
                      ORDER BY sequence_number DESC
                      LIMIT ?2",
                     &[(1, conversation_id)],
                     &[(2, limit as i64)],
-                    9,
+                    11,
+                    &blob_cols,
                 )
                 .map_err(Self::store_err)?
         };
@@ -786,21 +1058,38 @@ impl MLSStorageBackend for WasmStorageBackend {
         let mut messages: Vec<Message> = rows
             .into_iter()
             .map(|row| {
-                let id = row[0].clone().unwrap_or_default();
-                let convo_id = row[1].clone().unwrap_or_default();
-                let sender = row[2].clone().unwrap_or_default();
-                let text = row[3].clone().unwrap_or_default();
-                let seq: u64 = row[4].as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let epoch: u64 = row[5].as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let created_at = row[6].clone().unwrap_or_default();
-                let is_own = row[7].as_deref() == Some("1");
+                let id = row[0].0.clone().unwrap_or_default();
+                let convo_id = row[1].0.clone().unwrap_or_default();
+                let sender = row[2].0.clone().unwrap_or_default();
+                let legacy_text = row[3].0.clone().unwrap_or_default();
+                let seq: u64 =
+                    row[4].0.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let epoch: u64 =
+                    row[5].0.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let created_at = row[6].0.clone().unwrap_or_default();
+                let is_own = row[7].0.as_deref() == Some("1");
                 let delivery_status: Option<DeliveryStatus> = row[8]
+                    .0
                     .as_ref()
                     .and_then(|s| serde_json::from_str(s).ok());
+                let legacy_payload_json = row[9].0.clone();
+                let payload_encrypted = row[10].1.clone();
 
                 let timestamp = created_at
                     .parse::<chrono::DateTime<chrono::Utc>>()
                     .unwrap_or_else(|_| chrono::Utc::now());
+
+                // Prefer the sealed column when present and we have a key;
+                // fall back to legacy plaintext columns on either miss.
+                let (text, payload_json) = match payload_encrypted.as_ref() {
+                    Some(wire) if !wire.is_empty() => {
+                        match self.try_decrypt_message_body(&convo_id, wire, &id) {
+                            Some((t, pj)) => (t, pj),
+                            None => (legacy_text, legacy_payload_json),
+                        }
+                    }
+                    _ => (legacy_text, legacy_payload_json),
+                };
 
                 Message {
                     id,
@@ -812,7 +1101,7 @@ impl MLSStorageBackend for WasmStorageBackend {
                     sequence_number: seq,
                     is_own,
                     delivery_status,
-                    payload_json: None,
+                    payload_json,
                 }
             })
             .collect();

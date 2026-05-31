@@ -199,14 +199,10 @@ fn parse_conversation(c: &lexicon::defs::ConvoView) -> ConversationView {
                 },
             })
             .collect(),
-        metadata: c.metadata.as_ref().map(|m| ConversationMetadata {
-            name: m.name.as_ref().map(|name| name.to_string()),
-            description: m
-                .description
-                .as_ref()
-                .map(|description| description.to_string()),
-            avatar_url: None,
-        }),
+        // Metadata cutover: ConvoView no longer carries plaintext metadata.
+        // Name/description live in the encrypted metadata blob, fetched
+        // separately via getGroupMetadataBlob (parity with catmos-cli / catbird-mls).
+        metadata: None,
         created_at: Some(c.created_at.as_ref().with_timezone(&chrono::Utc)),
         updated_at: None,
     }
@@ -709,7 +705,9 @@ impl MLSAPIClient for WasmApiClient {
         &self,
         group_id: &str,
         initial_members: Option<&[String]>,
-        metadata: Option<&ConversationMetadata>,
+        // Metadata cutover: createConvo no longer accepts inline metadata; the
+        // name/description now travel in an encrypted blob published separately.
+        _metadata: Option<&ConversationMetadata>,
         _commit_data: Option<&[u8]>,
         welcome_data: Option<&[u8]>,
     ) -> Result<CreateConversationResult> {
@@ -719,13 +717,7 @@ impl MLSAPIClient for WasmApiClient {
             cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
             initial_members: initial_members
                 .map(|members| members.iter().map(|d| parse_did(d)).collect()),
-            metadata: metadata.map(|m| {
-                lexicon::create_convo::MetadataInputData {
-                    name: m.name.clone(),
-                    description: m.description.clone(),
-                }
-                .into()
-            }),
+            // TODO: publish the encrypted metadata blob via updateConvo after creation.
             welcome_message: welcome_data.map(|w| B64.encode(w)),
             current_epoch: None,
             key_package_hashes: None,

@@ -3075,18 +3075,37 @@ pub async fn catbird_mls_check_opt_in_status(dids: Array) -> Result<JsValue, JsV
 ///    picks up the winner's Welcome. Other server errors: same.
 ///
 /// Returns the count of conversations the loop touched.
+///
+/// Shares the re-entrancy guard with the background-tasks timer: if a
+/// deferred-recovery pass is already in flight (a timer tick or another
+/// manual call), this returns `{ touched: 0, alreadyRunning: true }` instead
+/// of running a second pass concurrently — concurrent passes can clobber
+/// each other's bootstrap state. Each pass also runs under a deadline
+/// (`MANUAL_PASS_DEADLINE_MS` here; 2× `interval_ms` for timer ticks) — on
+/// timeout the pass is cancelled and `{ touched: 0, timedOut: true }` is
+/// returned.
 //
 // TODO(architecture): WASM bootstrap is currently inline-mirrored from
 // `catbird-mls/src/orchestrator/recovery.rs::try_first_responder_bootstrap`.
 // Long-term, WASM should migrate to driving `MLSOrchestrator` directly so
 // the ladder lives in one place across all platforms (Phase 4+ backlog).
 //
-// TODO(test-gap): no unit coverage — `catbird-mls-web` is `cdylib`-only and
-// uses sqlite-wasm-rs OPFS VFS that doesn't run on host. Verified by
-// inspection against `try_first_responder_bootstrap` (recovery.rs:1593) and
-// the catmos / catmos-cli inheritor implementations.
+// TODO(test-gap): bootstrap ladder itself has no unit coverage —
+// `catbird-mls-web` is `cdylib`-only and uses sqlite-wasm-rs OPFS VFS that
+// doesn't run on host. Verified by inspection against
+// `try_first_responder_bootstrap` (recovery.rs:1593) and the catmos /
+// catmos-cli inheritor implementations. (Guard/deadline plumbing IS covered
+// by `background_tasks_tests`.)
 #[wasm_bindgen]
 pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
+    run_deferred_recovery_guarded(MANUAL_PASS_DEADLINE_MS).await
+}
+
+/// Un-guarded single deferred-recovery pass — the body of
+/// `catbird_mls_run_deferred_recovery`. Callers MUST go through
+/// `run_deferred_recovery_guarded`; calling this directly bypasses the
+/// re-entrancy guard and can run concurrently with a timer tick.
+async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::storage::MLSStorageBackend;
     use catbird_mls::orchestrator::types::ConversationState;
 
@@ -3382,6 +3401,47 @@ extern "C" {
 
     #[wasm_bindgen(js_name = clearInterval)]
     fn js_clear_interval(handle: f64);
+
+    /// Global `setTimeout`, same Window + Worker rationale as `setInterval`
+    /// above. Takes a plain `js_sys::Function` so a `Promise` constructor's
+    /// `resolve` can be passed directly (see `sleep_ms`).
+    #[wasm_bindgen(js_name = setTimeout)]
+    fn js_set_timeout(handler: &js_sys::Function, timeout_ms: f64) -> f64;
+}
+
+/// Promise-based sleep via the global `setTimeout` (Window + Worker safe).
+/// If the returned future is dropped before the deadline, the underlying JS
+/// timer still fires once and resolves an orphaned promise — harmless.
+async fn sleep_ms(ms: f64) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let _ = js_set_timeout(&resolve, ms);
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// Race `fut` against a `setTimeout`-backed deadline. Returns `None` if the
+/// deadline fires first; the losing `fut` is **dropped** (cancelled), so its
+/// destructors — including `TickInFlightReset` — run. Needed because
+/// reqwest-on-wasm has no default request timeout: a stalled fetch would
+/// otherwise hold a deferred-recovery pass open forever.
+async fn race_with_timeout<F: std::future::Future>(
+    fut: F,
+    deadline_ms: f64,
+) -> Option<F::Output> {
+    use std::future::Future as _;
+    use std::task::Poll;
+    let mut fut = Box::pin(fut);
+    let mut deadline = Box::pin(sleep_ms(deadline_ms));
+    std::future::poll_fn(move |cx| {
+        if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(out));
+        }
+        if deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// Live background-task state. Dropping this without calling
@@ -3397,27 +3457,76 @@ struct BackgroundTasks {
 
 thread_local! {
     static BACKGROUND_TASKS: RefCell<Option<BackgroundTasks>> = const { RefCell::new(None) };
-    /// Re-entrancy guard: skip a tick if the previous one is still awaiting
-    /// (slow network). The next interval fire picks the work back up.
+    /// Re-entrancy guard shared by EVERY deferred-recovery entry point —
+    /// timer ticks AND the manual `catbird_mls_run_deferred_recovery()`
+    /// export. While a pass is in flight, any other entry skips (slow
+    /// network); the next interval fire picks the work back up. Set/reset
+    /// only via `run_deferred_recovery_guarded` + `TickInFlightReset`.
     static BACKGROUND_TICK_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// One timer tick: run the same logic as `catbird_mls_run_deferred_recovery`,
-/// swallowing-and-logging errors so one failed tick never kills the loop.
-async fn background_tasks_tick() {
+/// RAII reset for `BACKGROUND_TICK_IN_FLIGHT`. Constructed by
+/// `run_deferred_recovery_guarded` immediately after it sets the flag, so the
+/// flag is cleared on every exit path — normal completion, `?`/early return,
+/// and (the load-bearing case) the pass future being dropped when
+/// `race_with_timeout` cancels it at the deadline. Without this, one wedged
+/// pass would permanently skip every subsequent tick while
+/// `catbird_mls_background_tasks_running()` still reported `true`.
+struct TickInFlightReset;
+
+impl Drop for TickInFlightReset {
+    fn drop(&mut self) {
+        BACKGROUND_TICK_IN_FLIGHT.with(|f| f.set(false));
+    }
+}
+
+/// Per-pass deadline for the manual `catbird_mls_run_deferred_recovery()`
+/// export: 2× the recommended 30s timer interval, matching the 2×
+/// `interval_ms` deadline timer ticks get.
+const MANUAL_PASS_DEADLINE_MS: f64 = 60_000.0;
+
+/// The single guarded entry for a deferred-recovery pass. Both the timer
+/// tick and the manual export route through here, so they share one
+/// re-entrancy guard — a manual call (e.g. on `visibilitychange`) can never
+/// run a pass concurrently with a timer tick.
+///
+/// - If a pass is already in flight: returns a benign
+///   `{ touched: 0, alreadyRunning: true }` without touching the flag (the
+///   in-flight pass owns it).
+/// - Otherwise: sets the flag, arms the RAII reset, and races the pass
+///   against `deadline_ms`. On timeout the pass is dropped (cancelled), a
+///   warning is logged, and `{ touched: 0, timedOut: true }` is returned;
+///   the RAII reset clears the flag so the loop never wedges.
+async fn run_deferred_recovery_guarded(deadline_ms: f64) -> Result<JsValue, JsValue> {
     if BACKGROUND_TICK_IN_FLIGHT.with(|f| f.replace(true)) {
         web_sys::console::log_1(&js_err!(
-            "[background-tasks] previous deferred-recovery tick still running — skipping"
+            "[background-tasks] deferred-recovery pass already in flight — skipping"
         ));
-        return;
+        return to_js(&serde_json::json!({ "touched": 0, "alreadyRunning": true }));
     }
-    if let Err(e) = catbird_mls_run_deferred_recovery().await {
+    let _reset = TickInFlightReset;
+
+    match race_with_timeout(run_deferred_recovery_inner(), deadline_ms).await {
+        Some(result) => result,
+        None => {
+            web_sys::console::warn_1(&js_err!(
+                "[background-tasks] deferred-recovery pass exceeded {}ms deadline — cancelled, in-flight flag cleared",
+                deadline_ms
+            ));
+            to_js(&serde_json::json!({ "touched": 0, "timedOut": true }))
+        }
+    }
+}
+
+/// One timer tick: run a guarded deferred-recovery pass, swallowing-and-
+/// logging errors so one failed tick never kills the loop.
+async fn background_tasks_tick(deadline_ms: f64) {
+    if let Err(e) = run_deferred_recovery_guarded(deadline_ms).await {
         web_sys::console::warn_2(
             &js_err!("[background-tasks] deferred-recovery tick failed (loop continues):"),
             &e,
         );
     }
-    BACKGROUND_TICK_IN_FLIGHT.with(|f| f.set(false));
 }
 
 /// Start the crate-owned background task loop (currently: deferred recovery,
@@ -3427,11 +3536,17 @@ async fn background_tasks_tick() {
 /// - Runs one tick immediately, then every `interval_ms`.
 /// - Per-tick errors (including "not initialized" / "not authenticated") are
 ///   logged to the console and swallowed — the loop keeps running.
+/// - Each tick runs under a 2×`interval_ms` deadline: reqwest-on-wasm has no
+///   default request timeout, so a stalled fetch would otherwise wedge the
+///   in-flight guard and skip every subsequent tick. On timeout the pass is
+///   cancelled, a warning is logged, and the next fire runs normally.
 /// - Calling again while running **replaces** the existing timer (restart
 ///   semantics); timers never stack.
 /// - `catbird_mls_run_deferred_recovery()` stays exported for on-demand
 ///   ticks (e.g. on `visibilitychange === "visible"`, where background-tab
-///   timer throttling delays the next interval fire).
+///   timer throttling delays the next interval fire). It shares this loop's
+///   re-entrancy guard, so an on-demand tick never runs concurrently with a
+///   timer tick.
 #[wasm_bindgen]
 pub fn catbird_mls_start_background_tasks(interval_ms: u32) -> Result<(), JsValue> {
     if interval_ms == 0 {
@@ -3443,8 +3558,9 @@ pub fn catbird_mls_start_background_tasks(interval_ms: u32) -> Result<(), JsValu
     // Restart semantics: replace any existing timer instead of stacking.
     catbird_mls_stop_background_tasks();
 
+    let tick_deadline_ms = f64::from(interval_ms) * 2.0;
     let tick_closure = Closure::<dyn FnMut()>::new(move || {
-        wasm_bindgen_futures::spawn_local(background_tasks_tick());
+        wasm_bindgen_futures::spawn_local(background_tasks_tick(tick_deadline_ms));
     });
     let interval_handle = js_set_interval(&tick_closure, f64::from(interval_ms));
     BACKGROUND_TASKS.with(|t| {
@@ -3456,7 +3572,7 @@ pub fn catbird_mls_start_background_tasks(interval_ms: u32) -> Result<(), JsValu
 
     // First tick now — a convo already in ResetPending shouldn't wait a full
     // interval to start healing.
-    wasm_bindgen_futures::spawn_local(background_tasks_tick());
+    wasm_bindgen_futures::spawn_local(background_tasks_tick(tick_deadline_ms));
 
     web_sys::console::log_1(&js_err!(
         "[background-tasks] started (deferred-recovery every {}ms)",
@@ -3491,19 +3607,26 @@ mod background_tasks_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    /// Promise-based sleep via the global `setTimeout` (Window + Worker safe).
-    async fn sleep_ms(ms: f64) {
-        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-            let global = js_sys::global();
-            let set_timeout: js_sys::Function =
-                js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
-                    .expect("setTimeout missing from global scope")
-                    .into();
-            set_timeout
-                .call2(&global, &resolve, &JsValue::from_f64(ms))
-                .expect("setTimeout call failed");
-        });
-        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    fn in_flight() -> bool {
+        BACKGROUND_TICK_IN_FLIGHT.with(|f| f.get())
+    }
+
+    fn set_in_flight(v: bool) {
+        BACKGROUND_TICK_IN_FLIGHT.with(|f| f.set(v));
+    }
+
+    /// Read one field of a pass result. `to_js` serializes
+    /// `serde_json::Value` objects via serde-wasm-bindgen, which emits JS
+    /// `Map`s for maps — handle both `Map` and plain-object shapes so the
+    /// test doesn't encode the serializer's choice.
+    fn result_field(v: &JsValue, key: &str) -> JsValue {
+        use wasm_bindgen::JsCast;
+        let key = JsValue::from_str(key);
+        if let Some(map) = v.dyn_ref::<js_sys::Map>() {
+            map.get(&key)
+        } else {
+            js_sys::Reflect::get(v, &key).unwrap_or(JsValue::UNDEFINED)
+        }
     }
 
     #[wasm_bindgen_test]
@@ -3541,6 +3664,72 @@ mod background_tasks_tests {
         );
         catbird_mls_stop_background_tasks();
         assert!(!catbird_mls_background_tasks_running());
+    }
+
+    #[wasm_bindgen_test]
+    async fn manual_export_shares_in_flight_guard() {
+        // Simulate a pass in flight (exactly what a slow timer tick holds).
+        assert!(!in_flight(), "flag must start clear");
+        set_in_flight(true);
+
+        // The manual export must NOT start a concurrent pass — it returns a
+        // benign already-running result instead.
+        let result = catbird_mls_run_deferred_recovery()
+            .await
+            .expect("manual call during an in-flight pass must be benign, not an error");
+        assert_eq!(
+            result_field(&result, "alreadyRunning").as_bool(),
+            Some(true),
+            "expected alreadyRunning: true"
+        );
+        assert_eq!(
+            result_field(&result, "touched").as_f64(),
+            Some(0.0),
+            "an already-running skip must touch nothing"
+        );
+
+        // The skip path must not clear a flag it does not own.
+        assert!(in_flight(), "skip path must leave the owner's flag set");
+        set_in_flight(false);
+    }
+
+    #[wasm_bindgen_test]
+    async fn manual_pass_resets_in_flight_flag_on_error() {
+        // Not initialized / not authenticated → the pass errors immediately.
+        // The RAII reset must still clear the flag on the error path, so a
+        // failed manual pass never wedges the timer loop.
+        assert!(!in_flight(), "flag must start clear");
+        let _ = catbird_mls_run_deferred_recovery().await;
+        assert!(!in_flight(), "error path must reset the in-flight flag");
+    }
+
+    #[wasm_bindgen_test]
+    fn in_flight_reset_guard_is_drop_safe() {
+        set_in_flight(true);
+        {
+            let _reset = TickInFlightReset;
+            assert!(in_flight(), "guard construction must not clear the flag");
+        }
+        assert!(!in_flight(), "Drop must reset the in-flight flag");
+    }
+
+    #[wasm_bindgen_test]
+    async fn deadline_cancellation_resets_in_flight_flag() {
+        // A wedged pass (reqwest-on-wasm has no default timeout) must be
+        // cancelled at the deadline, and dropping it must reset the flag via
+        // the RAII guard — otherwise every later tick would skip forever.
+        assert!(!in_flight(), "flag must start clear");
+        set_in_flight(true);
+        let wedged_pass = async {
+            let _reset = TickInFlightReset;
+            sleep_ms(10_000.0).await; // far past the deadline below
+        };
+        let raced = race_with_timeout(wedged_pass, 50.0).await;
+        assert!(raced.is_none(), "the deadline must win against a wedged pass");
+        assert!(
+            !in_flight(),
+            "dropping the cancelled pass must reset the flag via RAII"
+        );
     }
 }
 

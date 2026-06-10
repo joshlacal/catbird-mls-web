@@ -54,7 +54,12 @@ catbird_mls_stop_background_tasks();
 
 `catbird_mls_run_deferred_recovery()` remains exported for on-demand ticks
 (visibility changes, tests, "retry now" buttons); hand-rolling your own
-`setInterval` around it is no longer the contract.
+`setInterval` around it is no longer the contract. It shares the loop's
+re-entrancy guard: if a recovery pass is already in flight it resolves to a
+benign `{ touched: 0, alreadyRunning: true }` instead of running a second
+pass concurrently. Every pass (timer or manual) runs under a deadline
+(2× `interval_ms` for timer ticks; 60s for manual calls) — a stalled pass is
+cancelled with `{ touched: 0, timedOut: true }` so the loop never wedges.
 `catbird_mls_background_tasks_running()` reports whether the loop is active.
 
 Each recovery tick is a no-op when no conversations are in `ResetPending`, so

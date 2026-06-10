@@ -98,7 +98,7 @@ After changing the Rust ABI, rebuild `pkg/` and re-run `npm run check` in catmos
 
 Browser apps **MUST** call `catbird_mls_start_background_tasks(interval_ms)` once after `catbird_mls_setup()` (recommended: `30_000`). The crate then owns the repeating timer that drives the deferred-recovery state machine adopting server-initiated `groupResetEvent`s (spec §8.5 Phase 1). Without it, a conversation in `ResetPending` never heals. Each tick is a no-op when nothing is pending (cheap); per-tick errors are logged and swallowed so one failure never kills the loop; restarting replaces the existing timer (never stacks); `catbird_mls_stop_background_tasks()` tears it down (idempotent).
 
-`catbird_mls_run_deferred_recovery()` remains exported for **on-demand** ticks — call it on `visibilitychange === "visible"` so recovery runs immediately when the user returns to a throttled background tab. Hand-rolling your own `setInterval` around it is no longer the contract. Full rationale and a copy-paste TS snippet are in `README.md`.
+`catbird_mls_run_deferred_recovery()` remains exported for **on-demand** ticks — call it on `visibilitychange === "visible"` so recovery runs immediately when the user returns to a throttled background tab. Hand-rolling your own `setInterval` around it is no longer the contract. The manual export shares the loop's re-entrancy guard (a call while a pass is in flight resolves to `{ touched: 0, alreadyRunning: true }` rather than running concurrently), and every pass runs under a deadline (2× `interval_ms` for timer ticks, 60s for manual calls) that cancels a stalled pass (`{ touched: 0, timedOut: true }`) so a hung fetch can never wedge the loop. Full rationale and a copy-paste TS snippet are in `README.md`.
 
 ## Gotchas
 

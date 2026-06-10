@@ -3363,6 +3363,188 @@ async fn fetch_roster_for_convo(
 }
 
 // ---------------------------------------------------------------------------
+// Background tasks — crate-owned deferred-recovery timer (WS-5.5)
+//
+// Before this existed, hosts had to wire their own `setInterval` around
+// `catbird_mls_run_deferred_recovery()` (a documented MUST that the primary
+// consumer never implemented). `catbird_mls_start_background_tasks()` moves
+// the timer into the crate so the host calls one function after setup.
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen]
+extern "C" {
+    /// Bound to the *global* scope (`globalThis.setInterval`), not
+    /// `web_sys::Window` — this crate must run inside a Web Worker (see module
+    /// docs), where `web_sys::window()` is `None`. Plain extern bindings work
+    /// in both Window and Worker contexts.
+    #[wasm_bindgen(js_name = setInterval)]
+    fn js_set_interval(handler: &Closure<dyn FnMut()>, timeout_ms: f64) -> f64;
+
+    #[wasm_bindgen(js_name = clearInterval)]
+    fn js_clear_interval(handle: f64);
+}
+
+/// Live background-task state. Dropping this without calling
+/// `clearInterval` would leak the JS interval (it would keep firing into a
+/// freed closure), so teardown always goes through
+/// `catbird_mls_stop_background_tasks()`.
+struct BackgroundTasks {
+    interval_handle: f64,
+    /// Keeps the JS callback allocation alive for the lifetime of the
+    /// interval (same pattern as `WsSubscription`'s handler closures).
+    _tick_closure: Closure<dyn FnMut()>,
+}
+
+thread_local! {
+    static BACKGROUND_TASKS: RefCell<Option<BackgroundTasks>> = const { RefCell::new(None) };
+    /// Re-entrancy guard: skip a tick if the previous one is still awaiting
+    /// (slow network). The next interval fire picks the work back up.
+    static BACKGROUND_TICK_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One timer tick: run the same logic as `catbird_mls_run_deferred_recovery`,
+/// swallowing-and-logging errors so one failed tick never kills the loop.
+async fn background_tasks_tick() {
+    if BACKGROUND_TICK_IN_FLIGHT.with(|f| f.replace(true)) {
+        web_sys::console::log_1(&js_err!(
+            "[background-tasks] previous deferred-recovery tick still running — skipping"
+        ));
+        return;
+    }
+    if let Err(e) = catbird_mls_run_deferred_recovery().await {
+        web_sys::console::warn_2(
+            &js_err!("[background-tasks] deferred-recovery tick failed (loop continues):"),
+            &e,
+        );
+    }
+    BACKGROUND_TICK_IN_FLIGHT.with(|f| f.set(false));
+}
+
+/// Start the crate-owned background task loop (currently: deferred recovery,
+/// spec §8.5 Phase 1). Call once after `catbird_mls_setup()`; `interval_ms`
+/// of `30_000` (30s) is the recommended cadence.
+///
+/// - Runs one tick immediately, then every `interval_ms`.
+/// - Per-tick errors (including "not initialized" / "not authenticated") are
+///   logged to the console and swallowed — the loop keeps running.
+/// - Calling again while running **replaces** the existing timer (restart
+///   semantics); timers never stack.
+/// - `catbird_mls_run_deferred_recovery()` stays exported for on-demand
+///   ticks (e.g. on `visibilitychange === "visible"`, where background-tab
+///   timer throttling delays the next interval fire).
+#[wasm_bindgen]
+pub fn catbird_mls_start_background_tasks(interval_ms: u32) -> Result<(), JsValue> {
+    if interval_ms == 0 {
+        return Err(js_err!(
+            "start_background_tasks: interval_ms must be > 0 (recommended: 30000)"
+        ));
+    }
+
+    // Restart semantics: replace any existing timer instead of stacking.
+    catbird_mls_stop_background_tasks();
+
+    let tick_closure = Closure::<dyn FnMut()>::new(move || {
+        wasm_bindgen_futures::spawn_local(background_tasks_tick());
+    });
+    let interval_handle = js_set_interval(&tick_closure, f64::from(interval_ms));
+    BACKGROUND_TASKS.with(|t| {
+        *t.borrow_mut() = Some(BackgroundTasks {
+            interval_handle,
+            _tick_closure: tick_closure,
+        });
+    });
+
+    // First tick now — a convo already in ResetPending shouldn't wait a full
+    // interval to start healing.
+    wasm_bindgen_futures::spawn_local(background_tasks_tick());
+
+    web_sys::console::log_1(&js_err!(
+        "[background-tasks] started (deferred-recovery every {}ms)",
+        interval_ms
+    ));
+    Ok(())
+}
+
+/// Stop the background task loop started by
+/// `catbird_mls_start_background_tasks()`. Idempotent — safe to call when
+/// nothing is running. Call on logout/teardown if the Worker outlives the
+/// session (terminating the Worker also kills the timer).
+#[wasm_bindgen]
+pub fn catbird_mls_stop_background_tasks() {
+    if let Some(tasks) = BACKGROUND_TASKS.with(|t| t.borrow_mut().take()) {
+        js_clear_interval(tasks.interval_handle);
+        web_sys::console::log_1(&js_err!("[background-tasks] stopped"));
+    }
+}
+
+/// Whether the background task loop is currently running. Exposed for hosts
+/// and the wasm-bindgen test suite.
+#[wasm_bindgen]
+pub fn catbird_mls_background_tasks_running() -> bool {
+    BACKGROUND_TASKS.with(|t| t.borrow().is_some())
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod background_tasks_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Promise-based sleep via the global `setTimeout` (Window + Worker safe).
+    async fn sleep_ms(ms: f64) {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            let global = js_sys::global();
+            let set_timeout: js_sys::Function =
+                js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
+                    .expect("setTimeout missing from global scope")
+                    .into();
+            set_timeout
+                .call2(&global, &resolve, &JsValue::from_f64(ms))
+                .expect("setTimeout call failed");
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    #[wasm_bindgen_test]
+    fn start_stop_and_restart_guard() {
+        assert!(!catbird_mls_background_tasks_running());
+
+        catbird_mls_start_background_tasks(60_000).expect("start should succeed");
+        assert!(catbird_mls_background_tasks_running());
+
+        // Double-start replaces the existing timer rather than stacking.
+        catbird_mls_start_background_tasks(120_000).expect("restart should succeed");
+        assert!(catbird_mls_background_tasks_running());
+
+        catbird_mls_stop_background_tasks();
+        assert!(!catbird_mls_background_tasks_running());
+
+        // Stop is idempotent.
+        catbird_mls_stop_background_tasks();
+        assert!(!catbird_mls_background_tasks_running());
+
+        // Zero interval is rejected and does not start anything.
+        catbird_mls_start_background_tasks(0).expect_err("zero interval must be rejected");
+        assert!(!catbird_mls_background_tasks_running());
+    }
+
+    #[wasm_bindgen_test]
+    async fn failed_ticks_do_not_kill_the_loop() {
+        // Not initialized / not authenticated → every tick errors. The loop
+        // must swallow those errors and stay alive.
+        catbird_mls_start_background_tasks(25).expect("start should succeed");
+        sleep_ms(150.0).await; // several error ticks elapse
+        assert!(
+            catbird_mls_background_tasks_running(),
+            "timer must survive failing ticks"
+        );
+        catbird_mls_stop_background_tasks();
+        assert!(!catbird_mls_background_tasks_running());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Field-level encryption — JS exports
 //
 // In-memory only at this layer (Task 5 of the MLS field-level encryption

@@ -45,15 +45,16 @@ Entry points are defined with `#[wasm_bindgen]` in `src/lib.rs` (~45 exports). G
 - **Attachments**: `catbird_mls_send_image`, `catbird_mls_get_image_attachment`.
 - **Members / roster**: `catbird_mls_get_members`, `catbird_mls_add_group_members`, `catbird_mls_add_participants`, `catbird_mls_remove_participants`, `catbird_mls_promote_member`, `catbird_mls_demote_member`, `catbird_mls_check_opt_in_status`, `catbird_mls_search_users`, `catbird_mls_get_profiles`.
 - **Realtime (WebSocket)**: `catbird_mls_subscribe(convo_id, on_message, on_event, on_status)` / `catbird_mls_unsubscribe`, plus lower-level `connect(...)` returning a `WsSubscription` handle (call `.close()` to disconnect).
-- **Key packages / recovery**: `catbird_mls_replenish_key_packages`, `catbird_mls_run_deferred_recovery` (see Consumers).
+- **Key packages / recovery**: `catbird_mls_replenish_key_packages`, `catbird_mls_start_background_tasks(interval_ms)` / `catbird_mls_stop_background_tasks()` / `catbird_mls_background_tasks_running()` (crate-owned deferred-recovery timer — the default contract), `catbird_mls_run_deferred_recovery` (manual/on-demand tick; see Consumers).
 - **Field-level (envelope) crypto** (`js_name` camelCase): `setContentRootKey`, `clearContentRootKey`, `encryptMessagePayload`, `decryptMessagePayload`, `computeMessageHmac`, `verifyMessageHmac` — the per-conversation payload encryption layer, wire-compatible with catmos desktop.
 
 ### Init ordering (load-bearing)
 
 ```ts
-await catbird_mls_init(config);          // open encrypted SQLite, load groups
-catbird_mls_set_auth(did, token);        // inject ATProto bearer token
-await catbird_mls_setup();               // register device / replenish key packages
+await catbird_mls_init(config);             // open encrypted SQLite, load groups
+catbird_mls_set_auth(did, token);           // inject ATProto bearer token
+await catbird_mls_setup();                  // register device / replenish key packages
+catbird_mls_start_background_tasks(30_000); // crate-owned deferred-recovery timer
 ```
 
 `InitConfig` (deserialized from a JS object, camelCase keys):
@@ -95,7 +96,9 @@ After changing the Rust ABI, rebuild `pkg/` and re-run `npm run check` in catmos
 
 ### Deferred-recovery loop (required, not optional)
 
-Browser apps **MUST** call `catbird_mls_run_deferred_recovery()` on a cadence (every ~30s via `setInterval` + on `visibilitychange === "visible"`). This drives the deferred-recovery state machine that adopts server-initiated `groupResetEvent`s (spec §8.5 Phase 1). Without it, a conversation in `ResetPending` never heals. It is a no-op when nothing is pending (cheap). Full rationale and a copy-paste TS snippet are in `README.md`.
+Browser apps **MUST** call `catbird_mls_start_background_tasks(interval_ms)` once after `catbird_mls_setup()` (recommended: `30_000`). The crate then owns the repeating timer that drives the deferred-recovery state machine adopting server-initiated `groupResetEvent`s (spec §8.5 Phase 1). Without it, a conversation in `ResetPending` never heals. Each tick is a no-op when nothing is pending (cheap); per-tick errors are logged and swallowed so one failure never kills the loop; restarting replaces the existing timer (never stacks); `catbird_mls_stop_background_tasks()` tears it down (idempotent).
+
+`catbird_mls_run_deferred_recovery()` remains exported for **on-demand** ticks — call it on `visibilitychange === "visible"` so recovery runs immediately when the user returns to a throttled background tab. Hand-rolling your own `setInterval` around it is no longer the contract. Full rationale and a copy-paste TS snippet are in `README.md`.
 
 ## Gotchas
 

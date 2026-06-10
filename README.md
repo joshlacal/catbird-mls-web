@@ -13,63 +13,52 @@ Output lands in `pkg/`.
 
 ## JS Integration: Recovery Loop
 
-Browser apps **MUST** call `catbird_mls_run_deferred_recovery()` on a periodic
-cadence. This drives the deferred-recovery state machine that adopts
+Browser apps **MUST** start the crate-owned background task loop once after
+setup. This drives the deferred-recovery state machine that adopts
 server-initiated `groupResetEvent`s (spec §8.5 Phase 1) — without it, a
 conversation that lands in `ResetPending` will never finish healing.
 
-Recommended cadence:
-
-- **Every 30 seconds** via `setInterval` while the page is in the foreground.
-- **On `visibilitychange="visible"`** so the loop runs immediately when the
-  user returns to the tab (the periodic timer is paused/throttled in
-  background tabs by browsers).
-
-Example:
-
 ```ts
-import { catbird_mls_run_deferred_recovery } from "catbird-mls-web";
+import {
+  catbird_mls_start_background_tasks,
+  catbird_mls_stop_background_tasks,
+  catbird_mls_run_deferred_recovery,
+} from "catbird-mls-web";
 
-const RECOVERY_INTERVAL_MS = 30_000;
-let timer: number | undefined;
+// After catbird_mls_init / set_auth / setup — the crate owns the timer.
+// Runs one recovery tick immediately, then every 30s. Per-tick errors are
+// logged to the console and swallowed; one failed tick never kills the loop.
+// Calling start again replaces the running timer (restart semantics — timers
+// never stack). interval_ms must be > 0.
+catbird_mls_start_background_tasks(30_000);
 
-async function tick() {
-  try {
-    const result = await catbird_mls_run_deferred_recovery();
-    // result is { touched: number } — count of ResetPending convos processed.
-  } catch (err) {
-    console.warn("[catbird-mls-web] deferred recovery failed:", err);
-  }
-}
-
-function start() {
-  if (timer) return;
-  timer = window.setInterval(tick, RECOVERY_INTERVAL_MS);
-  void tick(); // run immediately on start
-}
-
-function stop() {
-  if (timer) {
-    window.clearInterval(timer);
-    timer = undefined;
-  }
-}
-
+// Browsers throttle timers in background tabs, so also run an on-demand tick
+// when the user returns to the tab:
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
-    void tick();
-    start();
-  } else {
-    stop();
+    void catbird_mls_run_deferred_recovery().catch((err) =>
+      console.warn("[catbird-mls-web] deferred recovery failed:", err)
+    );
   }
 });
 
-// Kick off after init.
-start();
+// On logout/teardown (idempotent; terminating the Worker also kills it):
+catbird_mls_stop_background_tasks();
 ```
 
-The function is a no-op when no conversations are in `ResetPending`, so
-running it every 30s is cheap. Each call:
+> **Note (Workers):** the WASM module runs inside a Web Worker — call
+> `catbird_mls_start_background_tasks` from *inside* the Worker (it uses the
+> global `setInterval`, available in both Window and Worker scopes), but the
+> `visibilitychange` listener must live on the main thread (`document` does
+> not exist in Workers) and forward to the Worker.
+
+`catbird_mls_run_deferred_recovery()` remains exported for on-demand ticks
+(visibility changes, tests, "retry now" buttons); hand-rolling your own
+`setInterval` around it is no longer the contract.
+`catbird_mls_background_tasks_running()` reports whether the loop is active.
+
+Each recovery tick is a no-op when no conversations are in `ResetPending`, so
+a 30s cadence is cheap. Each tick:
 
 1. Lists all conversations for the current user.
 2. For each in `ResetPending`, tries Welcome → External Commit

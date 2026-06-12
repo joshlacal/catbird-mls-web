@@ -704,6 +704,9 @@ impl MLSStorageBackend for WasmStorageBackend {
             metadata: None,
             created_at: None,
             updated_at: None,
+            // WS-4 rung 2: not yet persisted in this platform's storage
+            // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
+            sequencer_did: None,
         }))
     }
 
@@ -753,6 +756,9 @@ impl MLSStorageBackend for WasmStorageBackend {
                 metadata: None,
                 created_at: None,
                 updated_at: None,
+                // WS-4 rung 2: not yet persisted in this platform's storage
+                // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
+                sequencer_did: None,
             });
         }
         Ok(views)

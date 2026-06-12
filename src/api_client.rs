@@ -205,6 +205,9 @@ fn parse_conversation(c: &lexicon::defs::ConvoView) -> ConversationView {
         metadata: None,
         created_at: Some(c.created_at.as_ref().with_timezone(&chrono::Utc)),
         updated_at: None,
+        // WS-4 rung 2: per-conversation sequencer DS (ADR-010 D4). Optional on
+        // the wire; older servers omit it.
+        sequencer_did: c.sequencer_did.as_ref().map(|d| d.as_str().to_string()),
     }
 }
 

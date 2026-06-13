@@ -219,6 +219,7 @@ impl WasmStorageBackend {
                 join_epoch             INTEGER,
                 needs_rejoin           INTEGER DEFAULT 0,
                 state                  TEXT DEFAULT 'active',
+                sequencer_did          TEXT,
                 reset_new_group_id     TEXT,
                 reset_generation       INTEGER,
                 reset_notified_at_ms   INTEGER,
@@ -231,6 +232,7 @@ impl WasmStorageBackend {
         let _ = conn.exec_raw(
             "ALTER TABLE conversations ADD COLUMN state TEXT DEFAULT 'active';",
         );
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN sequencer_did TEXT;");
 
         // Migration (spec §8.6 / §8.1 RESET_PENDING): persist the payload
         // shipped by `GroupResetEvent` so deferred recovery survives reload.
@@ -657,10 +659,10 @@ impl MLSStorageBackend for WasmStorageBackend {
         let rows = self
             .conn
             .query_text(
-                "SELECT group_id FROM conversations
+                "SELECT group_id, sequencer_did FROM conversations
                  WHERE conversation_id = ?1 AND user_did = ?2",
                 &[(1, conversation_id), (2, user_did)],
-                1,
+                2,
             )
             .map_err(Self::store_err)?;
 
@@ -669,6 +671,7 @@ impl MLSStorageBackend for WasmStorageBackend {
         }
 
         let group_id = rows[0][0].clone().unwrap_or_default();
+        let sequencer_did = rows[0][1].clone();
 
         // Look up group state for epoch/members
         let gs_rows = self
@@ -704,9 +707,7 @@ impl MLSStorageBackend for WasmStorageBackend {
             metadata: None,
             created_at: None,
             updated_at: None,
-            // WS-4 rung 2: not yet persisted in this platform's storage
-            // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
-            sequencer_did: None,
+            sequencer_did,
         }))
     }
 
@@ -714,15 +715,16 @@ impl MLSStorageBackend for WasmStorageBackend {
         let rows = self
             .conn
             .query_text(
-                "SELECT conversation_id, group_id FROM conversations WHERE user_did = ?1",
+                "SELECT conversation_id, group_id, sequencer_did FROM conversations WHERE user_did = ?1",
                 &[(1, user_did)],
-                2,
+                3,
             )
             .map_err(Self::store_err)?;
 
         let mut views = Vec::with_capacity(rows.len());
         for row in rows {
             let group_id = row[1].clone().unwrap_or_default();
+            let sequencer_did = row[2].clone();
 
             let gs_rows = self
                 .conn
@@ -756,9 +758,7 @@ impl MLSStorageBackend for WasmStorageBackend {
                 metadata: None,
                 created_at: None,
                 updated_at: None,
-                // WS-4 rung 2: not yet persisted in this platform's storage
-                // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
-                sequencer_did: None,
+                sequencer_did,
             });
         }
         Ok(views)
@@ -903,6 +903,19 @@ impl MLSStorageBackend for WasmStorageBackend {
                      reset_notified_at_ms = NULL
                  WHERE conversation_id = ?1",
                 &[(1, conversation_id)],
+            )
+            .map_err(Self::store_err)
+    }
+
+    async fn set_conversation_sequencer(
+        &self,
+        conversation_id: &str,
+        sequencer_did: &str,
+    ) -> Result<()> {
+        self.conn
+            .exec_with_text_params(
+                "UPDATE conversations SET sequencer_did = ?1 WHERE conversation_id = ?2",
+                &[(1, sequencer_did), (2, conversation_id)],
             )
             .map_err(Self::store_err)
     }
@@ -1217,5 +1230,72 @@ impl MLSStorageBackend for WasmStorageBackend {
                 &[(1, group_id)],
             )
             .map_err(Self::store_err)
+    }
+
+    fn implemented_optional_methods(&self) -> &'static [&'static str] {
+        &[
+            "get_conversation_state",
+            "mark_reset_pending",
+            "clear_reset_pending",
+            "set_conversation_sequencer",
+        ]
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    const TEST_DB_KEY: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    fn new_storage() -> WasmStorageBackend {
+        let db_path = format!("catbird-mls-web-test-{}.db", uuid::Uuid::new_v4());
+        let conn = SqliteConn::open(&db_path, TEST_DB_KEY).expect("open sqlite");
+        WasmStorageBackend::ensure_schema(&conn).expect("ensure schema");
+        WasmStorageBackend::new(Rc::new(conn))
+    }
+
+    #[wasm_bindgen_test]
+    async fn conversation_sequencer_did_round_trips() {
+        let storage = new_storage();
+        let user_did = "did:plc:alice";
+        let conversation_id = "conv-sequencer";
+        let group_id = conversation_id;
+        let sequencer_did = "did:web:ds-b.example";
+
+        storage
+            .ensure_conversation_exists(user_did, conversation_id, group_id)
+            .await
+            .expect("create conversation");
+        storage
+            .set_conversation_sequencer(conversation_id, sequencer_did)
+            .await
+            .expect("persist sequencer");
+        assert!(
+            storage
+                .implemented_optional_methods()
+                .contains(&"set_conversation_sequencer"),
+            "storage capabilities should report sequencer persistence"
+        );
+
+        let got = storage
+            .get_conversation(user_did, conversation_id)
+            .await
+            .expect("load conversation")
+            .expect("conversation exists");
+        assert_eq!(got.sequencer_did.as_deref(), Some(sequencer_did));
+
+        let listed = storage
+            .list_conversations(user_did)
+            .await
+            .expect("list conversations");
+        let listed = listed
+            .into_iter()
+            .find(|c| c.conversation_id == conversation_id)
+            .expect("listed conversation");
+        assert_eq!(listed.sequencer_did.as_deref(), Some(sequencer_did));
     }
 }

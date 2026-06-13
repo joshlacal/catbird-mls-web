@@ -1,0 +1,1 @@
+{"status":"HEALTHY","checked_at":"2026-04-20T00:00:00Z","workspace":{"cli_crate":true,"core_crate":true,"tui_crate":true},"toolchain":{"cargo":"1.93.1"},"dependencies":{"catbird_mls_wired":true},"build_artifacts_present":true,"issues":[]}

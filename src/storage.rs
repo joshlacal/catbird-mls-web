@@ -219,6 +219,7 @@ impl WasmStorageBackend {
                 join_epoch             INTEGER,
                 needs_rejoin           INTEGER DEFAULT 0,
                 state                  TEXT DEFAULT 'active',
+                sequencer_did          TEXT,
                 reset_new_group_id     TEXT,
                 reset_generation       INTEGER,
                 reset_notified_at_ms   INTEGER,
@@ -228,46 +229,27 @@ impl WasmStorageBackend {
         .map_err(|e| format!("conversations table: {}", e))?;
 
         // Migration: add state column for existing databases.
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN state TEXT DEFAULT 'active';",
-        );
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN state TEXT DEFAULT 'active';");
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN sequencer_did TEXT;");
 
         // Migration (spec §8.6 / §8.1 RESET_PENDING): persist the payload
         // shipped by `GroupResetEvent` so deferred recovery survives reload.
         // Three additive ALTERs — ignore errors if columns already exist.
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN reset_new_group_id TEXT;",
-        );
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN reset_generation INTEGER;",
-        );
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN reset_notified_at_ms INTEGER;",
-        );
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN reset_new_group_id TEXT;");
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN reset_generation INTEGER;");
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN reset_notified_at_ms INTEGER;");
 
         // Migration (MLS metadata cutover): persist decrypted group metadata
         // locally. Server has no plaintext title / description / avatar; the
         // encrypted-blob path (catbird_mls::metadata) is the only source of
         // truth. We store the decrypted result here so the conversation
         // list can render display names without re-fetching every load.
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN title TEXT;",
-        );
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN description TEXT;",
-        );
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN metadata_version INTEGER;",
-        );
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN avatar_blob_locator TEXT;",
-        );
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN avatar_content_type TEXT;",
-        );
-        let _ = conn.exec_raw(
-            "ALTER TABLE conversations ADD COLUMN avatar_bytes BLOB;",
-        );
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN title TEXT;");
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN description TEXT;");
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN metadata_version INTEGER;");
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN avatar_blob_locator TEXT;");
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN avatar_content_type TEXT;");
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN avatar_bytes BLOB;");
 
         conn.exec_raw(
             "CREATE TABLE IF NOT EXISTS messages (
@@ -307,9 +289,8 @@ impl WasmStorageBackend {
         // user-initiated deletes, but the columns ship now so a later
         // soft-delete path can land without another schema migration
         // breaking the HMAC chain.
-        let _ = conn.exec_raw(
-            "ALTER TABLE messages ADD COLUMN is_tombstone INTEGER NOT NULL DEFAULT 0;",
-        );
+        let _ = conn
+            .exec_raw("ALTER TABLE messages ADD COLUMN is_tombstone INTEGER NOT NULL DEFAULT 0;");
         let _ = conn.exec_raw("ALTER TABLE messages ADD COLUMN deleted_at INTEGER;");
 
         // One-shot drop of any pre-field-encryption rows. Matches the
@@ -422,9 +403,7 @@ impl WasmStorageBackend {
                             "DELETE FROM group_states WHERE group_id = ?1",
                             &[(1, &old)],
                         )
-                        .map_err(|e| {
-                            format!("update_conversation_group_id DELETE: {:?}", e)
-                        })?;
+                        .map_err(|e| format!("update_conversation_group_id DELETE: {:?}", e))?;
                 }
             }
             Ok(())
@@ -657,10 +636,10 @@ impl MLSStorageBackend for WasmStorageBackend {
         let rows = self
             .conn
             .query_text(
-                "SELECT group_id FROM conversations
+                "SELECT group_id, sequencer_did FROM conversations
                  WHERE conversation_id = ?1 AND user_did = ?2",
                 &[(1, conversation_id), (2, user_did)],
-                1,
+                2,
             )
             .map_err(Self::store_err)?;
 
@@ -669,6 +648,7 @@ impl MLSStorageBackend for WasmStorageBackend {
         }
 
         let group_id = rows[0][0].clone().unwrap_or_default();
+        let sequencer_did = rows[0][1].clone();
 
         // Look up group state for epoch/members
         let gs_rows = self
@@ -704,9 +684,7 @@ impl MLSStorageBackend for WasmStorageBackend {
             metadata: None,
             created_at: None,
             updated_at: None,
-            // WS-4 rung 2: not yet persisted in this platform's storage
-            // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
-            sequencer_did: None,
+            sequencer_did,
         }))
     }
 
@@ -714,15 +692,16 @@ impl MLSStorageBackend for WasmStorageBackend {
         let rows = self
             .conn
             .query_text(
-                "SELECT conversation_id, group_id FROM conversations WHERE user_did = ?1",
+                "SELECT conversation_id, group_id, sequencer_did FROM conversations WHERE user_did = ?1",
                 &[(1, user_did)],
-                2,
+                3,
             )
             .map_err(Self::store_err)?;
 
         let mut views = Vec::with_capacity(rows.len());
         for row in rows {
             let group_id = row[1].clone().unwrap_or_default();
+            let sequencer_did = row[2].clone();
 
             let gs_rows = self
                 .conn
@@ -756,9 +735,7 @@ impl MLSStorageBackend for WasmStorageBackend {
                 metadata: None,
                 created_at: None,
                 updated_at: None,
-                // WS-4 rung 2: not yet persisted in this platform's storage
-                // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
-                sequencer_did: None,
+                sequencer_did,
             });
         }
         Ok(views)
@@ -801,7 +778,11 @@ impl MLSStorageBackend for WasmStorageBackend {
                          reset_generation = ?3,
                          reset_notified_at_ms = ?4
                      WHERE conversation_id = ?5",
-                    &[(1, state_str), (2, new_group_id.as_str()), (5, conversation_id)],
+                    &[
+                        (1, state_str),
+                        (2, new_group_id.as_str()),
+                        (5, conversation_id),
+                    ],
                     &[(3, reset_generation as i64), (4, notified_at_ms)],
                 )
                 .map_err(Self::store_err),
@@ -849,8 +830,14 @@ impl MLSStorageBackend for WasmStorageBackend {
             "failed" => Ok(Some(ConversationState::Failed)),
             "reset_pending" => {
                 let new_group_id = row.get(1).and_then(|c| c.clone());
-                let reset_generation = row.get(2).and_then(|c| c.as_deref()).and_then(|s| s.parse::<i32>().ok());
-                let notified_at_ms = row.get(3).and_then(|c| c.as_deref()).and_then(|s| s.parse::<i64>().ok());
+                let reset_generation = row
+                    .get(2)
+                    .and_then(|c| c.as_deref())
+                    .and_then(|s| s.parse::<i32>().ok());
+                let notified_at_ms = row
+                    .get(3)
+                    .and_then(|c| c.as_deref())
+                    .and_then(|s| s.parse::<i64>().ok());
                 match (new_group_id, reset_generation, notified_at_ms) {
                     (Some(g), Some(r), Some(t)) if !g.is_empty() => {
                         Ok(Some(ConversationState::ResetPending {
@@ -903,6 +890,19 @@ impl MLSStorageBackend for WasmStorageBackend {
                      reset_notified_at_ms = NULL
                  WHERE conversation_id = ?1",
                 &[(1, conversation_id)],
+            )
+            .map_err(Self::store_err)
+    }
+
+    async fn set_conversation_sequencer(
+        &self,
+        conversation_id: &str,
+        sequencer_did: &str,
+    ) -> Result<()> {
+        self.conn
+            .exec_with_text_params(
+                "UPDATE conversations SET sequencer_did = ?1 WHERE conversation_id = ?2",
+                &[(1, sequencer_did), (2, conversation_id)],
             )
             .map_err(Self::store_err)
     }
@@ -1068,16 +1068,12 @@ impl MLSStorageBackend for WasmStorageBackend {
                 let convo_id = row[1].0.clone().unwrap_or_default();
                 let sender = row[2].0.clone().unwrap_or_default();
                 let legacy_text = row[3].0.clone().unwrap_or_default();
-                let seq: u64 =
-                    row[4].0.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let epoch: u64 =
-                    row[5].0.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let seq: u64 = row[4].0.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let epoch: u64 = row[5].0.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let created_at = row[6].0.clone().unwrap_or_default();
                 let is_own = row[7].0.as_deref() == Some("1");
-                let delivery_status: Option<DeliveryStatus> = row[8]
-                    .0
-                    .as_ref()
-                    .and_then(|s| serde_json::from_str(s).ok());
+                let delivery_status: Option<DeliveryStatus> =
+                    row[8].0.as_ref().and_then(|s| serde_json::from_str(s).ok());
                 let legacy_payload_json = row[9].0.clone();
                 let payload_encrypted = row[10].1.clone();
 
@@ -1119,10 +1115,7 @@ impl MLSStorageBackend for WasmStorageBackend {
 
     async fn message_exists(&self, message_id: &str) -> Result<bool> {
         self.conn
-            .exists(
-                "SELECT 1 FROM messages WHERE id = ?1",
-                &[(1, message_id)],
-            )
+            .exists("SELECT 1 FROM messages WHERE id = ?1", &[(1, message_id)])
             .map_err(Self::store_err)
     }
 
@@ -1147,10 +1140,7 @@ impl MLSStorageBackend for WasmStorageBackend {
     }
 
     async fn set_sync_cursor(&self, user_did: &str, cursor: &SyncCursor) -> Result<()> {
-        let convos_cursor = cursor
-            .conversations_cursor
-            .as_deref()
-            .unwrap_or("");
+        let convos_cursor = cursor.conversations_cursor.as_deref().unwrap_or("");
         let msgs_cursor = cursor.messages_cursor.as_deref().unwrap_or("");
         self.conn
             .exec_with_text_params(
@@ -1217,5 +1207,72 @@ impl MLSStorageBackend for WasmStorageBackend {
                 &[(1, group_id)],
             )
             .map_err(Self::store_err)
+    }
+
+    fn implemented_optional_methods(&self) -> &'static [&'static str] {
+        &[
+            "get_conversation_state",
+            "mark_reset_pending",
+            "clear_reset_pending",
+            "set_conversation_sequencer",
+        ]
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    const TEST_DB_KEY: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    fn new_storage() -> WasmStorageBackend {
+        let db_path = format!("catbird-mls-web-test-{}.db", uuid::Uuid::new_v4());
+        let conn = SqliteConn::open(&db_path, TEST_DB_KEY).expect("open sqlite");
+        WasmStorageBackend::ensure_schema(&conn).expect("ensure schema");
+        WasmStorageBackend::new(Rc::new(conn))
+    }
+
+    #[wasm_bindgen_test]
+    async fn conversation_sequencer_did_round_trips() {
+        let storage = new_storage();
+        let user_did = "did:plc:alice";
+        let conversation_id = "conv-sequencer";
+        let group_id = conversation_id;
+        let sequencer_did = "did:web:ds-b.example";
+
+        storage
+            .ensure_conversation_exists(user_did, conversation_id, group_id)
+            .await
+            .expect("create conversation");
+        storage
+            .set_conversation_sequencer(conversation_id, sequencer_did)
+            .await
+            .expect("persist sequencer");
+        assert!(
+            storage
+                .implemented_optional_methods()
+                .contains(&"set_conversation_sequencer"),
+            "storage capabilities should report sequencer persistence"
+        );
+
+        let got = storage
+            .get_conversation(user_did, conversation_id)
+            .await
+            .expect("load conversation")
+            .expect("conversation exists");
+        assert_eq!(got.sequencer_did.as_deref(), Some(sequencer_did));
+
+        let listed = storage
+            .list_conversations(user_did)
+            .await
+            .expect("list conversations");
+        let listed = listed
+            .into_iter()
+            .find(|c| c.conversation_id == conversation_id)
+            .expect("listed conversation");
+        assert_eq!(listed.sequencer_did.as_deref(), Some(sequencer_did));
     }
 }

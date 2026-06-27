@@ -46,7 +46,10 @@ impl From<serde_json::Error> for WasmSqliteError {
 pub fn sqlite_transient() -> Option<unsafe extern "C" fn(*mut std::ffi::c_void)> {
     // SQLITE_TRANSIENT = ((sqlite3_destructor_type)-1)
     unsafe {
-        Some(std::mem::transmute::<isize, unsafe extern "C" fn(*mut std::ffi::c_void)>(-1))
+        Some(std::mem::transmute::<
+            isize,
+            unsafe extern "C" fn(*mut std::ffi::c_void),
+        >(-1))
     }
 }
 
@@ -103,8 +106,7 @@ impl SqliteConn {
 
     /// Execute a SQL statement with no parameters and no result.
     pub fn exec_raw(&self, sql: &str) -> Result<(), WasmSqliteError> {
-        let c_sql =
-            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let ret = unsafe {
             sqlite3_exec(
                 self.db,
@@ -159,8 +161,7 @@ impl SqliteConn {
             if blob_ptr.is_null() || blob_len == 0 {
                 Ok(Some(Vec::new()))
             } else {
-                let slice =
-                    unsafe { std::slice::from_raw_parts(blob_ptr.cast::<u8>(), blob_len) };
+                let slice = unsafe { std::slice::from_raw_parts(blob_ptr.cast::<u8>(), blob_len) };
                 Ok(Some(slice.to_vec()))
             }
         } else if step == SQLITE_DONE {
@@ -175,8 +176,7 @@ impl SqliteConn {
 
     /// Upsert a key-value pair (INSERT OR REPLACE) into the KV table.
     pub fn put(&self, storage_key: &[u8], value: &[u8]) -> Result<(), WasmSqliteError> {
-        let sql =
-            c"INSERT OR REPLACE INTO openmls_kv (storage_key, value) VALUES (?1, ?2)";
+        let sql = c"INSERT OR REPLACE INTO openmls_kv (storage_key, value) VALUES (?1, ?2)";
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
         let ret = unsafe {
@@ -278,8 +278,7 @@ impl SqliteConn {
         sql: &str,
         params: &[(i32, &str)],
     ) -> Result<(), WasmSqliteError> {
-        let c_sql =
-            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
         let ret = unsafe {
@@ -329,8 +328,7 @@ impl SqliteConn {
         text_params: &[(i32, &str)],
         int_params: &[(i32, i64)],
     ) -> Result<(), WasmSqliteError> {
-        let c_sql =
-            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
         let ret = unsafe {
@@ -397,8 +395,7 @@ impl SqliteConn {
         int_params: &[(i32, i64)],
         blob_params: &[(i32, &[u8])],
     ) -> Result<(), WasmSqliteError> {
-        let c_sql =
-            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
         let ret = unsafe {
@@ -471,8 +468,7 @@ impl SqliteConn {
         text_params: &[(i32, &str)],
         blob_params: &[(i32, &[u8])],
     ) -> Result<(), WasmSqliteError> {
-        let c_sql =
-            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
         let ret = unsafe {
@@ -538,8 +534,7 @@ impl SqliteConn {
         params: &[(i32, &str)],
         col_count: usize,
     ) -> Result<Vec<Vec<Option<String>>>, WasmSqliteError> {
-        let c_sql =
-            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
         let ret = unsafe {
@@ -608,8 +603,7 @@ impl SqliteConn {
         int_params: &[(i32, i64)],
         col_count: usize,
     ) -> Result<Vec<Vec<Option<String>>>, WasmSqliteError> {
-        let c_sql =
-            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
         let ret = unsafe {
@@ -699,8 +693,7 @@ impl SqliteConn {
         col_count: usize,
         blob_cols: &[usize],
     ) -> Result<Vec<Vec<(Option<String>, Option<Vec<u8>>)>>, WasmSqliteError> {
-        let c_sql =
-            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
         let ret = unsafe {
@@ -751,8 +744,7 @@ impl SqliteConn {
                 for i in 0..col_count {
                     if blob_set.contains(&i) {
                         let blob_ptr = unsafe { sqlite3_column_blob(stmt, i as i32) };
-                        let blob_len =
-                            unsafe { sqlite3_column_bytes(stmt, i as i32) } as usize;
+                        let blob_len = unsafe { sqlite3_column_bytes(stmt, i as i32) } as usize;
                         if blob_ptr.is_null() || blob_len == 0 {
                             row.push((None, None));
                         } else {
@@ -790,8 +782,7 @@ impl SqliteConn {
         sql: &str,
         text_params: &[(i32, &str)],
     ) -> Result<Option<Vec<u8>>, WasmSqliteError> {
-        let c_sql =
-            CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
         let ret = unsafe {
@@ -832,8 +823,7 @@ impl SqliteConn {
             if blob_ptr.is_null() || blob_len == 0 {
                 Ok(Some(Vec::new()))
             } else {
-                let slice =
-                    unsafe { std::slice::from_raw_parts(blob_ptr.cast::<u8>(), blob_len) };
+                let slice = unsafe { std::slice::from_raw_parts(blob_ptr.cast::<u8>(), blob_len) };
                 Ok(Some(slice.to_vec()))
             }
         } else if step == SQLITE_DONE {
@@ -847,11 +837,7 @@ impl SqliteConn {
     }
 
     /// Check if a row exists (returns true if query returns at least one row).
-    pub fn exists(
-        &self,
-        sql: &str,
-        params: &[(i32, &str)],
-    ) -> Result<bool, WasmSqliteError> {
+    pub fn exists(&self, sql: &str, params: &[(i32, &str)]) -> Result<bool, WasmSqliteError> {
         let rows = self.query_text(sql, params, 1)?;
         Ok(!rows.is_empty())
     }

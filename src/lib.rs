@@ -499,25 +499,28 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
                 let mut loaded = 0u32;
                 for id_str in &ids {
                     let Some(gid_bytes) = decode_group_id(id_str) else {
-                        web_sys::console::warn_1(&format!(
-                            "catbird-mls-web: invalid group_id in storage: {}",
-                            id_str
-                        ).into());
+                        web_sys::console::warn_1(
+                            &format!("catbird-mls-web: invalid group_id in storage: {}", id_str)
+                                .into(),
+                        );
                         continue;
                     };
                     match ctx.ensure_group_loaded(&gid_bytes) {
                         Ok(true) => loaded += 1,
                         Ok(false) => {
-                            web_sys::console::warn_1(&format!(
+                            web_sys::console::warn_1(
+                                &format!(
                                 "catbird-mls-web: group {} in SQLite but not in OpenMLS storage",
                                 id_str
-                            ).into());
+                            )
+                                .into(),
+                            );
                         }
                         Err(e) => {
-                            web_sys::console::warn_1(&format!(
-                                "catbird-mls-web: failed to load group {}: {}",
-                                id_str, e
-                            ).into());
+                            web_sys::console::warn_1(
+                                &format!("catbird-mls-web: failed to load group {}: {}", id_str, e)
+                                    .into(),
+                            );
                         }
                     }
                 }
@@ -531,10 +534,13 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
                 );
             }
             Err(e) => {
-                web_sys::console::warn_1(&format!(
-                    "catbird-mls-web: failed to enumerate persisted groups: {}",
-                    e
-                ).into());
+                web_sys::console::warn_1(
+                    &format!(
+                        "catbird-mls-web: failed to enumerate persisted groups: {}",
+                        e
+                    )
+                    .into(),
+                );
             }
         }
     }
@@ -917,19 +923,26 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
                 Ok(jr) => {
                     // Cache the local MLS epoch so send_message uses it
                     let welcome_epoch = with_state(|s| {
-                        Ok(s.mls_context.as_ref()
+                        Ok(s.mls_context
+                            .as_ref()
                             .and_then(|ctx| ctx.get_epoch(jr.group_id.clone()).ok())
                             .unwrap_or(0))
-                    }).unwrap_or(0);
-                    SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.to_string(), welcome_epoch));
+                    })
+                    .unwrap_or(0);
+                    SERVER_EPOCHS
+                        .with(|m| m.borrow_mut().insert(convo_id.to_string(), welcome_epoch));
 
                     // MLS metadata cutover: bootstrap encrypted metadata so
                     // the conversation list / header render the title +
                     // description + avatar without waiting for a UI nudge.
                     // Best-effort — never block the join path on this.
-                    let group_id_hex_for_bootstrap = jr.group_id
-                        .iter().map(|b| format!("{:02x}", b)).collect::<String>();
-                    if let Err(e) = wasm_bootstrap_group_metadata(group_id_hex_for_bootstrap).await {
+                    let group_id_hex_for_bootstrap = jr
+                        .group_id
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>();
+                    if let Err(e) = wasm_bootstrap_group_metadata(group_id_hex_for_bootstrap).await
+                    {
                         web_sys::console::warn_1(&JsValue::from_str(&format!(
                             "[bootstrap] post-Welcome bootstrap failed (non-fatal): {:?}",
                             e
@@ -995,7 +1008,10 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
     })?;
 
     // Cache server epoch so send_message uses it instead of local MLS epoch
-    SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.to_string(), server_result.epoch));
+    SERVER_EPOCHS.with(|m| {
+        m.borrow_mut()
+            .insert(convo_id.to_string(), server_result.epoch)
+    });
 
     // Publish updated GroupInfo so other clients can also external-commit join
     let publish_result = with_state(|s| {
@@ -1170,7 +1186,10 @@ pub async fn catbird_mls_create_conversation(
     };
 
     // Encode as hex to match server convention (GroupId = hex-encoded string)
-    let group_id_str: String = group_id_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let group_id_str: String = group_id_bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
     let metadata = ConversationMetadata {
         name: Some(name.clone()),
         description: None,
@@ -1202,10 +1221,12 @@ pub async fn catbird_mls_create_conversation(
             server_epoch
         } else {
             with_state(|s| {
-                Ok(s.mls_context.as_ref()
+                Ok(s.mls_context
+                    .as_ref()
                     .and_then(|ctx| ctx.get_epoch(group_id_bytes.clone()).ok())
                     .unwrap_or(0))
-            }).unwrap_or(0)
+            })
+            .unwrap_or(0)
         }
     };
     SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), create_epoch));
@@ -1216,7 +1237,10 @@ pub async fn catbird_mls_create_conversation(
 
     // Publish GroupInfo so other clients can join via external commit
     let gi_result = with_state(|s| {
-        let ctx = s.mls_context.as_ref().ok_or_else(|| js_err!("MLS not init"))?;
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS not init"))?;
         ctx.export_group_info(group_id_bytes.clone(), identity_bytes.clone())
             .map_err(|e| js_err!("export_group_info: {:?}", e))
     });
@@ -1346,7 +1370,10 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
 
     // Cache the server's epoch for this conversation so sendMessage uses it
     // instead of the local MLS epoch (which may differ from the server's counter).
-    SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.to_string(), server_result.epoch));
+    SERVER_EPOCHS.with(|m| {
+        m.borrow_mut()
+            .insert(convo_id.to_string(), server_result.epoch)
+    });
 
     // Publish updated GroupInfo so other clients can also external-commit join
     let publish_result = with_state(|s| {
@@ -1457,7 +1484,8 @@ async fn send_payload_message_internal(
         let epoch = {
             let mls_epoch = STATE.with(|s| {
                 let borrowed = s.borrow();
-                borrowed.as_ref()
+                borrowed
+                    .as_ref()
                     .and_then(|st| st.mls_context.as_ref())
                     .and_then(|ctx| ctx.get_epoch(group_id_bytes.clone()).ok())
             });
@@ -1470,7 +1498,9 @@ async fn send_payload_message_internal(
                 let cached = SERVER_EPOCHS.with(|m| m.borrow().get(&convo_id).copied());
                 cached.unwrap_or(e)
             } else {
-                SERVER_EPOCHS.with(|m| m.borrow().get(&convo_id).copied()).unwrap_or(0)
+                SERVER_EPOCHS
+                    .with(|m| m.borrow().get(&convo_id).copied())
+                    .unwrap_or(0)
             }
         };
 
@@ -1498,27 +1528,32 @@ async fn send_payload_message_internal(
                     };
                     if let Err(e) = storage.store_message(&stored_msg).await {
                         web_sys::console::warn_1(&js_err!(
-                            "catbird-mls-web: failed to persist sent message: {:?}", e
+                            "catbird-mls-web: failed to persist sent message: {:?}",
+                            e
                         ));
                     }
                 }
-                let message = ui_message_from_orchestrator(catbird_mls::orchestrator::types::Message {
-                    id: msg_id.clone(),
-                    conversation_id: convo_id,
-                    sender_did: user_did,
-                    text: display_text.clone(),
-                    timestamp: now,
-                    epoch,
-                    sequence_number: 0,
-                    is_own: true,
-                    delivery_status: None,
-                    payload_json: Some(payload_json.clone()),
-                });
+                let message =
+                    ui_message_from_orchestrator(catbird_mls::orchestrator::types::Message {
+                        id: msg_id.clone(),
+                        conversation_id: convo_id,
+                        sender_did: user_did,
+                        text: display_text.clone(),
+                        timestamp: now,
+                        epoch,
+                        sequence_number: 0,
+                        is_own: true,
+                        delivery_status: None,
+                        payload_json: Some(payload_json.clone()),
+                    });
                 return to_js(&message);
             }
             Err(e) => {
                 let (is_409, server_epoch_hint) = match &e {
-                    catbird_mls::orchestrator::error::OrchestratorError::ServerError { status, body } => {
+                    catbird_mls::orchestrator::error::OrchestratorError::ServerError {
+                        status,
+                        body,
+                    } => {
                         let is_conflict = *status == 409;
                         let hint = if is_conflict {
                             serde_json::from_str::<serde_json::Value>(body)
@@ -1542,7 +1577,8 @@ async fn send_payload_message_internal(
                             correct_epoch,
                             attempt + 1
                         ));
-                        SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), correct_epoch));
+                        SERVER_EPOCHS
+                            .with(|m| m.borrow_mut().insert(convo_id.clone(), correct_epoch));
                         continue;
                     } else {
                         // 409 without serverEpoch hint — we'd need to rejoin to make
@@ -1895,7 +1931,8 @@ pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue,
     if let Some(ref gid) = group_id_bytes {
         let updated_epoch = STATE.with(|s| {
             let borrowed = s.borrow();
-            borrowed.as_ref()
+            borrowed
+                .as_ref()
                 .and_then(|st| st.mls_context.as_ref())
                 .and_then(|ctx| ctx.get_epoch(gid.clone()).ok())
         });
@@ -2335,18 +2372,8 @@ pub fn catbird_mls_get_group_metadata(conversation_id: String) -> Result<JsValue
         None => return Ok(JsValue::NULL),
     };
 
-    let text = with_state(|s| {
-        Ok(s.storage
-            .get_metadata_text(&group_id_hex)
-            .ok()
-            .flatten())
-    })?;
-    let avatar = with_state(|s| {
-        Ok(s.storage
-            .get_metadata_avatar(&group_id_hex)
-            .ok()
-            .flatten())
-    })?;
+    let text = with_state(|s| Ok(s.storage.get_metadata_text(&group_id_hex).ok().flatten()))?;
+    let avatar = with_state(|s| Ok(s.storage.get_metadata_avatar(&group_id_hex).ok().flatten()))?;
 
     match text {
         Some((title, description)) => {
@@ -2419,7 +2446,10 @@ pub async fn catbird_mls_update_group_metadata(
                 }
                 Ok(())
             });
-            return Err(js_err!("commit_update_metadata server call failed: {:?}", e));
+            return Err(js_err!(
+                "commit_update_metadata server call failed: {:?}",
+                e
+            ));
         }
     };
     if !success {
@@ -2444,10 +2474,7 @@ pub async fn catbird_mls_update_group_metadata(
 
     // 4. Cache server epoch.
     if new_epoch > 0 {
-        SERVER_EPOCHS.with(|m| {
-            m.borrow_mut()
-                .insert(conversation_id.clone(), new_epoch)
-        });
+        SERVER_EPOCHS.with(|m| m.borrow_mut().insert(conversation_id.clone(), new_epoch));
     }
 
     // 5. Read post-merge MetadataReference + derive metadata key from new
@@ -2573,9 +2600,7 @@ pub async fn catbird_mls_update_group_metadata(
 /// Returns `null` if the group has no `MetadataReference` yet (e.g. just
 /// after a fresh group creation that hasn't run an `updateMetadata` commit).
 #[wasm_bindgen]
-pub async fn wasm_bootstrap_group_metadata(
-    group_id_hex: String,
-) -> Result<JsValue, JsValue> {
+pub async fn wasm_bootstrap_group_metadata(group_id_hex: String) -> Result<JsValue, JsValue> {
     use catbird_mls::metadata;
 
     let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
@@ -3109,25 +3134,24 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::storage::MLSStorageBackend;
     use catbird_mls::orchestrator::types::ConversationState;
 
-    let (api_client, storage, user_did, base_url, auth_token, proxy_did) =
-        with_state(|s| {
-            let did = s
-                .user_did
-                .clone()
-                .ok_or_else(|| js_err!("Not authenticated"))?;
-            let token = s
-                .auth_token
-                .clone()
-                .ok_or_else(|| js_err!("Not authenticated"))?;
-            Ok((
-                Arc::clone(&s.api_client),
-                Arc::clone(&s.storage),
-                did,
-                s.base_url.clone(),
-                token,
-                s.proxy_did.clone(),
-            ))
-        })?;
+    let (api_client, storage, user_did, base_url, auth_token, proxy_did) = with_state(|s| {
+        let did = s
+            .user_did
+            .clone()
+            .ok_or_else(|| js_err!("Not authenticated"))?;
+        let token = s
+            .auth_token
+            .clone()
+            .ok_or_else(|| js_err!("Not authenticated"))?;
+        Ok((
+            Arc::clone(&s.api_client),
+            Arc::clone(&s.storage),
+            did,
+            s.base_url.clone(),
+            token,
+            s.proxy_did.clone(),
+        ))
+    })?;
 
     // 1. Find ResetPending convos.
     let convos = storage
@@ -3251,10 +3275,7 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
         // roster is preserved server-side; the lexicon `members` field is
         // diagnostic-only but required. Idempotency-Key kept for
         // client-side dedup of network retries.
-        let idem_key = format!(
-            "{}:{}:{}:bootstrap",
-            convo_id, reset_generation, user_did
-        );
+        let idem_key = format!("{}:{}:{}:bootstrap", convo_id, reset_generation, user_did);
         let body = serde_json::json!({
             "originalConvoId": &convo_id,
             "newGroupId": &new_group_id_hex,
@@ -3424,10 +3445,7 @@ async fn sleep_ms(ms: f64) {
 /// destructors — including `TickInFlightReset` — run. Needed because
 /// reqwest-on-wasm has no default request timeout: a stalled fetch would
 /// otherwise hold a deferred-recovery pass open forever.
-async fn race_with_timeout<F: std::future::Future>(
-    fut: F,
-    deadline_ms: f64,
-) -> Option<F::Output> {
+async fn race_with_timeout<F: std::future::Future>(fut: F, deadline_ms: f64) -> Option<F::Output> {
     use std::future::Future as _;
     use std::task::Poll;
     let mut fut = Box::pin(fut);
@@ -3725,7 +3743,10 @@ mod background_tasks_tests {
             sleep_ms(10_000.0).await; // far past the deadline below
         };
         let raced = race_with_timeout(wedged_pass, 50.0).await;
-        assert!(raced.is_none(), "the deadline must win against a wedged pass");
+        assert!(
+            raced.is_none(),
+            "the deadline must win against a wedged pass"
+        );
         assert!(
             !in_flight(),
             "dropping the cancelled pass must reset the flag via RAII"

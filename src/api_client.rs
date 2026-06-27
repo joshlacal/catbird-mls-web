@@ -439,10 +439,8 @@ impl WasmApiClient {
     ) -> Result<(String, usize)> {
         let token = self.auth_header()?;
         let version_str = metadata_version.map(|v| v.to_string());
-        let mut query: Vec<(&str, &str)> = vec![
-            ("blobLocator", blob_locator),
-            ("groupId", group_id),
-        ];
+        let mut query: Vec<(&str, &str)> =
+            vec![("blobLocator", blob_locator), ("groupId", group_id)];
         if let Some(ref v) = version_str {
             query.push(("metadataVersion", v.as_str()));
         }
@@ -489,10 +487,8 @@ impl WasmApiClient {
     ) -> Result<Vec<u8>> {
         let token = self.auth_header()?;
         let version_str = metadata_version.map(|v| v.to_string());
-        let mut query: Vec<(&str, &str)> = vec![
-            ("blobLocator", blob_locator),
-            ("groupId", group_id),
-        ];
+        let mut query: Vec<(&str, &str)> =
+            vec![("blobLocator", blob_locator), ("groupId", group_id)];
         if let Some(ref v) = version_str {
             query.push(("metadataVersion", v.as_str()));
         }
@@ -724,6 +720,7 @@ impl MLSAPIClient for WasmApiClient {
             welcome_message: welcome_data.map(|w| B64.encode(w)),
             current_epoch: None,
             key_package_hashes: None,
+            group_info: None,
         }
         .into();
 
@@ -939,6 +936,7 @@ impl MLSAPIClient for WasmApiClient {
                     ciphertext: m.ciphertext.to_vec(),
                     timestamp,
                     server_message_id: Some(m.id.to_string()),
+                    server_epoch: Some(m.epoch as u64),
                 }
             })
             .collect();

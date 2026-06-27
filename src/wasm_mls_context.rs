@@ -538,10 +538,7 @@ impl WasmMLSContext {
     ///      `derive_metadata_key_from_group` against the post-merge epoch
     ///      and upload the encrypted blob via `putGroupMetadataBlob`.
     ///   4. On server failure, call `clear_pending_commit`.
-    pub(crate) fn update_group_metadata(
-        &self,
-        group_id: Vec<u8>,
-    ) -> Result<Vec<u8>, MLSError> {
+    pub(crate) fn update_group_metadata(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
         use catbird_mls::metadata;
         use catbird_mls::metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE as CATBIRD_METADATA_EXTENSION_TYPE;
 
@@ -601,11 +598,7 @@ impl WasmMLSContext {
 
         extensions
             .add_or_replace(Extension::RequiredCapabilities(
-                RequiredCapabilitiesExtension::new(
-                    &ext_types,
-                    &proposal_types,
-                    &credential_types,
-                ),
+                RequiredCapabilitiesExtension::new(&ext_types, &proposal_types, &credential_types),
             ))
             .map_err(|e| {
                 MLSError::OpenMLS(format!(
@@ -639,9 +632,7 @@ impl WasmMLSContext {
         let mut commit_builder = group
             .commit_builder()
             .propose_group_context_extensions(extensions)
-            .map_err(|e| {
-                MLSError::OpenMLS(format!("propose_group_context_extensions: {e:?}"))
-            })?;
+            .map_err(|e| MLSError::OpenMLS(format!("propose_group_context_extensions: {e:?}")))?;
 
         if let Some(ref ref_json) = planned_reference_json {
             commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
@@ -666,7 +657,12 @@ impl WasmMLSContext {
         }
 
         let commit_bundle = commit_stage
-            .build(self.provider.rand(), self.provider.crypto(), &signer, |_| true)
+            .build(
+                self.provider.rand(),
+                self.provider.crypto(),
+                &signer,
+                |_| true,
+            )
             .map_err(|e| MLSError::OpenMLS(format!("build metadata commit: {e:?}")))?
             .stage_commit(&self.provider)
             .map_err(|e| MLSError::OpenMLS(format!("stage metadata commit: {e:?}")))?;
@@ -690,7 +686,14 @@ impl WasmMLSContext {
     pub(crate) fn current_metadata_info(
         &self,
         group_id: Vec<u8>,
-    ) -> Result<Option<(Vec<u8>, u64, Option<catbird_mls::metadata::MetadataReference>)>, MLSError> {
+    ) -> Result<
+        Option<(
+            Vec<u8>,
+            u64,
+            Option<catbird_mls::metadata::MetadataReference>,
+        )>,
+        MLSError,
+    > {
         use catbird_mls::metadata;
 
         self.ensure_loaded(&group_id)?;

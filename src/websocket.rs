@@ -16,8 +16,8 @@
 
 use std::io::Cursor;
 
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use ciborium::Value as CborValue;
 use js_sys::Function;
 use serde::{Deserialize, Serialize};
@@ -238,28 +238,36 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 cbor_map(top, "message").ok_or("Missing 'message' field in messageEvent")?;
 
             let id = cbor_str(msg_map, "id").ok_or("Missing message.id")?;
-            let msg_convo_id =
-                cbor_str(msg_map, "convoId").ok_or("Missing message.convoId")?;
-            let created_at =
-                cbor_str(msg_map, "createdAt").ok_or("Missing message.createdAt")?;
+            let msg_convo_id = cbor_str(msg_map, "convoId").ok_or("Missing message.convoId")?;
+            let created_at = cbor_str(msg_map, "createdAt").ok_or("Missing message.createdAt")?;
 
             let ciphertext = cbor_bytes(msg_map, "ciphertext");
             let _epoch = cbor_int(msg_map, "epoch").unwrap_or(0);
             let sender_did_raw = cbor_str(msg_map, "senderDid").unwrap_or_default();
 
             // Debug: log message map keys and ciphertext presence
-            let keys: Vec<String> = msg_map.iter().filter_map(|(k, _)| {
-                if let CborValue::Text(t) = k { Some(t.clone()) } else { None }
-            }).collect();
-            web_sys::console::log_1(&JsValue::from_str(
-                &format!("[catmos-ws] msg keys={:?}, ciphertext_present={}, sender={}",
-                    keys, ciphertext.is_some(), sender_did_raw)
-            ));
+            let keys: Vec<String> = msg_map
+                .iter()
+                .filter_map(|(k, _)| {
+                    if let CborValue::Text(t) = k {
+                        Some(t.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            web_sys::console::log_1(&JsValue::from_str(&format!(
+                "[catmos-ws] msg keys={:?}, ciphertext_present={}, sender={}",
+                keys,
+                ciphertext.is_some(),
+                sender_did_raw
+            )));
 
             // Skip self-echoes (own messages already displayed locally)
             let is_own = crate::STATE.with(|s| {
                 let borrowed = s.borrow();
-                borrowed.as_ref()
+                borrowed
+                    .as_ref()
                     .and_then(|st| st.user_did.as_ref())
                     .map(|did| did.to_lowercase() == sender_did_raw.to_lowercase())
                     .unwrap_or(false)
@@ -297,22 +305,23 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                     match ctx.decrypt_message(gid.clone(), ct.clone()) {
                         Ok(res) if !res.plaintext.is_empty() => {
                             use catbird_mls::orchestrator::types::MLSMessagePayload;
-                            let (text, payload_json) = match MLSMessagePayload::decode(&res.plaintext) {
-                                Ok(payload) => {
-                                    if !payload.is_displayable() {
-                                        return None;
+                            let (text, payload_json) =
+                                match MLSMessagePayload::decode(&res.plaintext) {
+                                    Ok(payload) => {
+                                        if !payload.is_displayable() {
+                                            return None;
+                                        }
+                                        (
+                                            payload.display_text(),
+                                            String::from_utf8(res.plaintext.clone()).ok(),
+                                        )
                                     }
-                                    (
-                                        payload.display_text(),
-                                        String::from_utf8(res.plaintext.clone()).ok(),
-                                    )
-                                }
-                                Err(_) => (
-                                    String::from_utf8(res.plaintext)
-                                        .unwrap_or_else(|_| "[Binary]".to_string()),
-                                    None,
-                                ),
-                            };
+                                    Err(_) => (
+                                        String::from_utf8(res.plaintext)
+                                            .unwrap_or_else(|_| "[Binary]".to_string()),
+                                        None,
+                                    ),
+                                };
                             let sender = String::from_utf8(res.sender_credential.identity)
                                 .unwrap_or(sender_did_raw.clone());
                             Some((
@@ -322,9 +331,11 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                                         conversation_id: msg_convo_id.clone(),
                                         sender_did: sender.clone(),
                                         text,
-                                        timestamp: chrono::DateTime::parse_from_rfc3339(&created_at)
-                                            .map(|dt| dt.with_timezone(&chrono::Utc))
-                                            .unwrap_or_else(|_| chrono::Utc::now()),
+                                        timestamp: chrono::DateTime::parse_from_rfc3339(
+                                            &created_at,
+                                        )
+                                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                                        .unwrap_or_else(|_| chrono::Utc::now()),
                                         epoch: res.epoch,
                                         sequence_number: res.sequence_number,
                                         is_own: false,
@@ -395,10 +406,10 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
 
                     // Can't decrypt inline — signal the frontend to fetch via
                     // HTTP (which handles auto-join, epoch sync, etc.).
-                    web_sys::console::warn_1(&JsValue::from_str(
-                        &format!("[catmos-ws] decrypt failed for msg {} in {}: {}",
-                            id, msg_convo_id, reason)
-                    ));
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "[catmos-ws] decrypt failed for msg {} in {}: {}",
+                        id, msg_convo_id, reason
+                    )));
                     let obj = js_sys::Object::new();
                     js_sys::Reflect::set(
                         &obj,
@@ -418,7 +429,10 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                         &JsValue::from_str(&reason),
                     )
                     .ok();
-                    Ok(Some(FrameOutput::Event("fetchNeeded".to_string(), obj.into())))
+                    Ok(Some(FrameOutput::Event(
+                        "fetchNeeded".to_string(),
+                        obj.into(),
+                    )))
                 }
             }
         }
@@ -528,8 +542,7 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
             };
 
             let reaction = ReactionEvent {
-                conversation_id: cbor_str(top, "convoId")
-                    .unwrap_or_else(|| convo_id.to_string()),
+                conversation_id: cbor_str(top, "convoId").unwrap_or_else(|| convo_id.to_string()),
                 message_id: cbor_str(top, "messageId").unwrap_or_default(),
                 sender_did: cbor_str(top, "did").unwrap_or_default(),
                 emoji: cbor_str(top, "reaction").unwrap_or_default(),
@@ -557,7 +570,10 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 &JsValue::from_str(convo_id),
             )
             .ok();
-            Ok(Some(FrameOutput::Event("groupRefresh".to_string(), obj.into())))
+            Ok(Some(FrameOutput::Event(
+                "groupRefresh".to_string(),
+                obj.into(),
+            )))
         }
 
         // ------------------------------------------------------------------
@@ -710,14 +726,13 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
             )
             .ok();
             if let Some(ref r) = reason {
-                js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("reason"),
-                    &JsValue::from_str(r),
-                )
-                .ok();
+                js_sys::Reflect::set(&obj, &JsValue::from_str("reason"), &JsValue::from_str(r))
+                    .ok();
             }
-            Ok(Some(FrameOutput::Event("groupReset".to_string(), obj.into())))
+            Ok(Some(FrameOutput::Event(
+                "groupReset".to_string(),
+                obj.into(),
+            )))
         }
 
         // ------------------------------------------------------------------
@@ -769,8 +784,8 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
             // `expectedNewMlsGroupId` is `Option<String>` on the wire — the
             // common Phase 2.5 case is None (server has not minted). Treat
             // empty string the same as None for robustness.
-            let expected_new_mls_group_id: Option<String> = cbor_str(top, "expectedNewMlsGroupId")
-                .filter(|s| !s.is_empty());
+            let expected_new_mls_group_id: Option<String> =
+                cbor_str(top, "expectedNewMlsGroupId").filter(|s| !s.is_empty());
             let convo_id_owned = convo_id.to_string();
             let notified_at_ms = chrono::Utc::now().timestamp_millis();
 
@@ -971,12 +986,8 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 .ok();
             }
             if let Some(ref r) = reason {
-                js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("reason"),
-                    &JsValue::from_str(r),
-                )
-                .ok();
+                js_sys::Reflect::set(&obj, &JsValue::from_str("reason"), &JsValue::from_str(r))
+                    .ok();
             }
             Ok(Some(FrameOutput::Event(
                 "resetRequested".to_string(),
@@ -1002,8 +1013,7 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
 
             let action = cbor_str(top, "action").unwrap_or_default();
             let typing = TypingEvent {
-                conversation_id: cbor_str(top, "convoId")
-                    .unwrap_or_else(|| convo_id.to_string()),
+                conversation_id: cbor_str(top, "convoId").unwrap_or_else(|| convo_id.to_string()),
                 sender_did: cbor_str(top, "did").unwrap_or_default(),
                 is_typing: action != "typingStop",
             };
@@ -1032,7 +1042,10 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 &JsValue::from_str(convo_id),
             )
             .ok();
-            Ok(Some(FrameOutput::Event("treeChanged".to_string(), obj.into())))
+            Ok(Some(FrameOutput::Event(
+                "treeChanged".to_string(),
+                obj.into(),
+            )))
         }
 
         // ------------------------------------------------------------------
@@ -1047,8 +1060,12 @@ fn make_event_js<T: Serialize>(event_type: &str, data: &T) -> Result<JsValue, St
     let data_js = serde_wasm_bindgen::to_value(data)
         .map_err(|e| format!("Failed to serialize event data: {}", e))?;
     let obj = js_sys::Object::new();
-    js_sys::Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str(event_type))
-        .map_err(|_| "Reflect::set 'type' failed".to_string())?;
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("type"),
+        &JsValue::from_str(event_type),
+    )
+    .map_err(|_| "Reflect::set 'type' failed".to_string())?;
     js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &data_js)
         .map_err(|_| "Reflect::set 'data' failed".to_string())?;
     Ok(obj.into())
@@ -1157,10 +1174,7 @@ pub async fn connect(
     // ------------------------------------------------------------------
     // 2. Build the WebSocket URL.
     // ------------------------------------------------------------------
-    let ws_url = format!(
-        "{}?convoId={}&ticket={}",
-        ws_endpoint, convo_id, ticket
-    );
+    let ws_url = format!("{}?convoId={}&ticket={}", ws_endpoint, convo_id, ticket);
 
     // ------------------------------------------------------------------
     // 3. Create the browser WebSocket.
@@ -1201,41 +1215,38 @@ pub async fn connect(
     let convo_id_for_handler = convo_id.clone();
     let on_message_cb = on_message.clone();
     let on_event_cb = on_event.clone();
-    let on_message_handler =
-        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            // event.data() is a JsValue wrapping an ArrayBuffer (because we set
-            // binary_type = Arraybuffer above).
-            let data = event.data();
-            let bytes = js_sys::Uint8Array::new(&data).to_vec();
+    let on_message_handler = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+        // event.data() is a JsValue wrapping an ArrayBuffer (because we set
+        // binary_type = Arraybuffer above).
+        let data = event.data();
+        let bytes = js_sys::Uint8Array::new(&data).to_vec();
 
-            match handle_frame(&bytes, &convo_id_for_handler) {
-                Ok(Some(FrameOutput::Message(msg))) => {
-                    match serde_wasm_bindgen::to_value(&msg) {
-                        Ok(js_msg) => {
-                            let _ = on_message_cb.call1(&JsValue::NULL, &js_msg);
-                        }
-                        Err(e) => {
-                            web_sys::console::warn_1(&JsValue::from_str(&format!(
-                                "[catmos-ws] Failed to serialize UiMessage: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-                Ok(Some(FrameOutput::Event(_kind, js_val))) => {
-                    let _ = on_event_cb.call1(&JsValue::NULL, &js_val);
-                }
-                Ok(None) => {
-                    // Intentionally ignored frame type (typing, readdition, etc.)
+        match handle_frame(&bytes, &convo_id_for_handler) {
+            Ok(Some(FrameOutput::Message(msg))) => match serde_wasm_bindgen::to_value(&msg) {
+                Ok(js_msg) => {
+                    let _ = on_message_cb.call1(&JsValue::NULL, &js_msg);
                 }
                 Err(e) => {
                     web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] Frame decode error: {}",
+                        "[catmos-ws] Failed to serialize UiMessage: {}",
                         e
                     )));
                 }
+            },
+            Ok(Some(FrameOutput::Event(_kind, js_val))) => {
+                let _ = on_event_cb.call1(&JsValue::NULL, &js_val);
             }
-        });
+            Ok(None) => {
+                // Intentionally ignored frame type (typing, readdition, etc.)
+            }
+            Err(e) => {
+                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                    "[catmos-ws] Frame decode error: {}",
+                    e
+                )));
+            }
+        }
+    });
     ws.set_onmessage(Some(on_message_handler.as_ref().unchecked_ref()));
 
     // ------------------------------------------------------------------

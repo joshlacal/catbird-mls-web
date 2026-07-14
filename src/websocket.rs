@@ -121,10 +121,51 @@ fn cbor_int(map: &[(CborValue, CborValue)], key: &str) -> Option<i64> {
     map.iter().find_map(|(k, v)| match (k, v) {
         (CborValue::Text(k), CborValue::Integer(v)) if k == key => {
             let n: i128 = (*v).into();
-            Some(n as i64)
+            i64::try_from(n).ok()
         }
         _ => None,
     })
+}
+
+fn checked_reset_generation(
+    map: &[(CborValue, CborValue)],
+    key: &str,
+    event: &str,
+) -> Result<i32, String> {
+    let value = cbor_int(map, key).ok_or_else(|| format!("{event} is missing a valid {key}"))?;
+    let value = i32::try_from(value)
+        .map_err(|_| format!("{event} {key} is outside the i32 domain: {value}"))?;
+    if value < 0 {
+        return Err(format!("{event} {key} must be non-negative: {value}"));
+    }
+    Ok(value)
+}
+
+fn group_reset_authority_fields(map: &[(CborValue, CborValue)]) -> Result<(String, i32), String> {
+    let target = cbor_str(map, "newGroupId")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "groupResetEvent is missing a non-empty newGroupId".to_string())?;
+    let generation = checked_reset_generation(map, "resetGeneration", "groupResetEvent")?;
+    Ok((target, generation))
+}
+
+fn same_generation_replay_target(
+    existing_generation: i32,
+    existing_target: &str,
+    incoming_generation: i32,
+    expected_target: Option<&str>,
+) -> Result<Option<String>, String> {
+    if existing_generation != incoming_generation {
+        return Ok(None);
+    }
+    if let Some(expected_target) = expected_target {
+        if expected_target != existing_target {
+            return Err(format!(
+                "resetRequested target conflicts with committed generation {incoming_generation}"
+            ));
+        }
+    }
+    Ok(Some(existing_target.to_string()))
 }
 
 /// Extract bytes from a CBOR map.
@@ -212,7 +253,7 @@ fn cbor_str_from_cbor(val: &CborValue, key: &str) -> Option<String> {
 /// Returns `Ok(None)` for frames that are intentionally ignored (typing
 /// indicators, readdition requests, unknown types), `Ok(Some(_))` for
 /// actionable frames, and `Err` for decode failures or server-error frames.
-fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, String> {
+async fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, String> {
     let (header, payload_bytes) =
         split_frame(data).ok_or_else(|| "Failed to decode DAG-CBOR frame header".to_string())?;
 
@@ -599,8 +640,7 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 return Ok(None);
             };
 
-            let new_group_id = cbor_str(top, "newGroupId").unwrap_or_default();
-            let reset_generation = cbor_int(top, "resetGeneration").unwrap_or(0) as i32;
+            let (new_group_id, reset_generation) = group_reset_authority_fields(top)?;
             let reset_by = cbor_str(top, "resetBy").unwrap_or_default();
             let reason = cbor_str(top, "reason");
             let convo_id_owned = convo_id.to_string();
@@ -614,84 +654,23 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 short_id(&reset_by)
             )));
 
-            // Side-effects: persist + adopt new group_id. spawn_local because
-            // MLSStorageBackend methods are async; the WASM event loop is
-            // single-threaded so STATE access from inside the future is safe
-            // as long as we don't hold a borrow across `await`.
-            let new_gid_for_task = new_group_id.clone();
-            let convo_id_for_task = convo_id_owned.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                use catbird_mls::orchestrator::storage::MLSStorageBackend;
-
-                let storage = crate::STATE.with(|s| {
+            use catbird_mls::orchestrator::storage::MLSStorageBackend;
+            let storage = crate::STATE
+                .with(|s| {
                     s.borrow()
                         .as_ref()
                         .map(|st| std::sync::Arc::clone(&st.storage))
-                });
-                let Some(storage) = storage else {
-                    web_sys::console::warn_1(&JsValue::from_str(
-                        "[catmos-ws] groupReset: STATE not initialized; skipping persistence",
-                    ));
-                    return;
-                };
-
-                // 1. Persist the RESET_PENDING payload.
-                if let Err(e) = storage
-                    .mark_reset_pending(
-                        &convo_id_for_task,
-                        &new_gid_for_task,
-                        reset_generation,
-                        notified_at_ms,
-                    )
-                    .await
-                {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] mark_reset_pending failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 2. Flip conversation state to ResetPending (carries payload).
-                if let Err(e) = storage
-                    .set_conversation_state(
-                        &convo_id_for_task,
-                        catbird_mls::orchestrator::types::ConversationState::ResetPending {
-                            new_group_id: new_gid_for_task.clone(),
-                            reset_generation,
-                            notified_at_ms,
-                        },
-                    )
-                    .await
-                {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] set ResetPending failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 3. Mark needs_rejoin so deferred recovery picks it up.
-                if let Err(e) = storage.mark_needs_rejoin(&convo_id_for_task).await {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] mark_needs_rejoin failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 4. Adopt the new group_id locally (so the next External
-                //    Commit targets the post-reset group). Empty newGroupId
-                //    means the server did not specify one — fall back to the
-                //    pre-reset lookup-by-conversation-id heuristic.
-                if !new_gid_for_task.is_empty() {
-                    if let Err(e) =
-                        storage.update_conversation_group_id(&convo_id_for_task, &new_gid_for_task)
-                    {
-                        web_sys::console::warn_1(&JsValue::from_str(&format!(
-                            "[catmos-ws] update_conversation_group_id failed for {} -> {}: {}",
-                            convo_id_for_task, new_gid_for_task, e
-                        )));
-                    }
-                }
-            });
+                })
+                .ok_or_else(|| "groupReset: STATE not initialized".to_string())?;
+            storage
+                .mark_reset_pending(
+                    &convo_id_owned,
+                    &new_group_id,
+                    reset_generation,
+                    notified_at_ms,
+                )
+                .await
+                .map_err(|e| format!("groupReset authority publication failed: {e}"))?;
 
             // Build the JS event payload.
             let obj = js_sys::Object::new();
@@ -777,7 +756,8 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
             };
 
             let crypto_session_id = cbor_str(top, "cryptoSessionId").unwrap_or_default();
-            let reset_generation = cbor_int(top, "generation").unwrap_or(0) as i32;
+            let reset_generation =
+                checked_reset_generation(top, "generation", "resetRequestedEvent")?;
             let trigger = cbor_str(top, "trigger").unwrap_or_default();
             let request_event_id = cbor_str(top, "requestEventId").unwrap_or_default();
             let reason = cbor_str(top, "reason");
@@ -807,11 +787,8 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
             let expected_for_task = expected_new_mls_group_id.clone();
             let convo_id_for_task = convo_id_owned.clone();
 
-            // Side-effects: idempotency check + persist. spawn_local because
-            // MLSStorageBackend methods are async; the WASM event loop is
-            // single-threaded so STATE access from inside the future is safe
-            // as long as we don't hold a borrow across `await`.
-            wasm_bindgen_futures::spawn_local(async move {
+            // Gate event delivery on durable authority publication.
+            {
                 use catbird_mls::orchestrator::storage::MLSStorageBackend;
                 use catbird_mls::orchestrator::types::ConversationState;
 
@@ -821,26 +798,31 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                         .map(|st| std::sync::Arc::clone(&st.storage))
                 });
                 let Some(storage) = storage else {
-                    web_sys::console::warn_1(&JsValue::from_str(
-                        "[catmos-ws] resetRequested: STATE not initialized; skipping persistence",
-                    ));
-                    return;
+                    return Err("resetRequested: STATE not initialized".to_string());
                 };
 
-                // 1. Idempotency: if we are already in ResetPending at the
-                //    same generation, drop the duplicate (mirrors
-                //    recovery.rs:1400-1412).
-                match storage.get_conversation_state(&convo_id_for_task).await {
+                // 1. Reuse the already-committed target on same-generation
+                // replay when the server omitted its optional target.
+                let committed_replay_target = match storage
+                    .get_conversation_state(&convo_id_for_task)
+                    .await
+                {
                     Ok(Some(ConversationState::ResetPending {
                         reset_generation: existing_gen,
                         new_group_id: existing_gid,
                         ..
                     })) if existing_gen == reset_generation => {
+                        let replay_target = same_generation_replay_target(
+                            existing_gen,
+                            &existing_gid,
+                            reset_generation,
+                            expected_for_task.as_deref(),
+                        )?;
                         web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "[catmos-ws] resetRequested: already in ResetPending at gen={} (existing newGroupId={}); idempotent no-op",
+                            "[catmos-ws] resetRequested: replaying committed gen={} target={}",
                             reset_generation, existing_gid,
                         )));
-                        return;
+                        replay_target
                     }
                     Ok(Some(ConversationState::ResetPending {
                         reset_generation: existing_gen,
@@ -850,19 +832,25 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                             "[catmos-ws] resetRequested: superseding ResetPending at old gen={} with new gen={}",
                             existing_gen, reset_generation,
                         )));
+                        None
                     }
-                    Ok(_) | Err(_) => {
-                        // No persisted state, or state read failed — fall
-                        // through and persist. A read error here is
-                        // non-fatal; the writes below are authoritative.
+                    Ok(_) => None,
+                    Err(error) => {
+                        web_sys::console::warn_1(&JsValue::from_str(&format!(
+                            "[catmos-ws] resetRequested: durable authority read failed for {}: {:?}",
+                            convo_id_for_task, error
+                        )));
+                        return Err(format!(
+                            "resetRequested durable authority read failed: {error}"
+                        ));
                     }
-                }
+                };
 
                 // 2. Resolve new_group_id eagerly (mirrors
                 //    recovery.rs:1430-1456). Server-supplied wins; else mint
                 //    a UUIDv4-style 32-hex-char id locally for first-
                 //    responder race bootstrap.
-                let new_group_id_hex = match expected_for_task {
+                let new_group_id_hex = match committed_replay_target.or(expected_for_task) {
                     Some(hex_id) if !hex_id.is_empty() => {
                         web_sys::console::log_1(&JsValue::from_str(&format!(
                             "[catmos-ws] resetRequested: using server-supplied expectedNewMlsGroupId={}",
@@ -894,48 +882,9 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                         "[catmos-ws] mark_reset_pending failed for {}: {:?}",
                         convo_id_for_task, e
                     )));
+                    return Err(format!("resetRequested authority publication failed: {e}"));
                 }
-
-                // 4. Flip conversation state to ResetPending (carries
-                //    payload).
-                if let Err(e) = storage
-                    .set_conversation_state(
-                        &convo_id_for_task,
-                        ConversationState::ResetPending {
-                            new_group_id: new_group_id_hex.clone(),
-                            reset_generation,
-                            notified_at_ms,
-                        },
-                    )
-                    .await
-                {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] set ResetPending failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 5. Mark needs_rejoin so deferred recovery picks it up.
-                if let Err(e) = storage.mark_needs_rejoin(&convo_id_for_task).await {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] mark_needs_rejoin failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 6. Adopt the new group_id locally (so the next External
-                //    Commit / first-responder bootstrap targets the post-
-                //    reset group). Always non-empty here because step 2
-                //    minted one when server passed None.
-                if let Err(e) =
-                    storage.update_conversation_group_id(&convo_id_for_task, &new_group_id_hex)
-                {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] update_conversation_group_id failed for {} -> {}: {}",
-                        convo_id_for_task, new_group_id_hex, e
-                    )));
-                }
-            });
+            }
 
             // Build the JS event payload. Surfaced to the UI so a "Repairing
             // conversation…" banner can render while deferred recovery
@@ -1220,32 +1169,34 @@ pub async fn connect(
         // binary_type = Arraybuffer above).
         let data = event.data();
         let bytes = js_sys::Uint8Array::new(&data).to_vec();
-
-        match handle_frame(&bytes, &convo_id_for_handler) {
-            Ok(Some(FrameOutput::Message(msg))) => match serde_wasm_bindgen::to_value(&msg) {
-                Ok(js_msg) => {
-                    let _ = on_message_cb.call1(&JsValue::NULL, &js_msg);
+        let convo_id = convo_id_for_handler.clone();
+        let on_message = on_message_cb.clone();
+        let on_event = on_event_cb.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match handle_frame(&bytes, &convo_id).await {
+                Ok(Some(FrameOutput::Message(msg))) => match serde_wasm_bindgen::to_value(&msg) {
+                    Ok(js_msg) => {
+                        let _ = on_message.call1(&JsValue::NULL, &js_msg);
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(&JsValue::from_str(&format!(
+                            "[catmos-ws] Failed to serialize UiMessage: {}",
+                            e
+                        )));
+                    }
+                },
+                Ok(Some(FrameOutput::Event(_kind, js_val))) => {
+                    let _ = on_event.call1(&JsValue::NULL, &js_val);
                 }
+                Ok(None) => {}
                 Err(e) => {
                     web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] Failed to serialize UiMessage: {}",
+                        "[catmos-ws] Frame decode/authority error: {}",
                         e
                     )));
                 }
-            },
-            Ok(Some(FrameOutput::Event(_kind, js_val))) => {
-                let _ = on_event_cb.call1(&JsValue::NULL, &js_val);
             }
-            Ok(None) => {
-                // Intentionally ignored frame type (typing, readdition, etc.)
-            }
-            Err(e) => {
-                web_sys::console::warn_1(&JsValue::from_str(&format!(
-                    "[catmos-ws] Frame decode error: {}",
-                    e
-                )));
-            }
-        }
+        });
     });
     ws.set_onmessage(Some(on_message_handler.as_ref().unchecked_ref()));
 
@@ -1259,4 +1210,49 @@ pub async fn connect(
         _on_error: on_error,
         _on_close: on_close,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reset_map(target: Option<&str>, generation: Option<i64>) -> Vec<(CborValue, CborValue)> {
+        let mut map = Vec::new();
+        if let Some(target) = target {
+            map.push((
+                CborValue::Text("newGroupId".into()),
+                CborValue::Text(target.into()),
+            ));
+        }
+        if let Some(generation) = generation {
+            map.push((
+                CborValue::Text("resetGeneration".into()),
+                CborValue::Integer(generation.into()),
+            ));
+        }
+        map
+    }
+
+    #[test]
+    fn reset_authority_fields_fail_before_event_delivery() {
+        assert!(group_reset_authority_fields(&reset_map(None, Some(1))).is_err());
+        assert!(group_reset_authority_fields(&reset_map(Some(""), Some(1))).is_err());
+        assert!(group_reset_authority_fields(&reset_map(Some("00"), None)).is_err());
+        assert!(group_reset_authority_fields(&reset_map(Some("00"), Some(-1))).is_err());
+        assert!(group_reset_authority_fields(&reset_map(
+            Some("00"),
+            Some(i64::from(i32::MAX) + 1),
+        ))
+        .is_err());
+        assert_eq!(
+            group_reset_authority_fields(&reset_map(Some("00"), Some(7))).unwrap(),
+            ("00".to_string(), 7)
+        );
+        assert_eq!(
+            same_generation_replay_target(7, "target-x", 7, None).unwrap(),
+            Some("target-x".to_string()),
+            "missing optional target reuses committed same-generation authority"
+        );
+        assert!(same_generation_replay_target(7, "target-x", 7, Some("target-y")).is_err());
+    }
 }

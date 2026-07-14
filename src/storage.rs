@@ -223,6 +223,7 @@ impl WasmStorageBackend {
                 reset_new_group_id     TEXT,
                 reset_generation       INTEGER,
                 reset_notified_at_ms   INTEGER,
+                last_reset_generation  INTEGER NOT NULL DEFAULT -1,
                 PRIMARY KEY (conversation_id, user_did)
             );",
         )
@@ -238,6 +239,9 @@ impl WasmStorageBackend {
         let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN reset_new_group_id TEXT;");
         let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN reset_generation INTEGER;");
         let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN reset_notified_at_ms INTEGER;");
+        let _ = conn.exec_raw(
+            "ALTER TABLE conversations ADD COLUMN last_reset_generation INTEGER NOT NULL DEFAULT -1;",
+        );
 
         // Migration (MLS metadata cutover): persist decrypted group metadata
         // locally. Server has no plaintext title / description / avatar; the
@@ -348,6 +352,18 @@ impl WasmStorageBackend {
 
     fn store_err(e: impl std::fmt::Debug) -> OrchestratorError {
         OrchestratorError::Storage(format!("{:?}", e))
+    }
+
+    fn affected_rows(&self) -> Result<usize> {
+        let rows = self
+            .conn
+            .query_text("SELECT changes()", &[], 1)
+            .map_err(Self::store_err)?;
+        rows.first()
+            .and_then(|row| row.first())
+            .and_then(|value| value.as_deref())
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| OrchestratorError::Storage("SQLite changes() was unavailable".into()))
     }
 
     /// Adopt a new MLS group id for a conversation after a server-initiated
@@ -675,10 +691,8 @@ impl MLSStorageBackend for WasmStorageBackend {
         };
 
         Ok(Some(ConversationView {
-            group_id: group_id.clone(),
-            // TODO(§1.4): persist conversation_id separately once pyramid
-            // wiring (#15) lands. For pre-reset convos group_id == conversation_id.
-            conversation_id: group_id,
+            group_id,
+            conversation_id: conversation_id.to_string(),
             epoch,
             members,
             metadata: None,
@@ -700,6 +714,7 @@ impl MLSStorageBackend for WasmStorageBackend {
 
         let mut views = Vec::with_capacity(rows.len());
         for row in rows {
+            let conversation_id = row[0].clone().unwrap_or_default();
             let group_id = row[1].clone().unwrap_or_default();
             let sequencer_did = row[2].clone();
 
@@ -727,9 +742,8 @@ impl MLSStorageBackend for WasmStorageBackend {
             };
 
             views.push(ConversationView {
-                group_id: group_id.clone(),
-                // TODO(§1.4): persist conversation_id separately (see #15).
-                conversation_id: group_id,
+                group_id,
+                conversation_id,
                 epoch,
                 members,
                 metadata: None,
@@ -758,47 +772,30 @@ impl MLSStorageBackend for WasmStorageBackend {
         conversation_id: &str,
         state: ConversationState,
     ) -> Result<()> {
-        // Spec §8.6 / §8.1: when state == ResetPending, persist the payload
-        // (new_group_id, reset_generation, notified_at_ms) alongside the tag
-        // so deferred recovery survives reload. For all other variants, NULL
-        // the reset columns to avoid stale payload bleed-through after a
-        // successful adoption.
-        let state_str = state.tag();
-        match state {
-            ConversationState::ResetPending {
-                ref new_group_id,
-                reset_generation,
-                notified_at_ms,
-            } => self
-                .conn
-                .exec_with_mixed_params(
-                    "UPDATE conversations
-                     SET state = ?1,
-                         reset_new_group_id = ?2,
-                         reset_generation = ?3,
-                         reset_notified_at_ms = ?4
-                     WHERE conversation_id = ?5",
-                    &[
-                        (1, state_str),
-                        (2, new_group_id.as_str()),
-                        (5, conversation_id),
-                    ],
-                    &[(3, reset_generation as i64), (4, notified_at_ms)],
-                )
-                .map_err(Self::store_err),
-            _ => self
-                .conn
-                .exec_with_text_params(
-                    "UPDATE conversations
-                     SET state = ?1,
-                         reset_new_group_id = NULL,
-                         reset_generation = NULL,
-                         reset_notified_at_ms = NULL
-                     WHERE conversation_id = ?2",
-                    &[(1, state_str), (2, conversation_id)],
-                )
-                .map_err(Self::store_err),
+        if matches!(state, ConversationState::ResetPending { .. }) {
+            return Err(OrchestratorError::Storage(
+                "ResetPending must be published atomically via mark_reset_pending".into(),
+            ));
         }
+        let state_str = state.tag();
+        self.conn
+            .exec_with_text_params(
+                "UPDATE conversations
+                 SET state = CASE
+                     WHEN reset_new_group_id IS NULL
+                      AND reset_generation IS NULL
+                      AND reset_notified_at_ms IS NULL
+                     THEN ?1 ELSE state END
+                 WHERE conversation_id = ?2",
+                &[(1, state_str), (2, conversation_id)],
+            )
+            .map_err(Self::store_err)?;
+        if self.affected_rows()? != 1 {
+            return Err(OrchestratorError::Storage(format!(
+                "conversation not found while setting state: {conversation_id}"
+            )));
+        }
+        Ok(())
     }
 
     /// Read persisted state (spec §8.2). The WASM backend stores the state
@@ -846,9 +843,9 @@ impl MLSStorageBackend for WasmStorageBackend {
                             notified_at_ms: t,
                         }))
                     }
-                    // Tag says reset_pending but payload columns are missing —
-                    // treat as NeedsRejoin so deferred recovery still runs.
-                    _ => Ok(Some(ConversationState::NeedsRejoin)),
+                    _ => Err(OrchestratorError::Storage(format!(
+                        "incomplete reset_pending authority for {conversation_id}"
+                    ))),
                 }
             }
             _ => {
@@ -865,33 +862,109 @@ impl MLSStorageBackend for WasmStorageBackend {
         reset_generation: i32,
         notified_at_ms: i64,
     ) -> Result<()> {
-        // Spec §8.6: persist the GroupResetEvent payload so Phase-1 recovery
-        // can rehydrate ResetPending after orchestrator restart.
+        if new_group_id_hex.is_empty() {
+            return Err(OrchestratorError::Storage(format!(
+                "empty reset_pending group id for {conversation_id}"
+            )));
+        }
         self.conn
             .exec_with_mixed_params(
                 "UPDATE conversations
                  SET state = 'reset_pending',
                      reset_new_group_id = ?1,
                      reset_generation = ?2,
-                     reset_notified_at_ms = ?3
-                 WHERE conversation_id = ?4",
+                     reset_notified_at_ms = CASE
+                         WHEN reset_generation = ?2 AND reset_new_group_id = ?1
+                         THEN reset_notified_at_ms ELSE ?3 END,
+                     needs_rejoin = 1
+                 WHERE conversation_id = ?4
+                   AND (
+                       (reset_new_group_id IS NULL
+                        AND reset_generation IS NULL
+                        AND reset_notified_at_ms IS NULL
+                        AND ?2 > last_reset_generation
+                        AND state <> 'reset_pending')
+                       OR
+                       (state = 'reset_pending'
+                        AND reset_new_group_id IS NOT NULL
+                        AND reset_new_group_id <> ''
+                        AND reset_generation IS NOT NULL
+                        AND reset_notified_at_ms IS NOT NULL
+                        AND ((reset_generation = ?2 AND reset_new_group_id = ?1)
+                             OR ?2 > last_reset_generation)
+                        AND (reset_generation < ?2
+                             OR (reset_generation = ?2 AND reset_new_group_id = ?1)))
+                   )",
                 &[(1, new_group_id_hex), (4, conversation_id)],
                 &[(2, reset_generation as i64), (3, notified_at_ms)],
             )
-            .map_err(Self::store_err)
+            .map_err(Self::store_err)?;
+        if self.affected_rows()? != 1 {
+            return Err(OrchestratorError::Storage(format!(
+                "reset_pending publication lost its generation/tuple CAS: {conversation_id}"
+            )));
+        }
+        Ok(())
     }
 
-    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
+    async fn complete_reset_pending(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_new_group_id_hex: &str,
+    ) -> Result<bool> {
         self.conn
-            .exec_with_text_params(
+            .exec_with_mixed_params(
                 "UPDATE conversations
-                 SET reset_new_group_id = NULL,
+                 SET state = 'active',
+                     group_id = ?1,
+                     reset_new_group_id = NULL,
                      reset_generation = NULL,
-                     reset_notified_at_ms = NULL
-                 WHERE conversation_id = ?1",
-                &[(1, conversation_id)],
+                     reset_notified_at_ms = NULL,
+                     last_reset_generation = CASE
+                         WHEN last_reset_generation < ?3 THEN ?3
+                         ELSE last_reset_generation END,
+                     needs_rejoin = 0
+                 WHERE conversation_id = ?2
+                   AND state = 'reset_pending'
+                   AND reset_new_group_id = ?1
+                   AND reset_new_group_id <> ''
+                   AND reset_generation = ?3
+                   AND reset_notified_at_ms IS NOT NULL",
+                &[(1, expected_new_group_id_hex), (2, conversation_id)],
+                &[(3, expected_generation as i64)],
             )
-            .map_err(Self::store_err)
+            .map_err(Self::store_err)?;
+        Ok(self.affected_rows()? == 1)
+    }
+
+    async fn clear_reset_pending_for_delete(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+    ) -> Result<bool> {
+        self.conn
+            .exec_with_mixed_params(
+                "UPDATE conversations
+                 SET state = 'failed',
+                     reset_new_group_id = NULL,
+                     reset_generation = NULL,
+                     reset_notified_at_ms = NULL,
+                     last_reset_generation = CASE
+                         WHEN last_reset_generation < ?2 THEN ?2
+                         ELSE last_reset_generation END,
+                     needs_rejoin = 0
+                 WHERE conversation_id = ?1
+                   AND state = 'reset_pending'
+                   AND reset_new_group_id IS NOT NULL
+                   AND reset_new_group_id <> ''
+                   AND reset_generation = ?2
+                   AND reset_notified_at_ms IS NOT NULL",
+                &[(1, conversation_id)],
+                &[(2, expected_generation as i64)],
+            )
+            .map_err(Self::store_err)?;
+        Ok(self.affected_rows()? == 1)
     }
 
     async fn set_conversation_sequencer(
@@ -1213,7 +1286,8 @@ impl MLSStorageBackend for WasmStorageBackend {
         &[
             "get_conversation_state",
             "mark_reset_pending",
-            "clear_reset_pending",
+            "complete_reset_pending",
+            "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
         ]
     }
@@ -1274,5 +1348,79 @@ mod tests {
             .find(|c| c.conversation_id == conversation_id)
             .expect("listed conversation");
         assert_eq!(listed.sequencer_did.as_deref(), Some(sequencer_did));
+    }
+
+    #[wasm_bindgen_test]
+    async fn reset_cas_preserves_stable_conversation_id_and_predecessor_mapping() {
+        let storage = new_storage();
+        let user_did = "did:plc:alice";
+        let conversation_id = "stable-conversation";
+        storage
+            .ensure_conversation_exists(user_did, conversation_id, "group-a")
+            .await
+            .expect("create conversation");
+
+        storage
+            .mark_reset_pending(conversation_id, "group-b", 1, 1001)
+            .await
+            .expect("publish generation one");
+        let pending = storage
+            .get_conversation(user_did, conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.conversation_id, conversation_id);
+        assert_eq!(pending.group_id, "group-a", "mark preserves predecessor");
+        assert!(!storage
+            .complete_reset_pending(conversation_id, 1, "wrong-group")
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_reset_pending(conversation_id, 1, "group-b")
+            .await
+            .unwrap());
+
+        let active = storage
+            .get_conversation(user_did, conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.conversation_id, conversation_id);
+        assert_eq!(active.group_id, "group-b");
+
+        storage
+            .mark_reset_pending(conversation_id, "group-c", 2, 1002)
+            .await
+            .expect("publish generation two");
+        assert!(!storage
+            .clear_reset_pending_for_delete(conversation_id, 1)
+            .await
+            .unwrap());
+        assert!(matches!(
+            storage
+                .get_conversation_state(conversation_id)
+                .await
+                .unwrap(),
+            Some(ConversationState::ResetPending {
+                reset_generation: 2,
+                ..
+            })
+        ));
+        assert!(storage
+            .clear_reset_pending_for_delete(conversation_id, 2)
+            .await
+            .unwrap());
+        assert_eq!(
+            storage
+                .get_conversation_state(conversation_id)
+                .await
+                .unwrap(),
+            Some(ConversationState::Failed),
+            "delete cleanup never projects Active"
+        );
+        storage
+            .mark_reset_pending(conversation_id, "group-b", 1, 1003)
+            .await
+            .expect_err("applied generation high-water rejects stale replay");
     }
 }

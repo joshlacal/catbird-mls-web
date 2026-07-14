@@ -116,6 +116,14 @@ fn parse_sequencer_receipt_data(
         .and_then(|value| value.as_integer())
         .ok_or_else(|| "missing epoch".to_string())
         .and_then(|value| i32::try_from(value).map_err(|_| "epoch out of i32 range".to_string()))?;
+    let sequencer_term = object
+        .get("sequencer_term")
+        .or_else(|| object.get("sequencerTerm"))
+        .and_then(|value| value.as_integer())
+        .ok_or_else(|| "missing sequencer_term/sequencerTerm".to_string())
+        .and_then(|value| {
+            u64::try_from(value).map_err(|_| "sequencer term out of u64 range".to_string())
+        })?;
     let commit_hash = parse_receipt_bytes_data(
         "commit_hash",
         object
@@ -144,6 +152,7 @@ fn parse_sequencer_receipt_data(
     Ok(SequencerReceipt {
         convo_id,
         epoch,
+        sequencer_term,
         commit_hash,
         sequencer_did,
         issued_at,
@@ -151,10 +160,45 @@ fn parse_sequencer_receipt_data(
     })
 }
 
+fn find_receipt_value(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    let object = value.as_object()?;
+    object.get("receipt").or_else(|| {
+        object
+            .values()
+            .find_map(|value| value.as_object().and_then(|nested| nested.get("receipt")))
+    })
+}
+
+fn parse_commit_group_change_output(
+    body: &[u8],
+    op: &str,
+) -> Result<lexicon::commit_group_change::Output> {
+    let raw: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
+    if let Some(receipt) = find_receipt_value(&raw) {
+        let receipt = receipt.as_object().ok_or_else(|| {
+            OrchestratorError::Api(format!("invalid {op} sequencer receipt: expected object"))
+        })?;
+        receipt
+            .get("sequencer_term")
+            .or_else(|| receipt.get("sequencerTerm"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|term| *term <= i64::MAX as u64)
+            .ok_or_else(|| {
+                OrchestratorError::Api(format!(
+                    "invalid {op} sequencer receipt: sequencer term must be an ATProto i64 integer"
+                ))
+            })?;
+    }
+    parse_lexicon_json::<blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<'_>>(
+        body,
+    )
+}
+
 fn parse_commit_group_change_receipt(
     output: &lexicon::commit_group_change::Output,
     op: &str,
-) -> Option<SequencerReceipt> {
+) -> Result<Option<SequencerReceipt>> {
     let receipt = output.extra_data.as_ref().and_then(|extra| {
         extra.get("receipt").or_else(|| {
             extra
@@ -163,22 +207,13 @@ fn parse_commit_group_change_receipt(
         })
     });
 
-    let receipt = match receipt {
-        Some(value) => value,
-        None => return None,
+    let Some(receipt) = receipt else {
+        return Ok(None);
     };
 
-    match parse_sequencer_receipt_data(receipt) {
-        Ok(receipt) => Some(receipt),
-        Err(error) => {
-            tracing::warn!(
-                operation = op,
-                error = %error,
-                "Failed to parse sequencer receipt; continuing without receipt"
-            );
-            None
-        }
-    }
+    parse_sequencer_receipt_data(receipt)
+        .map(Some)
+        .map_err(|error| OrchestratorError::Api(format!("invalid {op} sequencer receipt: {error}")))
 }
 
 /// Convert a lexicon ConvoView to an orchestrator ConversationView.
@@ -631,9 +666,7 @@ impl WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<'_>,
-        >(body.as_ref())?;
+        let output = parse_commit_group_change_output(body.as_ref(), "add_members")?;
         let new_epoch = output
             .new_epoch
             .and_then(|epoch| u64::try_from(epoch).ok())
@@ -822,7 +855,7 @@ impl MLSAPIClient for WasmApiClient {
                 .new_epoch
                 .and_then(|epoch| u64::try_from(epoch).ok())
                 .unwrap_or(0),
-            receipt: parse_commit_group_change_receipt(&output, "add_members"),
+            receipt: parse_commit_group_change_receipt(&output, "add_members")?,
         })
     }
 
@@ -949,6 +982,7 @@ impl MLSAPIClient for WasmApiClient {
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> Result<()> {
         let token = self.auth_header()?;
         let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
@@ -958,7 +992,9 @@ impl MLSAPIClient for WasmApiClient {
             lexicon::publish_key_packages::InputData {
                 action: "publish".to_string(),
                 convo_id: None,
-                device_id: None,
+                device_id: device_id
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToString::to_string),
                 key_packages: Some(vec![lexicon::publish_key_packages::KeyPackageItemData {
                     cipher_suite: cipher_suite.to_string(),
                     expires,
@@ -1379,9 +1415,7 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<'_>,
-        >(body.as_ref())?;
+        let output = parse_commit_group_change_output(body.as_ref(), "process_external_commit")?;
         Ok(ProcessExternalCommitResult {
             epoch: output
                 .new_epoch
@@ -1392,7 +1426,7 @@ impl MLSAPIClient for WasmApiClient {
                 .as_ref()
                 .map(|value| value.as_ref().to_string())
                 .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-            receipt: parse_commit_group_change_receipt(&output, "process_external_commit"),
+            receipt: parse_commit_group_change_receipt(&output, "process_external_commit")?,
         })
     }
 }

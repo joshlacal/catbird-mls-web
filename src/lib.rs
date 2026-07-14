@@ -742,6 +742,7 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
                 &kp.key_package_data,
                 "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
                 &expires_at,
+                Some(&device_info.device_id),
             )
             .await
         {
@@ -785,14 +786,21 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
+    use catbird_mls::orchestrator::credentials::CredentialStore;
 
-    let (api_client, user_did) = with_state(|s| {
+    let (api_client, credentials, user_did) = with_state(|s| {
         let did = s
             .user_did
             .clone()
             .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), did))
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.credentials), did))
     })?;
+    let device_id = credentials
+        .get_device_uuid(&user_did)
+        .await
+        .map_err(|e| js_err!("Failed to load registered device id: {:?}", e))?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| js_err!("No registered device id for key-package publication"))?;
 
     // Track how many key packages THIS web device has published in this session.
     // Server stats are per-DID (includes iOS key packages) so we can't rely on them
@@ -836,7 +844,12 @@ pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
         match kp_result {
             Ok(kp) => {
                 match api_client
-                    .publish_key_package(&kp.key_package_data, cipher_suite, &expires_at)
+                    .publish_key_package(
+                        &kp.key_package_data,
+                        cipher_suite,
+                        &expires_at,
+                        Some(&device_id),
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -3181,15 +3194,24 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
 
         // 2. Try Welcome → External Commit ladder.
         if try_join_group_internal(&convo_id).await.is_ok() {
-            let _ = storage
-                .set_conversation_state(&convo_id, ConversationState::Active)
-                .await;
-            let _ = storage.clear_reset_pending(&convo_id).await;
-            let _ = storage.clear_rejoin_flag(&convo_id).await;
-            web_sys::console::log_1(&js_err!(
-                "[deferred-recovery] {}: cleared via Welcome/ExternalCommit",
-                convo_id
-            ));
+            match storage
+                .complete_reset_pending(&convo_id, reset_generation, &new_group_id_hex)
+                .await
+            {
+                Ok(true) => web_sys::console::log_1(&js_err!(
+                    "[deferred-recovery] {}: completed via Welcome/ExternalCommit",
+                    convo_id
+                )),
+                Ok(false) => web_sys::console::warn_1(&js_err!(
+                    "[deferred-recovery] {}: completion lost generation/target CAS",
+                    convo_id
+                )),
+                Err(error) => web_sys::console::warn_1(&js_err!(
+                    "[deferred-recovery] {}: completion failed: {:?}",
+                    convo_id,
+                    error
+                )),
+            }
             continue;
         }
 
@@ -3316,12 +3338,29 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
-            // 3e. Race winner — clear reset_pending.
-            let _ = storage
-                .set_conversation_state(&convo_id, ConversationState::Active)
-                .await;
-            let _ = storage.clear_reset_pending(&convo_id).await;
-            let _ = storage.clear_rejoin_flag(&convo_id).await;
+            // 3e. Race winner — project Active only through the exact reset
+            // generation + target transaction.
+            match storage
+                .complete_reset_pending(&convo_id, reset_generation, &new_group_id_hex)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    web_sys::console::warn_1(&js_err!(
+                        "[deferred-recovery] {}: bootstrap completion lost generation/target CAS",
+                        convo_id
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    web_sys::console::warn_1(&js_err!(
+                        "[deferred-recovery] {}: bootstrap completion failed: {:?}",
+                        convo_id,
+                        error
+                    ));
+                    continue;
+                }
+            }
             let local_epoch = with_state(|s| {
                 Ok(s.mls_context
                     .as_ref()

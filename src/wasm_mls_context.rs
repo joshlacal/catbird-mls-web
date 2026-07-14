@@ -463,6 +463,9 @@ impl WasmMLSContext {
         Ok(AddMembersResult {
             commit_data,
             welcome_data,
+            metadata_blob_locator: None,
+            metadata_blob_ciphertext: None,
+            metadata_version: None,
         })
     }
 

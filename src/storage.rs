@@ -366,6 +366,42 @@ impl WasmStorageBackend {
             .ok_or_else(|| OrchestratorError::Storage("SQLite changes() was unavailable".into()))
     }
 
+    /// Atomically retarget a complete ResetPending tuple after the winner has
+    /// been independently verified. The trait implementation forwards here
+    /// so browser tests exercise the same atomic statement.
+    fn adopt_reset_pending_target_cas(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
+        if authoritative_new_target.is_empty() {
+            return Ok(false);
+        }
+        self.conn
+            .exec_with_mixed_params(
+                "UPDATE conversations
+                 SET reset_new_group_id = ?1,
+                     needs_rejoin = 1
+                 WHERE conversation_id = ?2
+                   AND ?1 <> ''
+                   AND state = 'reset_pending'
+                   AND reset_new_group_id = ?3
+                   AND reset_new_group_id <> ''
+                   AND reset_generation = ?4
+                   AND reset_notified_at_ms IS NOT NULL",
+                &[
+                    (1, authoritative_new_target),
+                    (2, conversation_id),
+                    (3, expected_old_target),
+                ],
+                &[(4, expected_generation as i64)],
+            )
+            .map_err(Self::store_err)?;
+        Ok(self.affected_rows()? == 1)
+    }
+
     /// Adopt a new MLS group id for a conversation after a server-initiated
     /// group reset (spec §8.5). The websocket handler calls this so the
     /// subsequent External Commit (driven by deferred recovery / JS-triggered
@@ -907,6 +943,21 @@ impl MLSStorageBackend for WasmStorageBackend {
         Ok(())
     }
 
+    async fn adopt_reset_pending_target(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
+        self.adopt_reset_pending_target_cas(
+            conversation_id,
+            expected_generation,
+            expected_old_target,
+            authoritative_new_target,
+        )
+    }
+
     async fn complete_reset_pending(
         &self,
         conversation_id: &str,
@@ -1286,6 +1337,7 @@ impl MLSStorageBackend for WasmStorageBackend {
         &[
             "get_conversation_state",
             "mark_reset_pending",
+            "adopt_reset_pending_target",
             "complete_reset_pending",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
@@ -1422,5 +1474,68 @@ mod tests {
             .mark_reset_pending(conversation_id, "group-b", 1, 1003)
             .await
             .expect_err("applied generation high-water rejects stale replay");
+    }
+
+    #[wasm_bindgen_test]
+    async fn winner_target_adoption_is_exact_and_preserves_reset_tuple() {
+        let storage = new_storage();
+        let user_did = "did:plc:alice";
+        let conversation_id = "stable-reset-winner";
+        storage
+            .ensure_conversation_exists(user_did, conversation_id, "group-old")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "group-loser", 23, 1_717_000_000_023)
+            .await
+            .expect("publish losing candidate");
+
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 23, "group-loser", "")
+            .expect("empty winner is rejected fail closed"));
+
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 22, "group-loser", "group-winner-a")
+            .expect("stale generation is a clean CAS miss"));
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 23, "other-loser", "group-winner-a")
+            .expect("wrong old target is a clean CAS miss"));
+        assert!(storage
+            .adopt_reset_pending_target_cas(conversation_id, 23, "group-loser", "group-winner-a",)
+            .expect("adopt authoritative winner"));
+        assert!(
+            storage
+                .adopt_reset_pending_target_cas(
+                    conversation_id,
+                    23,
+                    "group-winner-a",
+                    "group-winner-a",
+                )
+                .expect("exact replay is idempotent")
+        );
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 23, "group-loser", "group-winner-b",)
+            .expect("competing stale winner loses CAS"));
+
+        let row = storage
+            .conn
+            .query_text(
+                "SELECT state, group_id, reset_new_group_id, reset_generation,
+                        reset_notified_at_ms, needs_rejoin, last_reset_generation
+                 FROM conversations WHERE conversation_id = ?1",
+                &[(1, conversation_id)],
+                7,
+            )
+            .expect("read adopted reset snapshot")
+            .into_iter()
+            .next()
+            .expect("conversation row");
+        assert_eq!(row[0].as_deref(), Some("reset_pending"));
+        assert_eq!(row[1].as_deref(), Some("group-old"));
+        assert_eq!(row[2].as_deref(), Some("group-winner-a"));
+        assert_eq!(row[3].as_deref(), Some("23"));
+        assert_eq!(row[4].as_deref(), Some("1717000000023"));
+        assert_eq!(row[5].as_deref(), Some("1"));
+        assert_eq!(row[6].as_deref(), Some("-1"));
     }
 }

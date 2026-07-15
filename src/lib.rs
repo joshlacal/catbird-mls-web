@@ -936,12 +936,13 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
                 Ok(jr) => {
                     // Cache the local MLS epoch so send_message uses it
                     let welcome_epoch = with_state(|s| {
-                        Ok(s.mls_context
+                        let ctx = s
+                            .mls_context
                             .as_ref()
-                            .and_then(|ctx| ctx.get_epoch(jr.group_id.clone()).ok())
-                            .unwrap_or(0))
-                    })
-                    .unwrap_or(0);
+                            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+                        ctx.get_epoch(jr.group_id.clone())
+                            .map_err(|e| js_err!("get_epoch after Welcome failed: {:?}", e))
+                    })?;
                     SERVER_EPOCHS
                         .with(|m| m.borrow_mut().insert(convo_id.to_string(), welcome_epoch));
 
@@ -3194,8 +3195,33 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
 
         // 2. Try Welcome → External Commit ladder.
         if try_join_group_internal(&convo_id).await.is_ok() {
+            let landed_epoch = match with_state(|s| {
+                let group_id = hex::decode(&new_group_id_hex)
+                    .map_err(|e| js_err!("invalid reset target group id: {:?}", e))?;
+                let ctx = s
+                    .mls_context
+                    .as_ref()
+                    .ok_or_else(|| js_err!("MLS context not initialized"))?;
+                ctx.get_epoch(group_id)
+                    .map_err(|e| js_err!("get_epoch for reset target failed: {:?}", e))
+            }) {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    web_sys::console::warn_1(&js_err!(
+                        "[deferred-recovery] {}: refusing completion without target epoch: {:?}",
+                        convo_id,
+                        error
+                    ));
+                    continue;
+                }
+            };
             match storage
-                .complete_reset_pending(&convo_id, reset_generation, &new_group_id_hex)
+                .complete_reset_pending(
+                    &convo_id,
+                    reset_generation,
+                    &new_group_id_hex,
+                    landed_epoch,
+                )
                 .await
             {
                 Ok(true) => web_sys::console::log_1(&js_err!(
@@ -3298,13 +3324,37 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
         // diagnostic-only but required. Idempotency-Key kept for
         // client-side dedup of network retries.
         let idem_key = format!("{}:{}:{}:bootstrap", convo_id, reset_generation, user_did);
+        let bootstrap_epoch = match with_state(|s| {
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.get_epoch(new_group_id_bytes.clone())
+                .map_err(|e| js_err!("get_epoch for bootstrap target failed: {:?}", e))
+        }) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                web_sys::console::warn_1(&js_err!(
+                    "[deferred-recovery] {}: refusing bootstrap without target epoch: {:?}",
+                    convo_id,
+                    error
+                ));
+                let _ = with_state(|s| {
+                    if let Some(ctx) = s.mls_context.as_ref() {
+                        let _ = ctx.delete_group(new_group_id_bytes.clone());
+                    }
+                    Ok(())
+                });
+                continue;
+            }
+        };
         let body = serde_json::json!({
             "originalConvoId": &convo_id,
             "newGroupId": &new_group_id_hex,
             "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
             "groupInfo": &group_info_bytes,
             "members": &roster,
-            "currentEpoch": 1,
+            "currentEpoch": bootstrap_epoch,
         });
         let url = format!(
             "{}/xrpc/blue.catbird.mlsChat.bootstrapResetGroup",
@@ -3338,10 +3388,34 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
+            let landed_epoch = match with_state(|s| {
+                let ctx = s
+                    .mls_context
+                    .as_ref()
+                    .ok_or_else(|| js_err!("MLS context not initialized"))?;
+                ctx.get_epoch(new_group_id_bytes.clone()).map_err(|e| {
+                    js_err!("get_epoch for successful bootstrap target failed: {:?}", e)
+                })
+            }) {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    web_sys::console::warn_1(&js_err!(
+                        "[deferred-recovery] {}: preserving reset authority because post-bootstrap target epoch is unavailable: {:?}",
+                        convo_id,
+                        error
+                    ));
+                    continue;
+                }
+            };
             // 3e. Race winner — project Active only through the exact reset
             // generation + target transaction.
             match storage
-                .complete_reset_pending(&convo_id, reset_generation, &new_group_id_hex)
+                .complete_reset_pending(
+                    &convo_id,
+                    reset_generation,
+                    &new_group_id_hex,
+                    landed_epoch,
+                )
                 .await
             {
                 Ok(true) => {}
@@ -3361,18 +3435,11 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
                     continue;
                 }
             }
-            let local_epoch = with_state(|s| {
-                Ok(s.mls_context
-                    .as_ref()
-                    .and_then(|ctx| ctx.get_epoch(new_group_id_bytes.clone()).ok())
-                    .unwrap_or(0))
-            })
-            .unwrap_or(0);
-            SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), local_epoch));
+            SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), landed_epoch));
             web_sys::console::log_1(&js_err!(
                 "[deferred-recovery] {}: bootstrap WON at epoch {} (gen {})",
                 convo_id,
-                local_epoch,
+                landed_epoch,
                 reset_generation
             ));
             continue;

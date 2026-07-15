@@ -963,12 +963,19 @@ impl MLSStorageBackend for WasmStorageBackend {
         conversation_id: &str,
         expected_generation: i32,
         expected_new_group_id_hex: &str,
+        landed_epoch: u64,
     ) -> Result<bool> {
-        self.conn
-            .exec_with_mixed_params(
-                "UPDATE conversations
+        let landed_epoch = i64::try_from(landed_epoch).map_err(|_| {
+            OrchestratorError::Storage("landed reset epoch exceeds SQLite range".into())
+        })?;
+        self.conn.exec_raw("BEGIN").map_err(Self::store_err)?;
+        let result = (|| -> Result<bool> {
+            self.conn
+                .exec_with_mixed_params(
+                    "UPDATE conversations
                  SET state = 'active',
                      group_id = ?1,
+                     join_epoch = ?4,
                      reset_new_group_id = NULL,
                      reset_generation = NULL,
                      reset_notified_at_ms = NULL,
@@ -982,11 +989,62 @@ impl MLSStorageBackend for WasmStorageBackend {
                    AND reset_new_group_id <> ''
                    AND reset_generation = ?3
                    AND reset_notified_at_ms IS NOT NULL",
-                &[(1, expected_new_group_id_hex), (2, conversation_id)],
-                &[(3, expected_generation as i64)],
-            )
-            .map_err(Self::store_err)?;
-        Ok(self.affected_rows()? == 1)
+                    &[(1, expected_new_group_id_hex), (2, conversation_id)],
+                    &[(3, expected_generation as i64), (4, landed_epoch)],
+                )
+                .map_err(Self::store_err)?;
+            if self.affected_rows()? != 1 {
+                return Ok(false);
+            }
+            self.conn
+                .exec_with_mixed_params(
+                    "INSERT INTO group_states (group_id, conversation_id, epoch, members_json)
+                     VALUES (
+                         ?1,
+                         ?2,
+                         ?3,
+                         COALESCE(
+                             (SELECT members_json FROM group_states
+                              WHERE group_id = ?1 AND conversation_id = ?2),
+                             (SELECT members_json FROM group_states
+                              WHERE conversation_id = ?2 LIMIT 1),
+                             '[]'
+                         )
+                     )
+                     ON CONFLICT(group_id) DO UPDATE SET
+                         conversation_id = excluded.conversation_id,
+                         epoch = excluded.epoch,
+                         members_json = excluded.members_json
+                     WHERE group_states.conversation_id = ?2",
+                    &[(1, expected_new_group_id_hex), (2, conversation_id)],
+                    &[(3, landed_epoch)],
+                )
+                .map_err(Self::store_err)?;
+            if self.affected_rows()? != 1 {
+                return Err(OrchestratorError::Storage(
+                    "reset completion target conflicts with another conversation".into(),
+                ));
+            }
+            self.conn
+                .exec_with_text_params(
+                    "DELETE FROM group_states
+                     WHERE conversation_id = ?1 AND group_id <> ?2",
+                    &[(1, conversation_id), (2, expected_new_group_id_hex)],
+                )
+                .map_err(Self::store_err)?;
+            Ok(true)
+        })();
+
+        match result {
+            Ok(completed) => {
+                self.conn.exec_raw("COMMIT").map_err(Self::store_err)?;
+                Ok(completed)
+            }
+            Err(error) => {
+                let _ = self.conn.exec_raw("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     async fn clear_reset_pending_for_delete(
@@ -1416,6 +1474,15 @@ mod tests {
             .mark_reset_pending(conversation_id, "group-b", 1, 1001)
             .await
             .expect("publish generation one");
+        storage
+            .conn
+            .exec_with_mixed_params(
+                "INSERT INTO group_states (group_id, conversation_id, epoch, members_json)
+                 VALUES (?1, ?2, ?3, '[]')",
+                &[(1, "group-b"), (2, conversation_id)],
+                &[(3, 1)],
+            )
+            .expect("seed landed group state");
         let pending = storage
             .get_conversation(user_did, conversation_id)
             .await
@@ -1424,11 +1491,11 @@ mod tests {
         assert_eq!(pending.conversation_id, conversation_id);
         assert_eq!(pending.group_id, "group-a", "mark preserves predecessor");
         assert!(!storage
-            .complete_reset_pending(conversation_id, 1, "wrong-group")
+            .complete_reset_pending(conversation_id, 1, "wrong-group", 1)
             .await
             .unwrap());
         assert!(storage
-            .complete_reset_pending(conversation_id, 1, "group-b")
+            .complete_reset_pending(conversation_id, 1, "group-b", 1)
             .await
             .unwrap());
 
@@ -1474,6 +1541,79 @@ mod tests {
             .mark_reset_pending(conversation_id, "group-b", 1, 1003)
             .await
             .expect_err("applied generation high-water rejects stale replay");
+    }
+
+    #[wasm_bindgen_test]
+    async fn completion_atomically_projects_landed_epoch_and_preserves_mismatch() {
+        let storage = new_storage();
+        let conversation_id = "stable-landed-epoch";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .conn
+            .exec_with_mixed_params(
+                "UPDATE conversations SET join_epoch = ?1 WHERE conversation_id = ?2",
+                &[(2, conversation_id)],
+                &[(1, 742)],
+            )
+            .expect("seed prior join epoch");
+        storage
+            .conn
+            .exec_with_mixed_params(
+                "INSERT INTO group_states (group_id, conversation_id, epoch, members_json)
+                 VALUES (?1, ?2, ?3, '[]')",
+                &[(1, "new-group"), (2, conversation_id)],
+                &[(3, 741)],
+            )
+            .expect("seed distinct current epoch");
+        storage
+            .mark_reset_pending(conversation_id, "new-group", 23, 1_717_000_000_023)
+            .await
+            .expect("publish reset authority");
+
+        let snapshot = || {
+            storage
+                .conn
+                .query_text(
+                    "SELECT state, group_id,
+                            (SELECT epoch FROM group_states
+                             WHERE group_id = 'new-group' AND conversation_id = ?1),
+                            join_epoch, reset_new_group_id,
+                            reset_generation, reset_notified_at_ms, needs_rejoin,
+                            last_reset_generation
+                     FROM conversations WHERE conversation_id = ?1",
+                    &[(1, conversation_id)],
+                    9,
+                )
+                .expect("read completion snapshot")
+        };
+        let pending = snapshot();
+        assert!(!storage
+            .complete_reset_pending(conversation_id, 22, "new-group", 3)
+            .await
+            .expect("stale completion is a clean CAS miss"));
+        assert_eq!(snapshot(), pending, "mismatch preserves every field");
+
+        assert!(storage
+            .complete_reset_pending(conversation_id, 23, "new-group", 3)
+            .await
+            .expect("exact completion commits"));
+        assert_eq!(
+            snapshot()[0],
+            vec![
+                Some("active".into()),
+                Some("new-group".into()),
+                Some("3".into()),
+                Some("3".into()),
+                None,
+                None,
+                None,
+                Some("0".into()),
+                Some("23".into()),
+            ]
+        );
     }
 
     #[wasm_bindgen_test]

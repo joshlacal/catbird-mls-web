@@ -21,6 +21,7 @@ Requires `wasm-pack` and the `wasm32-unknown-unknown` target (pinned in `rust-to
 ./build-dev.sh    # dev — wasm-pack build --dev (faster, debug symbols)
 ./test-native.sh  # native crate smoke tests; WASM-only dependencies excluded
 ./test-wasm.sh    # wasm-bindgen tests in headless Firefox
+./test-tooling-config.sh # guard against Unix-only global Cargo overrides
 ```
 
 Both emit to `pkg/` (gitignored, regenerated from source). `build.sh` runs `wasm-opt -Oz` only if `wasm-opt` is on `PATH` — it is skipped otherwise (currently not installed locally, so release builds ship un-`wasm-opt`'d unless you install binaryen).
@@ -28,15 +29,18 @@ Both emit to `pkg/` (gitignored, regenerated from source). `build.sh` runs `wasm
 Fast iteration without producing a package:
 
 ```bash
-cargo check --target wasm32-unknown-unknown          # type-check only
+AR_wasm32_unknown_unknown="$PWD/build-tools/wasm-ar" \
+  cargo check --target wasm32-unknown-unknown       # Unix type-check only
 cargo test --lib                                      # non-wasm unit tests
 wasm-pack test --headless --firefox                   # wasm-bindgen-test
 ```
 
-`.cargo/config.toml` routes `AR_wasm32_unknown_unknown` through
+The Unix WASM build/test scripts route `AR_wasm32_unknown_unknown` through
 `build-tools/wasm-ar`. This keeps `sqlite-wasm-rs` from invoking a broken
 toolchain-manager `~/.swiftly/bin/llvm-ar` shim; the probe selects LLVM tools
-from the active Rust toolchain or another installed Rust toolchain. The
+from the active Rust toolchain or another installed Rust toolchain. There is
+no unconditional `.cargo/config.toml` override, preserving Cargo's native
+Windows archiver default. `test-tooling-config.sh` guards this invariant. The
 `sqlite-wasm-rs` and shared `catbird_mls` crates are declared only for
 `wasm32`, keeping native smoke tests from pulling in `audiopus_sys` or CMake.
 

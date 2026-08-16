@@ -4,7 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "Building catbird-mls-web (release)..."
-wasm-pack build --target web --release --out-dir pkg
+AR_wasm32_unknown_unknown="$PWD/build-tools/wasm-ar" \
+    wasm-pack build --target web --release --out-dir pkg
 
 if command -v wasm-opt &>/dev/null; then
     echo "Running wasm-opt..."

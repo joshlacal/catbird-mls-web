@@ -11,9 +11,10 @@ Universal browser WASM package wrapping `catbird-mls` for web apps.
 ./test-wasm.sh    # wasm-bindgen tests in headless Firefox
 ```
 
-The crate's `.cargo/config.toml` supplies a target-local archiver override for
+The crate's `.cargo/config.toml` supplies a target-local archiver probe for
 `wasm32-unknown-unknown`. This avoids relying on a toolchain-manager shim such
-as `~/.swiftly/bin/llvm-ar`; a platform `ar` is resolved from `PATH` instead.
+as `~/.swiftly/bin/llvm-ar`; `build-tools/wasm-ar` selects a usable LLVM
+archiver from the active Rust toolchain or another installed Rust toolchain.
 The encrypted `sqlite-wasm-rs` dependency and shared `catbird_mls` adapter are
 WASM-target-only. This keeps host smoke tests from building the OPFS SQLite
 amalgamation, native Opus, or its CMake dependency at all.

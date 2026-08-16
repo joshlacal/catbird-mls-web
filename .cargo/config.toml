@@ -1,11 +1,11 @@
 # Keep C/C++ build scripts from assuming a toolchain-specific llvm-ar path.
-# `cc` falls back to the platform archiver named here when building the
-# sqlite-wasm-rs C amalgamation for wasm32.
+# `cc` uses this checkout-local probe when building the sqlite-wasm-rs C
+# amalgamation for wasm32.
 [target.wasm32-unknown-unknown]
-ar = "ar"
+ar = "build-tools/wasm-ar"
 
-# `cc` does not consume Cargo's target `ar` key.  Export its target-specific
-# override through Cargo so this remains local to this checkout and does not
-# replace an explicitly supplied AR_wasm32_unknown_unknown.
+# `cc` does not consume Cargo's target `ar` key. Export the same probe through
+# Cargo so this remains local to this checkout and does not replace an
+# explicitly supplied AR_wasm32_unknown_unknown.
 [env]
-AR_wasm32_unknown_unknown = { value = "ar", force = false }
+AR_wasm32_unknown_unknown = { value = "build-tools/wasm-ar", relative = true, force = false }

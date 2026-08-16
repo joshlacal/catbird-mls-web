@@ -5,7 +5,9 @@ edition = "2021"
 description = "Universal browser WASM package for catbird-mls — any web app can consume"
 
 [lib]
-crate-type = ["cdylib"]
+# Keep the browser package as a cdylib while also producing an rlib so
+# wasm-bindgen test harnesses link sqlite-wasm-rs's C archive correctly.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # WASM bindings

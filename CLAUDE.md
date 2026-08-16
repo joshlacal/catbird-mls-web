@@ -33,12 +33,12 @@ cargo test --lib                                      # non-wasm unit tests
 wasm-pack test --headless --firefox                   # wasm-bindgen-test
 ```
 
-`.cargo/config.toml` sets `AR_wasm32_unknown_unknown=ar` through Cargo's
-target-local environment. This keeps `sqlite-wasm-rs` from invoking a broken
-toolchain-manager `~/.swiftly/bin/llvm-ar` shim while remaining portable across
-hosts with `ar` on `PATH`. `sqlite-wasm-rs` and the shared `catbird_mls` crate
-are declared only for `wasm32`; this keeps native smoke tests from pulling in
-`audiopus_sys` or its CMake build at all.
+`.cargo/config.toml` routes `AR_wasm32_unknown_unknown` through
+`build-tools/wasm-ar`. This keeps `sqlite-wasm-rs` from invoking a broken
+toolchain-manager `~/.swiftly/bin/llvm-ar` shim; the probe selects LLVM tools
+from the active Rust toolchain or another installed Rust toolchain. The
+`sqlite-wasm-rs` and shared `catbird_mls` crates are declared only for
+`wasm32`, keeping native smoke tests from pulling in `audiopus_sys` or CMake.
 
 If a transitive dep pulls `audiopus_sys` (or any CMake 4.x policy error like `CMP0114`), prefix with `CMAKE_POLICY_VERSION_MINIMUM=3.5` (see workspace CLAUDE.md backlog item N2).
 

@@ -30,9 +30,9 @@ Fast iteration without producing a package:
 
 ```bash
 AR_wasm32_unknown_unknown="$PWD/build-tools/wasm-ar" \
-  cargo check --target wasm32-unknown-unknown       # Unix type-check only
+cargo check --target wasm32-unknown-unknown       # Unix type-check only
 cargo test --lib                                      # non-wasm unit tests
-wasm-pack test --headless --firefox                   # wasm-bindgen-test
+./test-wasm.sh                                      # wasm-bindgen-test (archiver configured)
 ```
 
 The Unix WASM build/test scripts route `AR_wasm32_unknown_unknown` through

@@ -8,10 +8,6 @@ description = "Universal browser WASM package for catbird-mls — any web app ca
 crate-type = ["cdylib"]
 
 [dependencies]
-# Shared MLS orchestrator — same crate as Catbird iOS and Catmos desktop
-catbird_mls = { path = "../catbird-mls", default-features = false, features = ["browser"] }
-catbird-atproto = { path = "../catbird-atproto" }
-
 # WASM bindings
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -58,9 +54,6 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-webpki-roots",
 ] }
 
-# SQLite for WASM — raw FFI bindings with sqlite3mc encryption
-sqlite-wasm-rs = { version = "0.5", default-features = false, features = ["sqlite3mc"] }
-
 # OpenMLS — same versions as catbird-mls
 openmls = { version = "0.8", features = ["js"] }
 openmls_traits = "0.5"
@@ -87,6 +80,17 @@ thiserror = "1.0"
 getrandom = { version = "0.2", features = ["js"] }
 getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Shared MLS orchestrator — same crate as Catbird iOS and Catmos desktop.
+# Keeping this target-specific prevents native checks from pulling its
+# audiopus_sys/CMake voice stack into this browser-only crate.
+catbird_mls = { path = "../catbird-mls", default-features = false, features = ["browser"] }
+catbird-atproto = { path = "../catbird-atproto" }
+
+# SQLite for WASM — raw FFI bindings with sqlite3mc encryption. Keep this out
+# of native checks/tests: its OPFS VFS and C amalgamation only run in WASM.
+sqlite-wasm-rs = { version = "0.5", default-features = false, features = ["sqlite3mc"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

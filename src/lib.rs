@@ -24,6 +24,11 @@
 //! Handle (SAH) pool VFS for synchronous SQLite I/O. This VFS is only available
 //! inside Web Workers.
 
+#![cfg(target_arch = "wasm32")]
+// This crate has no native implementation. Keeping the entire adapter behind
+// the target gate lets `cargo test --lib` provide a lightweight host smoke
+// check without compiling browser-only OPFS SQLite or native Opus support.
+
 mod api_client;
 mod credentials;
 pub mod mls_storage;

@@ -7,7 +7,16 @@ Universal browser WASM package wrapping `catbird-mls` for web apps.
 ```bash
 ./build.sh        # release (with wasm-opt if available)
 ./build-dev.sh    # dev (faster, debug symbols)
+./test-native.sh  # host crate smoke tests; WASM-only dependencies excluded
+./test-wasm.sh    # wasm-bindgen tests in headless Firefox
 ```
+
+The crate's `.cargo/config.toml` supplies a target-local archiver override for
+`wasm32-unknown-unknown`. This avoids relying on a toolchain-manager shim such
+as `~/.swiftly/bin/llvm-ar`; a platform `ar` is resolved from `PATH` instead.
+The encrypted `sqlite-wasm-rs` dependency and shared `catbird_mls` adapter are
+WASM-target-only. This keeps host smoke tests from building the OPFS SQLite
+amalgamation, native Opus, or its CMake dependency at all.
 
 Output lands in `pkg/`.
 

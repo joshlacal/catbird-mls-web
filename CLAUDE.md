@@ -19,6 +19,8 @@ Requires `wasm-pack` and the `wasm32-unknown-unknown` target (pinned in `rust-to
 ```bash
 ./build.sh        # release — wasm-pack build --release, then wasm-opt -Oz if available
 ./build-dev.sh    # dev — wasm-pack build --dev (faster, debug symbols)
+./test-native.sh  # native crate smoke tests; WASM-only dependencies excluded
+./test-wasm.sh    # wasm-bindgen tests in headless Firefox
 ```
 
 Both emit to `pkg/` (gitignored, regenerated from source). `build.sh` runs `wasm-opt -Oz` only if `wasm-opt` is on `PATH` — it is skipped otherwise (currently not installed locally, so release builds ship un-`wasm-opt`'d unless you install binaryen).
@@ -30,6 +32,13 @@ cargo check --target wasm32-unknown-unknown          # type-check only
 cargo test --lib                                      # non-wasm unit tests
 wasm-pack test --headless --firefox                   # wasm-bindgen-test
 ```
+
+`.cargo/config.toml` sets `AR_wasm32_unknown_unknown=ar` through Cargo's
+target-local environment. This keeps `sqlite-wasm-rs` from invoking a broken
+toolchain-manager `~/.swiftly/bin/llvm-ar` shim while remaining portable across
+hosts with `ar` on `PATH`. `sqlite-wasm-rs` and the shared `catbird_mls` crate
+are declared only for `wasm32`; this keeps native smoke tests from pulling in
+`audiopus_sys` or its CMake build at all.
 
 If a transitive dep pulls `audiopus_sys` (or any CMake 4.x policy error like `CMP0114`), prefix with `CMAKE_POLICY_VERSION_MINIMUM=3.5` (see workspace CLAUDE.md backlog item N2).
 

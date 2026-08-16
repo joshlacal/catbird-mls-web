@@ -48,6 +48,7 @@ use wasm_bindgen::prelude::*;
 use api_client::WasmApiClient;
 use base64::Engine as _;
 use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
+use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::MLSError;
 use credentials::SqliteCredentialStore;
 use storage::WasmStorageBackend;
@@ -719,7 +720,7 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
         .await
         .map_err(|e| js_err!("store_mls_did failed: {:?}", e))?;
     credentials
-        .store_device_uuid(&user_did, &device_uuid)
+        .store_device_uuid(&user_did, &device_info.device_id)
         .await
         .map_err(|e| js_err!("store_device_uuid failed: {:?}", e))?;
     credentials
@@ -747,6 +748,7 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
                 &kp.key_package_data,
                 "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
                 &expires_at,
+                Some(&device_info.device_id),
             )
             .await
         {
@@ -791,13 +793,17 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
 pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
 
-    let (api_client, user_did) = with_state(|s| {
+    let (api_client, credentials, user_did) = with_state(|s| {
         let did = s
             .user_did
             .clone()
             .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), did))
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.credentials), did))
     })?;
+    let device_uuid = credentials
+        .get_device_uuid(&user_did)
+        .await
+        .map_err(|e| js_err!("Device UUID lookup failed: {:?}", e))?;
 
     // Track how many key packages THIS web device has published in this session.
     // Server stats are per-DID (includes iOS key packages) so we can't rely on them
@@ -841,7 +847,12 @@ pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
         match kp_result {
             Ok(kp) => {
                 match api_client
-                    .publish_key_package(&kp.key_package_data, cipher_suite, &expires_at)
+                    .publish_key_package(
+                        &kp.key_package_data,
+                        cipher_suite,
+                        &expires_at,
+                        device_uuid.as_deref(),
+                    )
                     .await
                 {
                     Ok(()) => {

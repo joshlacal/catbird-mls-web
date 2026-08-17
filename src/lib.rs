@@ -30,6 +30,7 @@
 // check without compiling browser-only OPFS SQLite or native Opus support.
 
 mod api_client;
+mod browser_transport;
 mod credentials;
 pub mod mls_storage;
 pub mod sqlite_conn;
@@ -59,6 +60,11 @@ use wasm_mls_context::WasmMLSContext;
 // ---------------------------------------------------------------------------
 
 pub use api_client::WasmApiClient as WasmApiClientExport;
+pub use browser_transport::{
+    catbird_mls_clear_signer_bridge, catbird_mls_has_signer_bridge,
+    catbird_mls_prepare_signed_request, catbird_mls_prepare_unsigned_request,
+    catbird_mls_set_signer_bridge,
+};
 pub use credentials::SqliteCredentialStore as SqliteCredentialStoreExport;
 pub use mls_storage::WasmSqliteStorage;
 pub use sqlite_conn::{SqliteConn, WasmSqliteError};

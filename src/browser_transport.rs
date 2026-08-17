@@ -123,15 +123,46 @@ pub fn catbird_mls_prepare_unsigned_request(
     let operation = parse_operation(&operation).map_err(js_error)?;
     let _request = parse_generated_request(operation, request_json.as_bytes()).map_err(js_error)?;
     let route = canonical_route(operation);
-    let body = if is_read(operation) {
-        None
+    let (method, path, body) = if is_read(operation) {
+        let value: serde_json::Value =
+            serde_json::from_str(&request_json).map_err(|error| js_error(error))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| js_error("generated read request must be an object"))?;
+        let mut fields = Vec::new();
+        for (key, value) in object {
+            if key == "$type" || value.is_null() {
+                continue;
+            }
+            if let Some(values) = value.as_array() {
+                for value in values {
+                    fields.push(format!(
+                        "{}={}",
+                        encode_query(key),
+                        encode_query(&query_value(value).map_err(js_error)?)
+                    ));
+                }
+            } else {
+                fields.push(format!(
+                    "{}={}",
+                    encode_query(key),
+                    encode_query(&query_value(value).map_err(js_error)?)
+                ));
+            }
+        }
+        let path = if fields.is_empty() {
+            route.path.to_owned()
+        } else {
+            format!("{}?{}", route.path, fields.join("&"))
+        };
+        ("GET".to_owned(), path, None)
     } else {
-        Some(request_json.into_bytes())
+        ("POST".to_owned(), route.path.to_owned(), Some(request_json.into_bytes()))
     };
     let prepared = PreparedRequest {
         operation,
-        method: if is_read(operation) { "GET".into() } else { "POST".into() },
-        path: route.path.to_owned(),
+        method,
+        path,
         authorization: String::new(),
         dpop: String::new(),
         body,
@@ -188,6 +219,22 @@ fn project_signed(
     input: &[u8],
 ) -> Result<Projection, String> {
     let root: serde_json::Value = serde_json::from_slice(input).map_err(|error| error.to_string())?;
+    let root_object = root
+        .as_object()
+        .ok_or_else(|| "signed request must be an object".to_owned())?;
+    if root_object.keys().any(|key| key != "signedRequest") {
+        return Err("signed request wrapper has unknown fields".into());
+    }
+    let signed_request = root_object
+        .get("signedRequest")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "signedRequest must be an object".to_owned())?;
+    if signed_request
+        .keys()
+        .any(|key| !matches!(key.as_str(), "body" | "signature" | "$type"))
+    {
+        return Err("signedRequest has unknown fields".into());
+    }
     let body = root
         .get("signedRequest")
         .and_then(|value| value.get("body"))
@@ -401,6 +448,27 @@ fn is_read(operation: CanonicalOperation) -> bool {
             | CanonicalOperation::GetOwnDevices
             | CanonicalOperation::GetPendingWelcomes
     )
+}
+
+fn query_value(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::String(value) => Ok(value.clone()),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        _ => Err("query parameters must be scalar".into()),
+    }
+}
+
+fn encode_query(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {

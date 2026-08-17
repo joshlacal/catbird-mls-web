@@ -35,6 +35,7 @@ mod credentials;
 pub mod mls_storage;
 pub mod sqlite_conn;
 mod storage;
+mod strict_projection;
 mod wasm_mls_context;
 mod websocket;
 

@@ -383,3 +383,123 @@ export function avatarBytesToObjectUrl(
   const blob = new Blob([bytes], { type: contentType ?? 'application/octet-stream' })
   return URL.createObjectURL(blob)
 }
+
+// ---------------------------------------------------------------------------
+// Clean-chat signer bridge (Task 11)
+// ---------------------------------------------------------------------------
+
+/**
+ * A prepared clean-chat request. `body` is present for POSTs (signed or
+ * unsigned) and absent for GETs; `authorization`/`dpop` are intentionally not
+ * exposed — the host attaches its own transport credentials.
+ */
+export interface PreparedCleanChatRequest {
+  operation: string
+  method: 'GET' | 'POST'
+  path: string
+  body?: string
+}
+
+/**
+ * Install the browser-owned non-exporting Ed25519 signer for canonical
+ * clean-chat preparation.
+ *
+ * The `CryptoKey` must be a **non-extractable, sign-only Ed25519 private key**
+ * (e.g. generated with `crypto.subtle.generateKey({ name: 'Ed25519' }, false,
+ * ['sign'])`). Extractable or raw-imported keys are rejected before any WASM
+ * bridge state is installed. Only the public key and a signing callback cross
+ * into WASM — no private key bytes, access token, DPoP proof, or JKT is ever
+ * exported.
+ */
+export async function installCleanChatSigner(params: {
+  actorDid: string
+  deviceId: string
+  dpopJkt: string
+  publicKey: Uint8Array
+  key: CryptoKey
+  authGeneration?: bigint
+}): Promise<void> {
+  assertSignerKeyCustody(params.key)
+  const wasm = await getWasm()
+  const sign = (transcript: Uint8Array): Promise<Uint8Array> => {
+    // Copy into an ArrayBuffer-backed view so WebCrypto's BufferSource
+    // requirement is satisfied regardless of the caller's buffer type.
+    const buffer = new Uint8Array(transcript)
+    return crypto.subtle
+      .sign({ name: 'Ed25519' }, params.key, buffer)
+      .then((signature) => new Uint8Array(signature))
+  }
+  wasm.catbird_mls_set_signer_bridge(
+    sign,
+    params.key,
+    params.actorDid,
+    params.deviceId,
+    params.dpopJkt,
+    params.publicKey,
+    params.authGeneration ?? null,
+  )
+}
+
+/**
+ * Throw unless `key` satisfies the clean-chat signer custody contract: a
+ * private, non-extractable, sign-only Ed25519 `CryptoKey`.
+ */
+export function assertSignerKeyCustody(key: CryptoKey): void {
+  if (key.type !== 'private') {
+    throw new Error('clean-chat signer key must be a private CryptoKey')
+  }
+  if (key.extractable) {
+    throw new Error(
+      'clean-chat signer key must be non-extractable (extractable or raw-imported keys are rejected)',
+    )
+  }
+  if (key.algorithm.name !== 'Ed25519') {
+    throw new Error('clean-chat signer key must use the Ed25519 algorithm')
+  }
+  const usages = Array.from(key.usages)
+  if (usages.length !== 1 || usages[0] !== 'sign') {
+    throw new Error(
+      'clean-chat signer key must be sign-only (usages exactly ["sign"])',
+    )
+  }
+}
+
+/** Clear the installed clean-chat signer bridge (if any). */
+export async function clearCleanChatSigner(): Promise<void> {
+  const wasm = await getWasm()
+  wasm.catbird_mls_clear_signer_bridge()
+}
+
+/** Whether a clean-chat signer bridge is currently installed. */
+export async function hasCleanChatSigner(): Promise<boolean> {
+  const wasm = await getWasm()
+  return Boolean(wasm.catbird_mls_has_signer_bridge())
+}
+
+/**
+ * Prepare an unsigned generated clean-chat request (reads and
+ * `getSubscriptionTicket`). Unknown raw query keys are rejected.
+ */
+export async function prepareUnsignedCleanChatRequest(
+  operation: string,
+  requestJson: string,
+): Promise<PreparedCleanChatRequest> {
+  const wasm = await getWasm()
+  return wasm.catbird_mls_prepare_unsigned_request(operation, requestJson) as PreparedCleanChatRequest
+}
+
+/**
+ * Prepare a signed clean-chat mutation through the approved Rust strict
+ * projector. Validation structurally precedes signing; the signer bridge must
+ * already be installed via `installCleanChatSigner`.
+ */
+export async function prepareSignedCleanChatRequest(
+  operation: string,
+  requestJson: string,
+): Promise<PreparedCleanChatRequest> {
+  const wasm = await getWasm()
+  return (await wasm.catbird_mls_prepare_signed_request(
+    operation,
+    requestJson,
+  )) as PreparedCleanChatRequest
+}

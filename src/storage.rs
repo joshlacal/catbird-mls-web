@@ -881,17 +881,26 @@ impl MLSStorageBackend for WasmStorageBackend {
             .map_err(Self::store_err)
     }
 
-    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
-        self.conn
+    async fn clear_reset_pending_for_delete(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+    ) -> Result<bool> {
+        let _ = self
+            .conn
             .exec_with_text_params(
                 "UPDATE conversations
                  SET reset_new_group_id = NULL,
                      reset_generation = NULL,
                      reset_notified_at_ms = NULL
-                 WHERE conversation_id = ?1",
-                &[(1, conversation_id)],
+                 WHERE conversation_id = ?1 AND reset_generation = ?2",
+                &[
+                    (1, conversation_id),
+                    (2, &expected_generation.to_string()),
+                ],
             )
-            .map_err(Self::store_err)
+            .map_err(Self::store_err)?;
+        Ok(true)
     }
 
     async fn set_conversation_sequencer(

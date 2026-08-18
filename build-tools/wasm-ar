@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+is_usable() {
+  local candidate="$1"
+  [[ -x "$candidate" ]] && "$candidate" --version >/dev/null 2>&1
+}
+
+# Some Swiftly installations expose a non-executable manager shim as
+# ~/.swiftly/bin/llvm-ar. Probe before accepting PATH's result.
+if command -v llvm-ar >/dev/null 2>&1 && is_usable "$(command -v llvm-ar)"; then
+  exec "$(command -v llvm-ar)" "$@"
+fi
+
+if command -v rustc >/dev/null 2>&1; then
+  sysroot=$(rustc --print sysroot)
+  host=$(rustc -vV | sed -n 's/^host: //p')
+  candidate="$sysroot/lib/rustlib/$host/bin/llvm-ar"
+  if is_usable "$candidate"; then
+    exec "$candidate" "$@"
+  fi
+fi
+
+if command -v rustup >/dev/null 2>&1; then
+  while IFS= read -r toolchain; do
+    [[ -n "$toolchain" ]] || continue
+    sysroot=$(rustup run "$toolchain" rustc --print sysroot 2>/dev/null || true)
+    host=$(rustup run "$toolchain" rustc -vV 2>/dev/null | sed -n 's/^host: //p')
+    candidate="$sysroot/lib/rustlib/$host/bin/llvm-ar"
+    if is_usable "$candidate"; then
+      exec "$candidate" "$@"
+    fi
+  done < <(rustup toolchain list | sed 's/[[:space:]].*//')
+fi
+
+echo "catbird-mls-web: no usable LLVM archiver found (install llvm-ar or Rust LLVM tools)" >&2
+exit 127

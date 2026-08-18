@@ -19,6 +19,9 @@ Requires `wasm-pack` and the `wasm32-unknown-unknown` target (pinned in `rust-to
 ```bash
 ./build.sh        # release — wasm-pack build --release, then wasm-opt -Oz if available
 ./build-dev.sh    # dev — wasm-pack build --dev (faster, debug symbols)
+./test-native.sh  # native crate smoke tests; WASM-only dependencies excluded
+./test-wasm.sh    # wasm-bindgen tests in headless Firefox
+./test-tooling-config.sh # guard against Unix-only global Cargo overrides
 ```
 
 Both emit to `pkg/` (gitignored, regenerated from source). `build.sh` runs `wasm-opt -Oz` only if `wasm-opt` is on `PATH` — it is skipped otherwise (currently not installed locally, so release builds ship un-`wasm-opt`'d unless you install binaryen).
@@ -26,10 +29,20 @@ Both emit to `pkg/` (gitignored, regenerated from source). `build.sh` runs `wasm
 Fast iteration without producing a package:
 
 ```bash
-cargo check --target wasm32-unknown-unknown          # type-check only
+AR_wasm32_unknown_unknown="$PWD/build-tools/wasm-ar" \
+cargo check --target wasm32-unknown-unknown       # Unix type-check only
 cargo test --lib                                      # non-wasm unit tests
-wasm-pack test --headless --firefox                   # wasm-bindgen-test
+./test-wasm.sh                                      # wasm-bindgen-test (archiver configured)
 ```
+
+The Unix WASM build/test scripts route `AR_wasm32_unknown_unknown` through
+`build-tools/wasm-ar`. This keeps `sqlite-wasm-rs` from invoking a broken
+toolchain-manager `~/.swiftly/bin/llvm-ar` shim; the probe selects LLVM tools
+from the active Rust toolchain or another installed Rust toolchain. There is
+no unconditional `.cargo/config.toml` override, preserving Cargo's native
+Windows archiver default. `test-tooling-config.sh` guards this invariant. The
+`sqlite-wasm-rs` and shared `catbird_mls` crates are declared only for
+`wasm32`, keeping native smoke tests from pulling in `audiopus_sys` or CMake.
 
 If a transitive dep pulls `audiopus_sys` (or any CMake 4.x policy error like `CMP0114`), prefix with `CMAKE_POLICY_VERSION_MINIMUM=3.5` (see workspace CLAUDE.md backlog item N2).
 
@@ -103,7 +116,7 @@ Browser apps **MUST** call `catbird_mls_start_background_tasks(interval_ms)` onc
 ## Gotchas
 
 - **Worker context is required; COOP/COEP is NOT.** `catbird_mls_init()` must run inside a Web Worker (lib logs "Ensure `catbird_mls_init()` runs inside a Worker" when SQLite is unavailable). The OPFS SAH-pool VFS uses synchronous `SyncAccessHandle`s and deliberately avoids `SharedArrayBuffer`/Atomics, so **cross-origin isolation (COOP/COEP) is not needed** — catmos ships none. (Contrast: `SharedArrayBuffer`-based VFS approaches would require it.)
-- **ABI drift vs `catbird-atproto`.** `api_client.rs` and `wasm_mls_context.rs` consume generated Jacquard types; when `catbird-atproto` regenerates (renamed/removed fields), `cargo check --target wasm32-unknown-unknown` breaks. Reconcile against the regenerated core / lexicon — never hand-patch generated types. *(As of 2026-05-31 this is live: `create_convo::InputData` / `ConvoView` no longer expose a `metadata` field — `src/api_client.rs` needs updating to the regenerated `catbird-atproto`.)*
+- **ABI drift vs `catbird-atproto`.** `api_client.rs` and `wasm_mls_context.rs` consume generated Jacquard types; when `catbird-atproto` regenerates (renamed/removed fields), `cargo check --target wasm32-unknown-unknown` breaks. Reconcile against the regenerated core / lexicon — never hand-patch generated types.
 - **No state portability with desktop.** Web uses OPFS-backed SQLite; catmos desktop uses native SQLCipher. The field-level envelope crypto is wire-compatible, but the on-disk databases are not interchangeable. Document any divergence you find.
 - **No IndexedDB migration.** Storage moved from IndexedDB to encrypted SQLite; there is no migration path — users with old IndexedDB data must re-login. Old IDBs are left for browser GC.
 - **Voice/media not exposed.** No audio codecs in the WASM surface; `audiopus_sys` is not a dependency of this crate.

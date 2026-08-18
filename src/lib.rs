@@ -24,11 +24,18 @@
 //! Handle (SAH) pool VFS for synchronous SQLite I/O. This VFS is only available
 //! inside Web Workers.
 
+#![cfg(target_arch = "wasm32")]
+// This crate has no native implementation. Keeping the entire adapter behind
+// the target gate lets `cargo test --lib` provide a lightweight host smoke
+// check without compiling browser-only OPFS SQLite or native Opus support.
+
 mod api_client;
+mod browser_transport;
 mod credentials;
 pub mod mls_storage;
 pub mod sqlite_conn;
 mod storage;
+mod strict_projection;
 mod wasm_mls_context;
 mod websocket;
 
@@ -43,6 +50,7 @@ use wasm_bindgen::prelude::*;
 use api_client::WasmApiClient;
 use base64::Engine as _;
 use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
+use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::MLSError;
 use credentials::SqliteCredentialStore;
 use storage::WasmStorageBackend;
@@ -53,6 +61,11 @@ use wasm_mls_context::WasmMLSContext;
 // ---------------------------------------------------------------------------
 
 pub use api_client::WasmApiClient as WasmApiClientExport;
+pub use browser_transport::{
+    catbird_mls_clear_signer_bridge, catbird_mls_has_signer_bridge,
+    catbird_mls_prepare_signed_request, catbird_mls_prepare_unsigned_request,
+    catbird_mls_set_signer_bridge,
+};
 pub use credentials::SqliteCredentialStore as SqliteCredentialStoreExport;
 pub use mls_storage::WasmSqliteStorage;
 pub use sqlite_conn::{SqliteConn, WasmSqliteError};
@@ -714,7 +727,7 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
         .await
         .map_err(|e| js_err!("store_mls_did failed: {:?}", e))?;
     credentials
-        .store_device_uuid(&user_did, &device_uuid)
+        .store_device_uuid(&user_did, &device_info.device_id)
         .await
         .map_err(|e| js_err!("store_device_uuid failed: {:?}", e))?;
     credentials
@@ -742,6 +755,7 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
                 &kp.key_package_data,
                 "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
                 &expires_at,
+                Some(&device_info.device_id),
             )
             .await
         {
@@ -786,13 +800,17 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
 pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
 
-    let (api_client, user_did) = with_state(|s| {
+    let (api_client, credentials, user_did) = with_state(|s| {
         let did = s
             .user_did
             .clone()
             .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), did))
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.credentials), did))
     })?;
+    let device_uuid = credentials
+        .get_device_uuid(&user_did)
+        .await
+        .map_err(|e| js_err!("Device UUID lookup failed: {:?}", e))?;
 
     // Track how many key packages THIS web device has published in this session.
     // Server stats are per-DID (includes iOS key packages) so we can't rely on them
@@ -836,7 +854,12 @@ pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
         match kp_result {
             Ok(kp) => {
                 match api_client
-                    .publish_key_package(&kp.key_package_data, cipher_suite, &expires_at)
+                    .publish_key_package(
+                        &kp.key_package_data,
+                        cipher_suite,
+                        &expires_at,
+                        device_uuid.as_deref(),
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -3184,7 +3207,7 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
             let _ = storage
                 .set_conversation_state(&convo_id, ConversationState::Active)
                 .await;
-            let _ = storage.clear_reset_pending(&convo_id).await;
+            let _ = storage.clear_reset_pending_for_delete(&convo_id, reset_generation).await;
             let _ = storage.clear_rejoin_flag(&convo_id).await;
             web_sys::console::log_1(&js_err!(
                 "[deferred-recovery] {}: cleared via Welcome/ExternalCommit",
@@ -3320,7 +3343,7 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
             let _ = storage
                 .set_conversation_state(&convo_id, ConversationState::Active)
                 .await;
-            let _ = storage.clear_reset_pending(&convo_id).await;
+            let _ = storage.clear_reset_pending_for_delete(&convo_id, reset_generation).await;
             let _ = storage.clear_rejoin_flag(&convo_id).await;
             let local_epoch = with_state(|s| {
                 Ok(s.mls_context

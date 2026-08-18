@@ -463,6 +463,9 @@ impl WasmMLSContext {
         Ok(AddMembersResult {
             commit_data,
             welcome_data,
+            metadata_blob_locator: None,
+            metadata_blob_ciphertext: None,
+            metadata_version: None,
         })
     }
 
@@ -1079,6 +1082,8 @@ impl WasmMLSContext {
                 epoch,
                 sequence_number: 0,
                 sender_credential,
+                content_type: catbird_mls::DecryptContentType::Application,
+                proposal_ref: None,
             }),
 
             ProcessedMessageContent::StagedCommitMessage(commit) => {

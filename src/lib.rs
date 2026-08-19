@@ -2007,7 +2007,7 @@ pub async fn catbird_mls_send_reaction(
 
     let resp = client
         .post(format!(
-            "{}/xrpc/blue.catbird.mlsChat.sendMessage",
+            "{}/xrpc/blue.catbird.chat.sendMessage",
             base_url
         ))
         .bearer_auth(&auth_token)
@@ -2046,7 +2046,7 @@ pub async fn catbird_mls_update_cursor(
     let client = proxy_client(&proxy_did);
     let resp = client
         .post(format!(
-            "{}/xrpc/blue.catbird.mlsChat.updateCursor",
+            "{}/xrpc/blue.catbird.chat.submitTransition",
             base_url
         ))
         .bearer_auth(&auth_token)
@@ -2241,7 +2241,7 @@ pub async fn catbird_mls_demote_member(
     let client = proxy_client(&proxy_did);
     let resp = client
         .post(format!(
-            "{}/xrpc/blue.catbird.mlsChat.demoteAdmin",
+            "{}/xrpc/blue.catbird.chat.submitTransition",
             base_url
         ))
         .bearer_auth(&auth_token)
@@ -2322,7 +2322,7 @@ pub async fn catbird_mls_send_typing(
     let client = proxy_client(&proxy_did);
     let resp = client
         .post(format!(
-            "{}/xrpc/blue.catbird.mlsChat.sendMessage",
+            "{}/xrpc/blue.catbird.chat.publishTyping",
             base_url
         ))
         .bearer_auth(&auth_token)
@@ -2365,7 +2365,7 @@ pub async fn catbird_mls_promote_member(
     let client = proxy_client(&proxy_did);
     let resp = client
         .post(format!(
-            "{}/xrpc/blue.catbird.mlsChat.promoteAdmin",
+            "{}/xrpc/blue.catbird.chat.submitTransition",
             base_url
         ))
         .bearer_auth(&auth_token)
@@ -3062,7 +3062,7 @@ pub async fn catbird_mls_check_opt_in_status(dids: Array) -> Result<JsValue, JsV
 
     let dids_param = dids.join(",");
     let url = format!(
-        "{}/xrpc/blue.catbird.mlsChat.getOptInStatus?dids={}",
+        "{}/xrpc/blue.catbird.chat.getDevices?dids={}",
         base_url, dids_param
     );
 
@@ -3308,7 +3308,7 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
             "currentEpoch": 1,
         });
         let url = format!(
-            "{}/xrpc/blue.catbird.mlsChat.bootstrapResetGroup",
+            "{}/xrpc/blue.catbird.chat.requestReset",
             base_url.trim_end_matches('/')
         );
         let client = proxy_client(&proxy_did);

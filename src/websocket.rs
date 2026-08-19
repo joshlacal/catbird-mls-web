@@ -1141,7 +1141,7 @@ pub async fn connect(
     let client = reqwest::Client::new();
     let ticket_resp = client
         .post(format!(
-            "{}/xrpc/blue.catbird.mlsChat.getSubscriptionTicket",
+            "{}/xrpc/blue.catbird.chat.getSubscriptionTicket",
             base_url
         ))
         .bearer_auth(&auth_token)

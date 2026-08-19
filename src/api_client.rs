@@ -9,280 +9,12 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use catbird_atproto::blue_catbird;
-use catbird_atproto::jacquard_common::IntoStatic;
 use reqwest::Client;
 use std::sync::RwLock;
 
-use catbird_atproto::blue_catbird::mlsChat::commit_group_change::{
-    CommitGroupChange, CommitGroupChangeAction,
-};
-use catbird_atproto::catbird::mls_chat as lexicon;
-use catbird_atproto::types::string::{Datetime, Did};
 use catbird_mls::orchestrator::api_client::MLSAPIClient;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 use catbird_mls::orchestrator::types::*;
-
-fn parse_did(s: &str) -> Did {
-    Did::new_owned(s.to_string()).unwrap_or_else(|_| panic!("invalid DID: {}", s))
-}
-
-fn parse_lexicon_json<'de, T>(body: &'de [u8]) -> Result<T::Output>
-where
-    T: serde::Deserialize<'de> + IntoStatic,
-{
-    let parsed: T =
-        serde_json::from_slice(body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
-    Ok(parsed.into_static())
-}
-
-// -- Helper parsers (ported from ReqwestApiClient) ----------------------------
-
-fn decode_hex_bytes(input: &str) -> std::result::Result<Vec<u8>, String> {
-    let trimmed = input.trim_start_matches("0x").trim_start_matches("0X");
-    if trimmed.len() % 2 != 0 {
-        return Err("hex string length must be even".to_string());
-    }
-    let mut out = Vec::with_capacity(trimmed.len() / 2);
-    let chars: Vec<char> = trimmed.chars().collect();
-    for idx in (0..chars.len()).step_by(2) {
-        let pair: String = [chars[idx], chars[idx + 1]].iter().collect();
-        let byte = u8::from_str_radix(&pair, 16)
-            .map_err(|_| format!("invalid hex byte at position {}", idx))?;
-        out.push(byte);
-    }
-    Ok(out)
-}
-
-fn parse_receipt_bytes_data(
-    field: &str,
-    value: &catbird_atproto::jacquard_common::types::value::Data,
-) -> std::result::Result<Vec<u8>, String> {
-    use catbird_atproto::jacquard_common::types::value::Data;
-
-    match value {
-        Data::Bytes(bytes) => Ok(bytes.to_vec()),
-        Data::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for (idx, item) in items.iter().enumerate() {
-                let n = item
-                    .as_integer()
-                    .ok_or_else(|| format!("{field}[{idx}] is not an integer"))?;
-                let byte =
-                    u8::try_from(n).map_err(|_| format!("{field}[{idx}] is out of byte range"))?;
-                out.push(byte);
-            }
-            Ok(out)
-        }
-        _ => {
-            if let Some(encoded) = value.as_str() {
-                if let Ok(decoded) = B64.decode(encoded) {
-                    return Ok(decoded);
-                }
-                if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE.decode(encoded) {
-                    return Ok(decoded);
-                }
-                if let Ok(decoded) =
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)
-                {
-                    return Ok(decoded);
-                }
-                if let Ok(decoded) = decode_hex_bytes(encoded) {
-                    return Ok(decoded);
-                }
-                return Err(format!(
-                    "{field} was a string but not valid base64/base64url/hex"
-                ));
-            }
-            Err(format!(
-                "{field} must be bytes, an array of integers, or an encoded string"
-            ))
-        }
-    }
-}
-
-fn parse_sequencer_receipt_data(
-    value: &catbird_atproto::jacquard_common::types::value::Data,
-) -> std::result::Result<SequencerReceipt, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "receipt is not an ATProto object".to_string())?;
-
-    let convo_id = object
-        .get("convo_id")
-        .or_else(|| object.get("convoId"))
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string)
-        .ok_or_else(|| "missing convo_id/convoId".to_string())?;
-    let epoch = object
-        .get("epoch")
-        .and_then(|value| value.as_integer())
-        .ok_or_else(|| "missing epoch".to_string())
-        .and_then(|value| i32::try_from(value).map_err(|_| "epoch out of i32 range".to_string()))?;
-    let commit_hash = parse_receipt_bytes_data(
-        "commit_hash",
-        object
-            .get("commit_hash")
-            .or_else(|| object.get("commitHash"))
-            .ok_or_else(|| "missing commit_hash/commitHash".to_string())?,
-    )?;
-    let sequencer_did = object
-        .get("sequencer_did")
-        .or_else(|| object.get("sequencerDid"))
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string)
-        .ok_or_else(|| "missing sequencer_did/sequencerDid".to_string())?;
-    let issued_at = object
-        .get("issued_at")
-        .or_else(|| object.get("issuedAt"))
-        .and_then(|value| value.as_integer())
-        .ok_or_else(|| "missing issued_at/issuedAt".to_string())?;
-    let signature = parse_receipt_bytes_data(
-        "signature",
-        object
-            .get("signature")
-            .ok_or_else(|| "missing signature".to_string())?,
-    )?;
-    let sequencer_term = object
-        .get("sequencer_term")
-        .or_else(|| object.get("sequencerTerm"))
-        .and_then(|value| value.as_integer())
-        .map(|v| v as u64)
-        .unwrap_or(0);
-
-    Ok(SequencerReceipt {
-        convo_id,
-        epoch,
-        sequencer_term,
-        commit_hash,
-        sequencer_did,
-        issued_at,
-        signature,
-    })
-}
-
-fn parse_commit_group_change_receipt(
-    output: &lexicon::commit_group_change::Output,
-    op: &str,
-) -> Option<SequencerReceipt> {
-    let receipt = output.extra_data.as_ref().and_then(|extra| {
-        extra.get("receipt").or_else(|| {
-            extra
-                .values()
-                .find_map(|value| value.as_object().and_then(|object| object.get("receipt")))
-        })
-    });
-
-    let receipt = match receipt {
-        Some(value) => value,
-        None => return None,
-    };
-
-    match parse_sequencer_receipt_data(receipt) {
-        Ok(receipt) => Some(receipt),
-        Err(error) => {
-            tracing::warn!(
-                operation = op,
-                error = %error,
-                "Failed to parse sequencer receipt; continuing without receipt"
-            );
-            None
-        }
-    }
-}
-
-/// Convert a lexicon ConvoView to an orchestrator ConversationView.
-fn parse_conversation(c: &lexicon::defs::ConvoView) -> ConversationView {
-    ConversationView {
-        group_id: c.group_id.to_string(),
-        conversation_id: c.conversation_id.to_string(),
-        epoch: c.epoch as u64,
-        members: c
-            .members
-            .iter()
-            .map(|m| MemberView {
-                did: m.user_did.as_str().to_string(),
-                role: if m.is_admin {
-                    MemberRole::Admin
-                } else {
-                    MemberRole::Member
-                },
-            })
-            .collect(),
-        // Metadata cutover: ConvoView no longer carries plaintext metadata.
-        // Name/description live in the encrypted metadata blob, fetched
-        // separately via getGroupMetadataBlob (parity with catmos-cli / catbird-mls).
-        metadata: None,
-        created_at: Some(c.created_at.as_ref().with_timezone(&chrono::Utc)),
-        updated_at: None,
-        // WS-4 rung 2: per-conversation sequencer DS (ADR-010 D4). Optional on
-        // the wire; older servers omit it.
-        sequencer_did: c.sequencer_did.as_ref().map(|d| d.as_str().to_string()),
-    }
-}
-
-/// Build a `CommitGroupChange` for the wire **without** going through
-/// the buggy `InputData → Input` adapter in `catbird-atproto`.
-///
-/// Why not use `catbird_atproto::catbird::mls_chat::commit_group_change::InputData`?
-/// That adapter types `commit` / `welcome` / `group_info` / `confirmation_tag`
-/// as `Option<String>`, and its `From<InputData> for Input` impl maps them via
-/// `String → bytes::Bytes`. `bytes::Bytes::from(String)` takes the UTF-8 bytes
-/// of the string verbatim — so when callers pass a pre-base64 string, the
-/// bytes field ends up containing the ASCII of the base64 text and the
-/// jacquard serializer then wraps it as `{"$bytes": base64(ASCII-base64)}`,
-/// producing double-encoded commits the server rejects or silently mis-decodes.
-/// Building the lexicon struct directly lets us pass raw
-/// `bytes::Bytes::from(Vec<u8>)` so the single serializer layer does the one
-/// correct base64 encode.
-///
-/// Mirrors the fix shipped in catmos-cli (commit `1ecf9e4`) for the same
-/// class of bug.
-#[allow(clippy::too_many_arguments)]
-fn build_commit_group_change(
-    convo_id: &str,
-    action: &str,
-    commit: Option<Vec<u8>>,
-    welcome: Option<Vec<u8>>,
-    group_info: Option<Vec<u8>>,
-    confirmation_tag: Option<Vec<u8>>,
-    member_dids: Option<Vec<String>>,
-    idempotency_key: Option<String>,
-) -> CommitGroupChange {
-    CommitGroupChange {
-        convo_id: convo_id.to_string().into(),
-        action: CommitGroupChangeAction::from_value(action.to_string().into()),
-        commit: commit.map(bytes::Bytes::from),
-        welcome: welcome.map(bytes::Bytes::from),
-        group_info: group_info.map(bytes::Bytes::from),
-        confirmation_tag: confirmation_tag.map(bytes::Bytes::from),
-        member_dids: member_dids.map(|dids| dids.iter().map(|d| parse_did(d)).collect()),
-        idempotency_key: idempotency_key.map(Into::into),
-        ..Default::default()
-    }
-}
-
-fn build_publish_key_package_input(
-    key_package: &[u8],
-    cipher_suite: &str,
-    expires: Datetime,
-    device_id: Option<&str>,
-) -> lexicon::publish_key_packages::Input {
-    lexicon::publish_key_packages::InputData {
-        action: "publish".to_string(),
-        convo_id: None,
-        device_id: device_id.map(ToOwned::to_owned),
-        key_packages: Some(vec![lexicon::publish_key_packages::KeyPackageItemData {
-            cipher_suite: cipher_suite.to_string(),
-            expires,
-            key_package: key_package.to_vec(),
-        }
-        .into()]),
-        local_hashes: None,
-        reason: None,
-        target_dids: None,
-    }
-    .into()
-}
 
 // -- WasmApiClient ------------------------------------------------------------
 
@@ -358,22 +90,16 @@ impl WasmApiClient {
     ) -> Result<SendMessageResponse> {
         let token = self.auth_header()?;
         let padded_size = ciphertext.len() as u32;
-        // TODO(A7/§5.5): populate confirmation_tag with real MLS state when the
-        // pyramid wiring task (#15 / #18) lands. Currently stubbed to None so the
-        // WASM wrapper compiles against the post-A7 lexicon surface.
-        let input: lexicon::send_message::Input = lexicon::send_message::InputData {
-            convo_id: convo_id.to_string(),
-            ciphertext: ciphertext.to_vec(),
-            confirmation_tag: None,
-            epoch: epoch as usize,
-            msg_id: msg_id.to_string(),
-            padded_size: i64::from(padded_size),
-            delivery: None,
-        }
-        .into();
+        let input = serde_json::json!({
+            "convoId": convo_id,
+            "ciphertext": { "$bytes": B64.encode(ciphertext) },
+            "epoch": epoch,
+            "msgId": msg_id,
+            "paddedSize": padded_size,
+        });
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::send_message::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.sendMessage"))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -400,16 +126,11 @@ impl WasmApiClient {
     /// Check opt-in status for a DID.
     pub async fn get_opt_in_status(&self, did: &str) -> Result<bool> {
         let token = self.auth_header()?;
-        let did = parse_did(did);
-        let input: lexicon::get_opt_in_status::Input = lexicon::get_opt_in_status::InputData {
-            dids: vec![did.clone()],
-        }
-        .into();
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::get_opt_in_status::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getDevices"))
             .bearer_auth(&token)
-            .json(&input)
+            .query(&[("dids", did)])
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -421,29 +142,22 @@ impl WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output =
-            parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput>(body.as_ref())?;
-        let statuses = output.statuses.unwrap_or_default();
-        Ok(statuses
-            .iter()
-            .any(|s| s.did.as_str() == did.as_str() && s.opted_in))
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let devices = output.get("devices").and_then(|v| v.as_array());
+        Ok(devices.map(|d| !d.is_empty()).unwrap_or(false))
     }
 
     /// Opt the current user into MLS chat.
     pub async fn opt_in(&self, device_id: Option<String>) -> Result<()> {
         let token = self.auth_header()?;
-        let input: lexicon::opt_in::Input = lexicon::opt_in::InputData {
-            action: "optIn".into(),
-            allow_followers_bypass: None,
-            allow_following_bypass: None,
-            auto_expire_days: None,
-            device_id: device_id.filter(|id| !id.trim().is_empty()).map(Into::into),
-            dids: None,
-        }
-        .into();
+        let input = serde_json::json!({
+            "action": "optIn",
+            "deviceId": device_id.filter(|id| !id.trim().is_empty()),
+        });
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::opt_in::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.enrollDevice"))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -456,11 +170,6 @@ impl WasmApiClient {
     }
 
     /// Upload an encrypted group metadata blob keyed by a client-generated locator.
-    ///
-    /// Optional `metadata_version` and `kind` query params let the server bind
-    /// the upload to a specific epoch/version (so concurrent committers don't
-    /// clobber each other) and distinguish metadata blobs from avatar blobs
-    /// (`kind = "avatar"` mirrors the iOS contract).
     pub async fn put_group_metadata_blob(
         &self,
         blob_locator: &str,
@@ -481,7 +190,7 @@ impl WasmApiClient {
         }
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::put_group_metadata_blob::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.uploadBlob"))
             .bearer_auth(&token)
             .query(&query)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -498,18 +207,24 @@ impl WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::put_group_metadata_blob::PutGroupMetadataBlobOutput,
-        >(body.as_ref())?;
-        let size = usize::try_from(output.size)
-            .map_err(|_| OrchestratorError::Api("metadata blob size out of range".into()))?;
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let locator = output
+            .get("blobLocator")
+            .or_else(|| output.get("blobId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(blob_locator)
+            .to_string();
+        let size = output
+            .get("size")
+            .and_then(|v| v.as_u64())
+            .map(|s| s as usize)
+            .unwrap_or(encrypted_blob.len());
 
-        Ok((output.blob_locator.to_string(), size))
+        Ok((locator, size))
     }
 
     /// Fetch an encrypted group metadata blob by locator.
-    ///
-    /// Optional `metadata_version` and `kind` mirror the iOS contract.
     pub async fn get_group_metadata_blob(
         &self,
         blob_locator: &str,
@@ -529,7 +244,7 @@ impl WasmApiClient {
         }
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_group_metadata_blob::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getBlob"))
             .bearer_auth(&token)
             .query(&query)
             .send()
@@ -552,7 +267,7 @@ impl WasmApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_group_metadata_blob::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getBlob"))
             .bearer_auth(&token)
             .query(&[("groupId", group_id)])
             .send()
@@ -570,12 +285,12 @@ impl WasmApiClient {
         Ok(body.to_vec())
     }
 
-    /// Upload a generic opaque blob. The server assigns the final blob ID.
+    /// Upload a generic opaque blob (file attachment, avatar, etc.).
     pub async fn upload_blob(&self, data: &[u8]) -> Result<(String, usize)> {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::upload_blob::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.uploadBlob"))
             .bearer_auth(&token)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(data.to_vec())
@@ -591,13 +306,21 @@ impl WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::upload_blob::UploadBlobOutput>(
-            body.as_ref(),
-        )?;
-        let size = usize::try_from(output.size)
-            .map_err(|_| OrchestratorError::Api("blob size out of range".into()))?;
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let blob_id = output
+            .get("blobId")
+            .or_else(|| output.get("blobLocator"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let size = output
+            .get("size")
+            .and_then(|v| v.as_u64())
+            .map(|s| s as usize)
+            .unwrap_or(data.len());
 
-        Ok((output.blob_id.to_string(), size))
+        Ok((blob_id, size))
     }
 
     /// Fetch a generic opaque blob by blob ID.
@@ -605,7 +328,7 @@ impl WasmApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_blob::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getBlob"))
             .bearer_auth(&token)
             .query(&[("blobId", blob_id)])
             .send()
@@ -624,33 +347,21 @@ impl WasmApiClient {
     }
 
     /// Send an `updateMetadata` commit to the server (MLS metadata cutover).
-    ///
-    /// Mirrors `add_members` in the trait impl below: uses
-    /// `build_commit_group_change` directly with `action = "updateMetadata"`
-    /// to avoid the `String → bytes::Bytes` UTF-8 double-encoding bug from
-    /// the catbird-atproto adapter.
-    ///
-    /// Returns `(success, new_epoch)` so callers can decide whether to merge
-    /// the local pending commit, clear it, or surface an error.
     pub async fn commit_update_metadata(
         &self,
         convo_id: &str,
         commit_data: &[u8],
     ) -> Result<(bool, u64)> {
         let token = self.auth_header()?;
-        let input = build_commit_group_change(
-            convo_id,
-            "updateMetadata",
-            Some(commit_data.to_vec()),
-            None, // no welcome
-            None, // no group_info
-            None, // confirmation_tag stubbed (TODO A7)
-            None, // no member_dids change
-            Some(uuid::Uuid::new_v4().to_string()),
-        );
+        let input = serde_json::json!({
+            "action": "updateMetadata",
+            "convoId": convo_id,
+            "commit": { "$bytes": B64.encode(commit_data) },
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+        });
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -663,14 +374,11 @@ impl WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput,
-        >(body.as_ref())?;
-        let new_epoch = output
-            .new_epoch
-            .and_then(|epoch| u64::try_from(epoch).ok())
-            .unwrap_or(0);
-        Ok((output.success, new_epoch))
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let new_epoch = output.get("newEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
+        let success = output.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+        Ok((success, new_epoch))
     }
 }
 
@@ -693,19 +401,16 @@ impl MLSAPIClient for WasmApiClient {
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
         let token = self.auth_header()?;
-        let mut url = format!(
-            "{}?limit={}",
-            self.xrpc_url(lexicon::get_convos::NSID),
-            limit
-        );
+        let mut query = vec![("limit", limit.to_string())];
         if let Some(c) = cursor {
-            url.push_str(&format!("&cursor={}", c));
+            query.push(("pageCursor", c.to_string()));
         }
 
         let resp = self
             .client
-            .get(&url)
+            .get(self.xrpc_url("blue.catbird.chat.getConversations"))
             .bearer_auth(&token)
+            .query(&query)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -717,18 +422,44 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::get_convos::GetConvosOutput>(
-            body.as_ref(),
-        )?;
-        let conversations = output
-            .conversations
-            .iter()
-            .map(parse_conversation)
-            .collect();
+
+        let output: blue_catbird::chat::get_conversations::GetConversationsOutput<String> =
+            serde_json::from_slice(&body)
+                .map_err(|e| OrchestratorError::Api(format!("getConversations parse: {e}")))?;
+
+        let mut conversations = Vec::new();
+        for item in output.items {
+            if let blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(state_item) = item {
+                let s = state_item.state;
+                let coords = s.coordinates;
+                let members = s
+                    .participants
+                    .into_iter()
+                    .map(|p| MemberView {
+                        did: p.user_did.to_string(),
+                        role: if p.role.eq_ignore_ascii_case("admin") {
+                            MemberRole::Admin
+                        } else {
+                            MemberRole::Member
+                        },
+                    })
+                    .collect();
+                conversations.push(ConversationView {
+                    group_id: hex::encode(coords.group_id.as_ref()),
+                    conversation_id: coords.conversation_id.to_string(),
+                    epoch: coords.epoch.max(0) as u64,
+                    members,
+                    metadata: None,
+                    created_at: None,
+                    updated_at: None,
+                    sequencer_did: None,
+                });
+            }
+        }
 
         Ok(ConversationListPage {
             conversations,
-            cursor: output.cursor.as_ref().map(|cursor| cursor.to_string()),
+            cursor: output.next_page_cursor,
         })
     }
 
@@ -736,31 +467,25 @@ impl MLSAPIClient for WasmApiClient {
         &self,
         group_id: &str,
         initial_members: Option<&[String]>,
-        // Metadata cutover: createConvo no longer accepts inline metadata; the
-        // name/description now travel in an encrypted blob published separately.
         _metadata: Option<&ConversationMetadata>,
         _commit_data: Option<&[u8]>,
         welcome_data: Option<&[u8]>,
     ) -> Result<CreateConversationResult> {
         let token = self.auth_header()?;
-        let input: lexicon::create_convo::Input = lexicon::create_convo::InputData {
-            group_id: group_id.to_string(),
-            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
-            initial_members: initial_members
-                .map(|members| members.iter().map(|d| parse_did(d)).collect()),
-            // TODO: publish the encrypted metadata blob via updateConvo after creation.
-            welcome_message: welcome_data.map(|w| B64.encode(w)),
-            current_epoch: None,
-            key_package_hashes: None,
-            group_info: None,
+        let mut req = serde_json::json!({
+            "groupId": group_id,
+            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+            "members": initial_members.unwrap_or(&[]),
+        });
+        if let Some(welcome) = welcome_data {
+            req["welcomeMessage"] = serde_json::json!({ "$bytes": B64.encode(welcome) });
         }
-        .into();
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::create_convo::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.createConversation"))
             .bearer_auth(&token)
-            .json(&input)
+            .json(&req)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -772,12 +497,40 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::create_convo::CreateConvoOutput>(
-            body.as_ref(),
-        )?;
-        let conversation = parse_conversation(&output.convo);
+        let output: blue_catbird::chat::create_conversation::CreateConversationOutput<String> =
+            serde_json::from_slice(&body)
+                .map_err(|e| OrchestratorError::Api(format!("createConversation parse: {e}")))?;
+
+        let (group_id, conversation_id, epoch) = match output.result {
+            blue_catbird::chat::ConversationCreationResult::ConversationCreatedResult(res) => {
+                let coords = res.coordinates;
+                (
+                    hex::encode(coords.group_id.as_ref()),
+                    coords.conversation_id.to_string(),
+                    coords.epoch.max(0) as u64,
+                )
+            }
+            blue_catbird::chat::ConversationCreationResult::ExistingDirectConversationResult(res) => {
+                let coords = res.coordinates;
+                (
+                    hex::encode(coords.group_id.as_ref()),
+                    coords.conversation_id.to_string(),
+                    coords.epoch.max(0) as u64,
+                )
+            }
+        };
+
         Ok(CreateConversationResult {
-            conversation,
+            conversation: ConversationView {
+                group_id,
+                conversation_id,
+                epoch,
+                members: vec![],
+                metadata: None,
+                created_at: None,
+                updated_at: None,
+                sequencer_did: None,
+            },
             commit_data: None,
             welcome_data: None,
         })
@@ -785,15 +538,12 @@ impl MLSAPIClient for WasmApiClient {
 
     async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
         let token = self.auth_header()?;
-        let input: lexicon::leave_convo::Input = lexicon::leave_convo::InputData {
-            convo_id: convo_id.to_string(),
-            commit: None,
-            target_did: None,
-        }
-        .into();
+        let input = serde_json::json!({
+            "convoId": convo_id,
+        });
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::leave_convo::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.requestLeave"))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -813,26 +563,19 @@ impl MLSAPIClient for WasmApiClient {
         welcome_data: Option<&[u8]>,
     ) -> Result<AddMembersServerResult> {
         let token = self.auth_header()?;
-        // TODO(A7): confirmation_tag + epoch_authenticator stubbed as None;
-        // real values require MLS state computation (deferred with #15/#18).
-        //
-        // NOTE: uses `build_commit_group_change` directly instead of the
-        // `InputData → Input` adapter in `catbird-atproto` to avoid the
-        // `String → bytes::Bytes` UTF-8-copy double-base64-encoding bug
-        // (see helper doc comment).
-        let input = build_commit_group_change(
-            convo_id,
-            "addMembers",
-            Some(commit_data.to_vec()),
-            welcome_data.map(|w| w.to_vec()),
-            None,
-            None,
-            Some(member_dids.to_vec()),
-            Some(uuid::Uuid::new_v4().to_string()),
-        );
+        let mut input = serde_json::json!({
+            "action": "addMembers",
+            "convoId": convo_id,
+            "memberDids": member_dids,
+            "commit": { "$bytes": B64.encode(commit_data) },
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+        });
+        if let Some(welcome) = welcome_data {
+            input["welcome"] = serde_json::json!({ "$bytes": B64.encode(welcome) });
+        }
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -845,16 +588,14 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput,
-        >(body.as_ref())?;
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let success = output.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+        let new_epoch = output.get("newEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
         Ok(AddMembersServerResult {
-            success: output.success,
-            new_epoch: output
-                .new_epoch
-                .and_then(|epoch| u64::try_from(epoch).ok())
-                .unwrap_or(0),
-            receipt: parse_commit_group_change_receipt(&output, "add_members"),
+            success,
+            new_epoch,
+            receipt: None,
         })
     }
 
@@ -865,17 +606,15 @@ impl MLSAPIClient for WasmApiClient {
         commit_data: &[u8],
     ) -> Result<()> {
         let token = self.auth_header()?;
-        // v2 removal flows through leaveConvo with targetDid set per member.
         for did in member_dids {
-            let input: lexicon::leave_convo::Input = lexicon::leave_convo::InputData {
-                convo_id: convo_id.to_string(),
-                commit: Some(B64.encode(commit_data)),
-                target_did: Some(parse_did(did)),
-            }
-            .into();
+            let input = serde_json::json!({
+                "convoId": convo_id,
+                "commit": { "$bytes": B64.encode(commit_data) },
+                "targetDid": did,
+            });
             let resp = self
                 .client
-                .post(self.xrpc_url(lexicon::leave_convo::NSID))
+                .post(self.xrpc_url("blue.catbird.chat.requestLeave"))
                 .bearer_auth(&token)
                 .json(&input)
                 .send()
@@ -915,64 +654,59 @@ impl MLSAPIClient for WasmApiClient {
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
-        message_type: Option<&str>,
-        from_epoch: Option<u32>,
-        to_epoch: Option<u32>,
+        _message_type: Option<&str>,
+        _from_epoch: Option<u32>,
+        _to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
         let token = self.auth_header()?;
-        let mut url = format!(
-            "{}?convoId={}&limit={}",
-            self.xrpc_url(lexicon::get_messages::NSID),
-            convo_id,
-            limit
-        );
-        if let Some(c) = cursor {
-            url.push_str(&format!("&sinceSeq={}", c));
-        }
-        if let Some(t) = message_type {
-            url.push_str(&format!("&type={}", t));
-        }
-        if let Some(from) = from_epoch {
-            url.push_str(&format!("&fromEpoch={}", from));
-        }
-        if let Some(to) = to_epoch {
-            url.push_str(&format!("&toEpoch={}", to));
-        }
-
+        let after_seq = cursor.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let query = vec![
+            ("conversationId", convo_id.to_string()),
+            ("afterSeq", after_seq.to_string()),
+            ("limit", limit.to_string()),
+        ];
         let resp = self
             .client
-            .get(&url)
+            .get(self.xrpc_url("blue.catbird.chat.getEntries"))
             .bearer_auth(&token)
+            .query(&query)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         if !resp.status().is_success() {
             return Err(self.handle_error(resp).await);
         }
-
         let body = resp
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::get_messages::GetMessagesOutput>(
-            body.as_ref(),
-        )?;
-        let envelopes = output
-            .messages
-            .iter()
-            .map(|m| {
-                let timestamp = m.created_at.as_ref().with_timezone(&chrono::Utc);
-                IncomingEnvelope {
-                    conversation_id: m.convo_id.to_string(),
-                    sender_did: String::new(), // Dumb DS — sender unknown
-                    ciphertext: m.ciphertext.to_vec(),
-                    timestamp,
-                    server_message_id: Some(m.id.to_string()),
-                    server_epoch: Some(m.epoch as u64),
-                }
-            })
-            .collect();
-        let next_cursor = output.last_seq.map(|seq| seq.to_string());
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let mut envelopes = Vec::new();
+        if let Some(entries) = output.get("entries").and_then(|v| v.as_array()) {
+            for entry in entries {
+                let entry_id = entry.get("entryId").and_then(|v| v.as_str()).unwrap_or("");
+                let epoch = entry.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ct_bytes = entry.get("ciphertext").and_then(|v| {
+                    if let Some(s) = v.as_str() {
+                        B64.decode(s).ok()
+                    } else if let Some(b) = v.get("$bytes").and_then(|b| b.as_str()) {
+                        B64.decode(b).ok()
+                    } else {
+                        None
+                    }
+                }).unwrap_or_default();
+                envelopes.push(IncomingEnvelope {
+                    conversation_id: convo_id.to_string(),
+                    sender_did: String::new(),
+                    ciphertext: ct_bytes,
+                    timestamp: chrono::Utc::now(),
+                    server_message_id: Some(entry_id.to_string()),
+                    server_epoch: Some(epoch),
+                });
+            }
+        }
+        let next_cursor = output.get("nextAfterSeq").map(|v| v.to_string());
         Ok((envelopes, next_cursor))
     }
 
@@ -984,15 +718,19 @@ impl MLSAPIClient for WasmApiClient {
         device_id: Option<&str>,
     ) -> Result<()> {
         let token = self.auth_header()?;
-        let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
-            .map(Datetime::new)
-            .map_err(|e| OrchestratorError::Api(format!("Invalid expires timestamp: {e}")))?;
-        let input = build_publish_key_package_input(key_package, cipher_suite, expires, device_id);
+        let body = serde_json::json!({
+            "keyPackages": [{
+                "cipherSuite": cipher_suite,
+                "expiresAt": expires_at,
+                "data": { "$bytes": B64.encode(key_package) },
+            }],
+            "deviceId": device_id,
+        });
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::publish_key_packages::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.replenishKeyPackages"))
             .bearer_auth(&token)
-            .json(&input)
+            .json(&body)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -1004,15 +742,12 @@ impl MLSAPIClient for WasmApiClient {
 
     async fn get_key_packages(&self, dids: &[String]) -> Result<Vec<KeyPackageRef>> {
         let token = self.auth_header()?;
-        let url = format!(
-            "{}?dids={}",
-            self.xrpc_url(lexicon::get_key_packages::NSID),
-            dids.join(",")
-        );
+        let dids_str = dids.join(",");
         let resp = self
             .client
-            .get(&url)
+            .get(self.xrpc_url("blue.catbird.chat.getKeyPackages"))
             .bearer_auth(&token)
+            .query(&[("dids", dids_str.as_str())])
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -1023,30 +758,38 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_key_packages::GetKeyPackagesOutput,
-        >(body.as_ref())?;
-        Ok(output
-            .key_packages
-            .iter()
-            .filter_map(|kp| {
-                // post-regen: key_package is raw bytes::Bytes, no base64 decode needed.
-                let kp_data = kp.key_package.to_vec();
-                Some(KeyPackageRef {
-                    did: kp.did.as_str().to_string(),
-                    key_package_data: kp_data,
-                    hash: kp.key_package_hash.as_ref().map(|hash| hash.to_string()),
-                    cipher_suite: kp.cipher_suite.to_string(),
-                })
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let kps = output.get("keyPackages").and_then(|v| v.as_array()).ok_or_else(|| {
+            OrchestratorError::Api("missing keyPackages".into())
+        })?;
+        Ok(kps.iter().filter_map(|kp| {
+            let did = kp.get("did").and_then(|v| v.as_str())?.to_string();
+            let kp_data = kp.get("keyPackage").and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    B64.decode(s).ok()
+                } else if let Some(b) = v.get("$bytes").and_then(|b| b.as_str()) {
+                    B64.decode(b).ok()
+                } else {
+                    None
+                }
+            })?;
+            let hash = kp.get("keyPackageHash").and_then(|v| v.as_str()).map(str::to_string);
+            let cipher_suite = kp.get("cipherSuite").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Some(KeyPackageRef {
+                did,
+                key_package_data: kp_data,
+                hash,
+                cipher_suite,
             })
-            .collect())
+        }).collect())
     }
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_key_package_status::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getDevices"))
             .bearer_auth(&token)
             .query(&[("include", "stats")])
             .send()
@@ -1059,15 +802,16 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_key_package_status::GetKeyPackageStatusOutput,
-        >(body.as_ref())?;
-        let stats = output.stats.ok_or_else(|| {
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let stats = output.get("stats").and_then(|v| v.as_object()).ok_or_else(|| {
             OrchestratorError::Api("missing stats in key package response".into())
         })?;
-        let available = u32::try_from(stats.total_available.max(0)).unwrap_or(u32::MAX);
-        let total_consumed = u32::try_from(stats.total_consumed.max(0)).unwrap_or(u32::MAX);
-        let total = available.saturating_add(total_consumed);
+        let parse_u32 = |key: &str| -> u32 {
+            stats.get(key).and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0) as u32
+        };
+        let available = parse_u32("available");
+        let total = if parse_u32("total") > 0 { parse_u32("total") } else { parse_u32("published").max(available) };
         Ok(KeyPackageStats { available, total })
     }
 
@@ -1076,7 +820,6 @@ impl MLSAPIClient for WasmApiClient {
         _local_hashes: &[String],
         _device_id: &str,
     ) -> Result<KeyPackageSyncResult> {
-        // Not implemented on server yet
         Ok(KeyPackageSyncResult {
             orphaned_count: 0,
             deleted_count: 0,
@@ -1092,29 +835,26 @@ impl MLSAPIClient for WasmApiClient {
         key_packages: &[Vec<u8>],
     ) -> Result<DeviceInfo> {
         let token = self.auth_header()?;
-        let kp_items: Vec<lexicon::register_device::KeyPackageItem> = key_packages
+        let kp_items: Vec<serde_json::Value> = key_packages
             .iter()
             .map(|kp| {
-                lexicon::register_device::KeyPackageItemData {
-                    cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
-                    expires: Datetime::new(
-                        (chrono::Utc::now() + chrono::Duration::days(90)).fixed_offset(),
-                    ),
-                    key_package: kp.clone(),
-                }
-                .into()
+                let expires_str = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
+                serde_json::json!({
+                    "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                    "expiresAt": expires_str,
+                    "data": { "$bytes": B64.encode(kp) },
+                })
             })
             .collect();
-        let input: lexicon::register_device::Input = lexicon::register_device::InputData {
-            device_uuid: Some(device_uuid.to_string()),
-            device_name: device_name.to_string(),
-            signature_public_key: signature_key.to_vec(),
-            key_packages: kp_items,
-        }
-        .into();
+        let input = serde_json::json!({
+            "deviceUuid": device_uuid,
+            "deviceName": device_name,
+            "signaturePublicKey": { "$bytes": B64.encode(signature_key) },
+            "keyPackages": kp_items,
+        });
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::register_device::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.enrollDevice"))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -1127,12 +867,13 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::register_device::RegisterDeviceOutput,
-        >(body.as_ref())?;
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let device_id = output.get("deviceId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mls_did = output.get("mlsDid").or_else(|| output.get("credentialDid")).and_then(|v| v.as_str()).unwrap_or("").to_string();
         Ok(DeviceInfo {
-            device_id: output.device_id.to_string(),
-            mls_did: output.mls_did.to_string(),
+            device_id,
+            mls_did,
             device_uuid: device_uuid.to_string(),
             created_at: None,
         })
@@ -1142,7 +883,7 @@ impl MLSAPIClient for WasmApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::list_devices::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getDevices"))
             .bearer_auth(&token)
             .send()
             .await
@@ -1154,35 +895,29 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::list_devices::ListDevicesOutput>(
-            body.as_ref(),
-        )?;
-        Ok(output
-            .devices
-            .iter()
-            .map(|d| DeviceInfo {
-                device_id: d.device_id.to_string(),
-                mls_did: d.credential_did.to_string(),
-                device_uuid: d
-                    .device_uuid
-                    .as_ref()
-                    .map(|uuid| uuid.to_string())
-                    .unwrap_or_default(),
-                created_at: Some(d.registered_at.as_ref().with_timezone(&chrono::Utc)),
-            })
-            .collect())
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let devices = output.get("devices").and_then(|v| v.as_array()).ok_or_else(|| {
+            OrchestratorError::Api("missing devices in response".into())
+        })?;
+        Ok(devices.iter().map(|d| DeviceInfo {
+            device_id: d.get("deviceId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            mls_did: d.get("credentialDid").or_else(|| d.get("mlsDid")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            device_uuid: d.get("deviceUuid").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            created_at: None,
+        }).collect())
     }
 
     async fn remove_device(&self, device_id: &str) -> Result<()> {
         let token = self.auth_header()?;
+        let body = serde_json::json!({
+            "deviceId": device_id,
+        });
         let resp = self
             .client
-            .request(
-                reqwest::Method::DELETE,
-                self.xrpc_url(lexicon::list_devices::NSID),
-            )
+            .post(self.xrpc_url("blue.catbird.chat.revokeDevice"))
             .bearer_auth(&token)
-            .query(&[("deviceId", device_id)])
+            .json(&body)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -1194,21 +929,14 @@ impl MLSAPIClient for WasmApiClient {
 
     async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
         let token = self.auth_header()?;
-        // See `build_commit_group_change` doc: direct construction avoids the
-        // double-base64 bug in the InputData adapter's String → Bytes mapping.
-        let input = build_commit_group_change(
-            convo_id,
-            "updateGroupInfo",
-            None,
-            None,
-            Some(group_info.to_vec()),
-            None,
-            None,
-            None,
-        );
+        let input = serde_json::json!({
+            "action": "updateGroupInfo",
+            "convoId": convo_id,
+            "groupInfo": { "$bytes": B64.encode(group_info) },
+        });
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -1224,9 +952,9 @@ impl MLSAPIClient for WasmApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_group_state::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getConversationState"))
             .bearer_auth(&token)
-            .query(&[("convoId", convo_id), ("include", "groupInfo,epoch")])
+            .query(&[("conversationId", convo_id), ("include", "groupInfo,epoch")])
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -1237,24 +965,27 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_group_state::GetGroupStateOutput,
-        >(body.as_ref())?;
-        // post-regen: group_info is raw bytes::Bytes; no base64 decode.
-        output
-            .group_info
-            .as_ref()
-            .map(|value| value.to_vec())
-            .ok_or_else(|| OrchestratorError::Api("missing groupInfo in group state".into()))
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let bytes = output.get("groupInfo").and_then(|v| {
+            if let Some(s) = v.as_str() {
+                B64.decode(s).ok()
+            } else if let Some(b) = v.get("$bytes").and_then(|b| b.as_str()) {
+                B64.decode(b).ok()
+            } else {
+                None
+            }
+        }).ok_or_else(|| OrchestratorError::Api("missing groupInfo in group state".into()))?;
+        Ok(bytes)
     }
 
     async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_group_state::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getConversationState"))
             .bearer_auth(&token)
-            .query(&[("convoId", convo_id), ("include", "welcome")])
+            .query(&[("conversationId", convo_id), ("include", "welcome")])
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -1265,17 +996,21 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_group_state::GetGroupStateOutput,
-        >(body.as_ref())?;
-        // post-regen: welcome is raw bytes::Bytes; no base64 decode.
-        match output.welcome.as_ref().map(|value| value.to_vec()) {
-            Some(bytes) => Ok(bytes),
-            None => Err(OrchestratorError::ServerError {
-                status: 404,
-                body: r#"{"error":"NotFound","message":"No welcome available"}"#.to_string(),
-            }),
-        }
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let bytes = output.get("welcome").and_then(|v| {
+            if let Some(s) = v.as_str() {
+                B64.decode(s).ok()
+            } else if let Some(b) = v.get("$bytes").and_then(|b| b.as_str()) {
+                B64.decode(b).ok()
+            } else {
+                None
+            }
+        }).ok_or_else(|| OrchestratorError::ServerError {
+            status: 404,
+            body: r#"{"error":"NotFound","message":"No welcome available"}"#.to_string(),
+        })?;
+        Ok(bytes)
     }
 
     async fn get_delivery_status(
@@ -1287,10 +1022,6 @@ impl MLSAPIClient for WasmApiClient {
         Ok(vec![])
     }
 
-    // TODO(test-gap): no unit coverage — `catbird-mls-web` has cdylib-only
-    // crate-type and uses sqlite-wasm-rs OPFS VFS that doesn't run on host.
-    // Verified by inspection against catmos/src-tauri/src/api_client.rs:567
-    // and catbird-mls/src/orchestrator/recovery.rs:898 (`report_unrecoverable_local`).
     async fn report_recovery_failure(
         &self,
         convo_id: &str,
@@ -1313,7 +1044,7 @@ impl MLSAPIClient for WasmApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.reportRecoveryFailure"))
+            .post(self.xrpc_url("blue.catbird.chat.requestLeafRecovery"))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -1328,8 +1059,6 @@ impl MLSAPIClient for WasmApiClient {
         let status_code = status.as_u16();
         let body_text = resp.text().await.unwrap_or_default();
 
-        // 403 = caller is no longer a member; treat as soft-ack so the
-        // orchestrator's best-effort reporter doesn't keep retrying.
         if status_code == 403 {
             tracing::info!(
                 convo_id,
@@ -1361,30 +1090,21 @@ impl MLSAPIClient for WasmApiClient {
         confirmation_tag: Option<&str>,
     ) -> Result<ProcessExternalCommitResult> {
         let token = self.auth_header()?;
-        // See `build_commit_group_change` doc: direct construction avoids the
-        // double-base64 bug in the InputData adapter's String → Bytes mapping.
-        //
-        // `confirmation_tag` is passed as `Option<&str>` from the orchestrator.
-        // Byte-preserving mapping: `s.as_bytes().to_vec()` produces the same
-        // wire bytes the buggy adapter was emitting (UTF-8 of the string).
-        // Whether the caller intends those bytes to be interpreted as ASCII
-        // or pre-base64 is a separate concern tracked outside this fix — the
-        // InputData adapter's behaviour was the same on that field, so this
-        // fix is strictly additive for that field. Commit/welcome/group_info
-        // are the wire-level correctness targets here.
-        let input = build_commit_group_change(
-            convo_id,
-            "externalCommit",
-            Some(commit_data.to_vec()),
-            None,
-            group_info.map(|value| value.to_vec()),
-            confirmation_tag.map(|s| s.as_bytes().to_vec()),
-            None,
-            Some(uuid::Uuid::new_v4().to_string()),
-        );
+        let mut input = serde_json::json!({
+            "action": "externalCommit",
+            "convoId": convo_id,
+            "commit": { "$bytes": B64.encode(commit_data) },
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+        });
+        if let Some(gi) = group_info {
+            input["groupInfo"] = serde_json::json!({ "$bytes": B64.encode(gi) });
+        }
+        if let Some(tag) = confirmation_tag {
+            input["confirmationTag"] = serde_json::json!(tag);
+        }
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
+            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -1397,20 +1117,18 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput,
-        >(body.as_ref())?;
+        let output: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let new_epoch = output.get("newEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
+        let rejoined_at = output.get("rejoinedAt").and_then(|v| v.as_str()).unwrap_or("").to_string();
         Ok(ProcessExternalCommitResult {
-            epoch: output
-                .new_epoch
-                .and_then(|value| u64::try_from(value).ok())
-                .unwrap_or(0),
-            rejoined_at: output
-                .rejoined_at
-                .as_ref()
-                .map(|value| value.as_ref().to_string())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-            receipt: parse_commit_group_change_receipt(&output, "process_external_commit"),
+            epoch: new_epoch,
+            rejoined_at: if rejoined_at.is_empty() {
+                chrono::Utc::now().to_rfc3339()
+            } else {
+                rejoined_at
+            },
+            receipt: None,
         })
     }
 }
@@ -1420,27 +1138,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn publish_key_package_input_preserves_exact_device_scope() {
-        let expires = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
-            .map(Datetime::new)
-            .expect("literal timestamp");
-        let input = build_publish_key_package_input(
-            b"key-package",
-            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            expires,
-            Some("018f3f6a-7b2c-4d91-8a5e-0f123456789a"),
-        );
-
-        assert_eq!(
-            input.device_id.as_ref().map(AsRef::as_ref),
-            Some("018f3f6a-7b2c-4d91-8a5e-0f123456789a")
-        );
-        assert_eq!(input.action.as_ref(), "publish");
-        assert_eq!(
-            input.key_packages.expect("one package")[0]
-                .key_package
-                .as_ref(),
-            b"key-package"
-        );
+    fn wasm_api_client_can_construct() {
+        let client = WasmApiClient::new("http://localhost:8080".to_string());
+        assert_eq!(client.base_url, "http://localhost:8080");
     }
 }

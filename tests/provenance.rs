@@ -75,7 +75,7 @@ fn vendored_schema_embeds_approved_petrel_provenance() {
         provenance["sourceRevision"]
             .as_str()
             .expect("source revision"),
-        "954d7ab20f362b731ee13f87eea89ae83558c624",
+        "13c0f5b8a108955dd705b3d682b27303a0962c58",
         "schema source revision must match the approved Petrel head"
     );
     assert_eq!(

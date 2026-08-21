@@ -709,25 +709,58 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
         device_uuid
     ));
 
-    // 4. Register device with server
-    let device_info = api_client
-        .register_device(
-            &device_uuid,
-            "Catbird Web",
-            &user_did,
-            &kp_result.hash_ref,
-            std::slice::from_ref(&kp_result.key_package_data),
-        )
+    // 4. Register device with server via prepared request
+    let expires_str = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
+    let input = serde_json::json!({
+        "deviceUuid": device_uuid,
+        "deviceName": "Catbird Web",
+        "signaturePublicKey": { "$bytes": B64.encode(&kp_result.hash_ref) },
+        "keyPackages": [{
+            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+            "expiresAt": expires_str,
+            "data": { "$bytes": B64.encode(&kp_result.key_package_data) },
+        }],
+    });
+    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::EnrollDevice,
+        method: "POST".to_string(),
+        path: "/xrpc/blue.catbird.chat.enrollDevice".to_string(),
+        authorization: String::new(),
+        dpop: String::new(),
+        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
+    };
+    let response = api_client
+        .submit_prepared_request(req)
         .await
         .map_err(|e| js_err!("Device registration failed: {:?}", e))?;
+    if response.status != 200 {
+        return Err(js_err!(
+            "Device registration failed with status {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ));
+    }
+    let output: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(|e| js_err!("JSON decode: {:?}", e))?;
+    let server_device_id = output
+        .get("deviceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&device_uuid)
+        .to_string();
+    let mls_did = output
+        .get("mlsDid")
+        .or_else(|| output.get("credentialDid"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(&user_did)
+        .to_string();
 
     // 5. Store credentials
     credentials
-        .store_mls_did(&user_did, &device_info.mls_did)
+        .store_mls_did(&user_did, &mls_did)
         .await
         .map_err(|e| js_err!("store_mls_did failed: {:?}", e))?;
     credentials
-        .store_device_uuid(&user_did, &device_info.device_id)
+        .store_device_uuid(&user_did, &server_device_id)
         .await
         .map_err(|e| js_err!("store_device_uuid failed: {:?}", e))?;
     credentials
@@ -750,18 +783,36 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
         })?;
 
         let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
-        match api_client
-            .publish_key_package(
-                &kp.key_package_data,
-                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                &expires_at,
-                Some(&device_info.device_id),
-            )
-            .await
-        {
-            Ok(()) => {
+        let replenish_input = serde_json::json!({
+            "keyPackages": [{
+                "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "expiresAt": expires_at,
+                "data": { "$bytes": B64.encode(&kp.key_package_data) },
+            }],
+            "deviceId": server_device_id,
+        });
+        let replenish_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+            operation:
+                catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ReplenishKeyPackages,
+            method: "POST".to_string(),
+            path: "/xrpc/blue.catbird.chat.replenishKeyPackages".to_string(),
+            authorization: String::new(),
+            dpop: String::new(),
+            body: Some(
+                serde_json::to_vec(&replenish_input).map_err(|e| js_err!("JSON error: {:?}", e))?,
+            ),
+        };
+        match api_client.submit_prepared_request(replenish_req).await {
+            Ok(resp) if resp.status == 200 => {
                 published += 1;
                 LOCAL_KP_COUNT.with(|c| *c.borrow_mut() += 1);
+            }
+            Ok(resp) => {
+                web_sys::console::warn_1(&js_err!(
+                    "Key package publish failed with status {}",
+                    resp.status
+                ));
+                break;
             }
             Err(e) => {
                 web_sys::console::warn_1(&js_err!("Key package publish failed: {:?}", e));
@@ -853,18 +904,30 @@ pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
         });
         match kp_result {
             Ok(kp) => {
-                match api_client
-                    .publish_key_package(
-                        &kp.key_package_data,
-                        cipher_suite,
-                        &expires_at,
-                        device_uuid.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(()) => {
+                let replenish_input = serde_json::json!({
+                    "keyPackages": [{
+                        "cipherSuite": cipher_suite,
+                        "expiresAt": expires_at,
+                        "data": { "$bytes": B64.encode(&kp.key_package_data) },
+                    }],
+                    "deviceId": device_uuid.as_deref(),
+                });
+                let replenish_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+                    operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ReplenishKeyPackages,
+                    method: "POST".to_string(),
+                    path: "/xrpc/blue.catbird.chat.replenishKeyPackages".to_string(),
+                    authorization: String::new(),
+                    dpop: String::new(),
+                    body: Some(serde_json::to_vec(&replenish_input).map_err(|e| js_err!("JSON error: {:?}", e))?),
+                };
+                match api_client.submit_prepared_request(replenish_req).await {
+                    Ok(resp) if resp.status == 200 => {
                         published += 1;
                         LOCAL_KP_COUNT.with(|c| *c.borrow_mut() += 1);
+                    }
+                    Ok(resp) => {
+                        web_sys::console::warn_1(&js_err!("Key package publish failed with status {}", resp.status));
+                        break;
                     }
                     Err(e) => {
                         web_sys::console::warn_1(&js_err!(

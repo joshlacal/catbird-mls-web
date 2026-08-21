@@ -503,3 +503,40 @@ export async function prepareSignedCleanChatRequest(
     requestJson,
   )) as PreparedCleanChatRequest
 }
+
+export interface GatewayResponse {
+  status: number
+  contentType?: string | null
+  body: string
+}
+
+/**
+ * Submit an exact WASM-prepared request over the opaque session transport.
+ */
+export async function submitPreparedCleanChatRequest(
+  prepared: PreparedCleanChatRequest,
+  token: string,
+  proxyDid: string = 'did:web:chat.catbird.blue#atproto_mls',
+  baseUrl: string = 'https://api.catbird.blue',
+): Promise<GatewayResponse> {
+  const url = `${baseUrl}${prepared.path}`
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    'atproto-proxy': proxyDid,
+  }
+  if (prepared.body) {
+    headers['Content-Type'] = 'application/json'
+  }
+  const resp = await fetch(url, {
+    method: prepared.method,
+    headers,
+    body: prepared.body,
+  })
+  const body = await resp.text()
+  const contentType = resp.headers.get('content-type')
+  return {
+    status: resp.status,
+    contentType,
+    body,
+  }
+}

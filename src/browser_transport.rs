@@ -179,15 +179,15 @@ pub fn catbird_mls_has_signer_bridge() -> bool {
 /// keys are rejected, never forwarded.
 fn read_query_whitelist(operation: CanonicalOperation) -> &'static [&'static str] {
     match operation {
-        CanonicalOperation::GetConversations => &["limit", "pageCursor"],
-        CanonicalOperation::GetBlob => &["blobId"],
-        CanonicalOperation::GetBlobUsage => &[],
-        CanonicalOperation::GetConversationState => &["conversationId"],
-        CanonicalOperation::GetDevices => &["userDids"],
-        CanonicalOperation::GetEntries => &["afterSeq", "conversationId", "limit"],
-        CanonicalOperation::GetLeafRecoveryInbox => &["inventorySessionId", "limit", "pageCursor"],
-        CanonicalOperation::GetOwnDevices => &["limit", "pageCursor"],
-        CanonicalOperation::GetPendingWelcomes => &["inventorySessionId", "limit", "pageCursor"],
+        CanonicalOperation::GetConversations => &["actorDeviceId", "limit", "pageCursor"],
+        CanonicalOperation::GetBlob => &["actorDeviceId", "blobId"],
+        CanonicalOperation::GetBlobUsage => &["actorDeviceId"],
+        CanonicalOperation::GetConversationState => &["actorDeviceId", "conversationId"],
+        CanonicalOperation::GetDevices => &["actorDeviceId", "userDids"],
+        CanonicalOperation::GetEntries => &["actorDeviceId", "afterSeq", "conversationId", "limit"],
+        CanonicalOperation::GetLeafRecoveryInbox => &["actorDeviceId", "inventorySessionId", "limit", "pageCursor"],
+        CanonicalOperation::GetOwnDevices => &["actorDeviceId", "limit", "pageCursor"],
+        CanonicalOperation::GetPendingWelcomes => &["actorDeviceId", "inventorySessionId", "limit", "pageCursor"],
         _ => &[],
     }
 }

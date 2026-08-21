@@ -678,6 +678,12 @@ impl MLSAPIClient for WasmApiClient {
                 mls_did: current_did.clone(),
                 device_uuid: d.device.key_id.to_string(),
                 created_at: None,
+                key_id: Some(d.device.key_id.to_string()),
+                signature_public_key: Some(d.device.signature_public_key.to_vec()),
+                auth_generation: Some(d.device.auth_generation),
+                status: Some("active".to_string()),
+                available_package_count: Some(d.device.available_package_count.max(0) as u32),
+                reserved_package_count: Some(d.device.reserved_package_count.max(0) as u32),
             })
             .collect())
     }
@@ -727,10 +733,10 @@ impl MLSAPIClient for WasmApiClient {
         blob_locator: &str,
     ) -> Result<Vec<u8>> {
         let token = self.auth_header()?;
-        let url = format!("{}/xrpc/blue.catbird.chat.getBlob?blobId={}", self.base_url, urlencoding::encode(blob_locator));
         let resp = self
             .client
-            .get(&url)
+            .get(self.xrpc_url("blue.catbird.chat.getBlob"))
+            .query(&[("blobId", blob_locator)])
             .bearer_auth(&token)
             .send()
             .await

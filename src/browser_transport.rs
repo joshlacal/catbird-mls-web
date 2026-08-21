@@ -291,8 +291,6 @@ pub fn catbird_mls_prepare_unsigned_request(
         operation,
         method,
         path,
-        authorization: String::new(),
-        dpop: String::new(),
         body,
     };
     serde_wasm_bindgen::to_value(&BrowserPreparedRequest::from(prepared))
@@ -311,7 +309,6 @@ pub async fn catbird_mls_prepare_signed_request(
     let binding = CleanChatSigningContext {
         actor_did: signer.actor_did.clone(),
         device_id: signer.device_id.clone(),
-        dpop_jkt: signer.dpop_jkt.clone(),
         auth_generation: signer.auth_generation,
     };
     // STRICT projection + binding validation FIRST — no signature is produced
@@ -383,7 +380,6 @@ fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {
         "getSubscriptionTicket" => CanonicalOperation::GetSubscriptionTicket,
         "prepareBlobUpload" => CanonicalOperation::PrepareBlobUpload,
         "publishTyping" => CanonicalOperation::PublishTyping,
-        "rebindDeviceAuthentication" => CanonicalOperation::RebindDeviceAuthentication,
         "rejectWelcome" => CanonicalOperation::RejectWelcome,
         "replenishKeyPackages" => CanonicalOperation::ReplenishKeyPackages,
         "requestLeafRecovery" => CanonicalOperation::RequestLeafRecovery,
@@ -422,7 +418,6 @@ fn operation_name(operation: CanonicalOperation) -> &'static str {
         CanonicalOperation::GetSubscriptionTicket => "getSubscriptionTicket",
         CanonicalOperation::PrepareBlobUpload => "prepareBlobUpload",
         CanonicalOperation::PublishTyping => "publishTyping",
-        CanonicalOperation::RebindDeviceAuthentication => "rebindDeviceAuthentication",
         CanonicalOperation::RejectWelcome => "rejectWelcome",
         CanonicalOperation::ReplenishKeyPackages => "replenishKeyPackages",
         CanonicalOperation::RequestLeafRecovery => "requestLeafRecovery",

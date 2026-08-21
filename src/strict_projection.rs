@@ -28,7 +28,6 @@ use catbird_mls::orchestrator::canonical_transport::{
 
 const REPLENISH_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REPLENISH\0";
 const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
-const DEVICE_REBIND_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REBIND\0";
 const DEVICE_REVOKE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REVOKE\0";
 const CREATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-CREATE\0";
 const COMMIT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-COMMIT\0";
@@ -739,39 +738,19 @@ fn validate_projected_binding(
             authenticated: binding.device_id.clone(),
         });
     }
-    validate_jkt(&binding.dpop_jkt)?;
-
     match operation {
         CanonicalOperation::EnrollDevice => {
-            let body_jkt = canonical_text(body, "dpopJkt")?;
-            if body_jkt != binding.dpop_jkt {
-                return Err(TransportError::DpopBindingMismatch);
+            if let Some(CanonicalValue::Text(jkt)) = body.get("dpopJkt") {
+                validate_jkt(jkt)?;
             }
             let expected = canonical_integer(body, "expectedAuthGeneration")?;
             if expected != 0 {
                 return Err(TransportError::InvalidEnrollmentGeneration { actual: expected });
             }
         }
-        CanonicalOperation::RebindDeviceAuthentication => {
-            validate_jkt(canonical_text(body, "currentDpopJkt")?)?;
-            if canonical_text(body, "newDpopJkt")? != binding.dpop_jkt {
-                return Err(TransportError::DpopBindingMismatch);
-            }
-            let actual = canonical_integer(body, "expectedAuthGeneration")?;
-            validate_auth_generation(actual)?;
-            let expected = binding
-                .auth_generation
-                .ok_or(TransportError::MissingAuthGeneration)?;
-            if actual != expected {
-                return Err(TransportError::AuthGenerationMismatch { expected, actual });
-            }
-        }
         _ => {
             if let Some(CanonicalValue::Text(jkt)) = body.get("dpopJkt") {
                 validate_jkt(jkt)?;
-                if *jkt != binding.dpop_jkt {
-                    return Err(TransportError::DpopBindingMismatch);
-                }
             }
             let actual = canonical_integer(body, "authGeneration")?;
             validate_auth_generation(actual)?;
@@ -1025,7 +1004,6 @@ pub(crate) struct SignedBodyProjection {
     pub(crate) body_json: serde_json::Value,
     pub(crate) generated_body_json: serde_json::Value,
     pub(crate) expected_device_id: String,
-    pub(crate) expected_dpop_jkt: String,
     pub(crate) expected_auth_generation: Option<i64>,
 }
 
@@ -1094,11 +1072,6 @@ fn signed_request_spec(
         CanonicalOperation::PublishTyping => SignedRequestSpec {
             domain: TYPING_SIGNATURE_DOMAIN,
             body_type: "blue.catbird.chat.defs#typingBody",
-            variant: None,
-        },
-        CanonicalOperation::RebindDeviceAuthentication => SignedRequestSpec {
-            domain: DEVICE_REBIND_SIGNATURE_DOMAIN,
-            body_type: "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
             variant: None,
         },
         CanonicalOperation::RejectWelcome => SignedRequestSpec {
@@ -1346,7 +1319,6 @@ pub(crate) fn prepare_signed_body(
         body_json: wire_json_ref(definition_name, &projected, true)?,
         generated_body_json,
         expected_device_id: binding.device_id.clone(),
-        expected_dpop_jkt: binding.dpop_jkt.clone(),
         expected_auth_generation: binding.auth_generation,
     })
 }
@@ -1374,8 +1346,8 @@ pub(crate) fn parse_generated_request(
         GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody, GetOwnDevicesRequestBody,
         GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody,
         PrepareBlobUploadRequestBody, PublishTypingRequestBody,
-        RebindDeviceAuthenticationRequestBody, RejectWelcomeRequestBody,
-        ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
+        RejectWelcomeRequestBody, ReplenishKeyPackagesRequestBody,
+        RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
         RequestResetRequestBody, RevokeDeviceRequestBody, SendMessageRequestBody,
         SubmitTransitionRequestBody, SubscribeEventsRequestBody, UploadBlobRequestBody,
     };
@@ -1421,10 +1393,6 @@ pub(crate) fn parse_generated_request(
             parse!(PrepareBlobUploadRequestBody, PrepareBlobUpload)
         }
         CanonicalOperation::PublishTyping => parse!(PublishTypingRequestBody, PublishTyping),
-        CanonicalOperation::RebindDeviceAuthentication => parse!(
-            RebindDeviceAuthenticationRequestBody,
-            RebindDeviceAuthentication
-        ),
         CanonicalOperation::RejectWelcome => parse!(RejectWelcomeRequestBody, RejectWelcome),
         CanonicalOperation::ReplenishKeyPackages => {
             parse!(ReplenishKeyPackagesRequestBody, ReplenishKeyPackages)
@@ -1480,8 +1448,6 @@ pub(crate) fn finish_signed_request(
         operation: prepared.operation,
         method: "POST".into(),
         path: canonical_route(prepared.operation).path.to_owned(),
-        authorization: String::new(),
-        dpop: String::new(),
         body: Some(
             serde_json::to_vec(&wire)
                 .map_err(|error| TransportError::Serialization(error.to_string()))?,

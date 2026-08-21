@@ -466,6 +466,8 @@ impl WasmMLSContext {
             metadata_blob_locator: None,
             metadata_blob_ciphertext: None,
             metadata_version: None,
+            next_confirmation_tag: None,
+            next_group_context_hash: None,
         })
     }
 

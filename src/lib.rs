@@ -48,8 +48,10 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 use api_client::WasmApiClient;
+use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
+use catbird_mls::orchestrator::api_client::MLSAPIClient;
 use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::MLSError;
 use credentials::SqliteCredentialStore;
@@ -725,8 +727,6 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
         operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::EnrollDevice,
         method: "POST".to_string(),
         path: "/xrpc/blue.catbird.chat.enrollDevice".to_string(),
-        authorization: String::new(),
-        dpop: String::new(),
         body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
     };
     let response = api_client
@@ -796,8 +796,6 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
                 catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ReplenishKeyPackages,
             method: "POST".to_string(),
             path: "/xrpc/blue.catbird.chat.replenishKeyPackages".to_string(),
-            authorization: String::new(),
-            dpop: String::new(),
             body: Some(
                 serde_json::to_vec(&replenish_input).map_err(|e| js_err!("JSON error: {:?}", e))?,
             ),
@@ -823,15 +821,15 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
 
     web_sys::console::log_1(&js_err!(
         "catbird-mls-web: device registered! id={}, mls_did={}, key_packages={}",
-        device_info.device_id,
-        device_info.mls_did,
+        server_device_id,
+        mls_did,
         published
     ));
 
     let result = serde_json::json!({
         "status": "registered",
-        "deviceId": device_info.device_id,
-        "mlsDid": device_info.mls_did,
+        "deviceId": server_device_id,
+        "mlsDid": mls_did,
         "keyPackagesPublished": published,
     });
     to_js(&result)
@@ -916,8 +914,6 @@ pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
                     operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ReplenishKeyPackages,
                     method: "POST".to_string(),
                     path: "/xrpc/blue.catbird.chat.replenishKeyPackages".to_string(),
-                    authorization: String::new(),
-                    dpop: String::new(),
                     body: Some(serde_json::to_vec(&replenish_input).map_err(|e| js_err!("JSON error: {:?}", e))?),
                 };
                 match api_client.submit_prepared_request(replenish_req).await {
@@ -1072,16 +1068,32 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
     })?;
 
     // 3. Send external commit to server
-    // TODO(A7): confirmation_tag stubbed as None until pyramid wiring (#15/#18).
-    let server_result = api_client
-        .process_external_commit(
-            convo_id,
-            &ext_commit.commit_data,
-            ext_commit.group_info.as_deref(),
-            None,
-        )
+    let input = serde_json::json!({
+        "action": "externalCommit",
+        "convoId": convo_id,
+        "commit": { "$bytes": B64.encode(&ext_commit.commit_data) },
+        "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+    });
+    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
+        method: "POST".to_string(),
+        path: "/xrpc/blue.catbird.chat.submitTransition".to_string(),
+        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
+    };
+    let response = api_client
+        .submit_prepared_request(req)
         .await
         .map_err(|e| js_err!("process_external_commit failed: {:?}", e))?;
+    if response.status != 200 {
+        return Err(js_err!(
+            "process_external_commit failed with status {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ));
+    }
+    let output: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(|e| js_err!("JSON decode: {:?}", e))?;
+    let server_epoch = output.get("newEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
 
     // 4. Merge pending commit to finalize local state
     let local_epoch = with_state(|s| {
@@ -1096,7 +1108,7 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
     // Cache server epoch so send_message uses it instead of local MLS epoch
     SERVER_EPOCHS.with(|m| {
         m.borrow_mut()
-            .insert(convo_id.to_string(), server_result.epoch)
+            .insert(convo_id.to_string(), server_epoch)
     });
 
     // Publish updated GroupInfo so other clients can also external-commit join
@@ -1127,10 +1139,9 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
 
     web_sys::console::log_1(&js_err!(
         "catbird-mls-web: try_join_group — server_epoch={}, local_epoch={}",
-        server_result.epoch,
+        server_epoch,
         local_epoch
     ));
-
     // MLS metadata cutover: bootstrap encrypted metadata after external
     // commit so the just-joined conversation displays title/description
     // /avatar immediately. Best-effort — never block the join path.
@@ -1148,7 +1159,7 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
 
     Ok(serde_json::json!({
         "status": "joined_via_external_commit",
-        "epoch": server_result.epoch,
+        "epoch": server_epoch,
     }))
 }
 
@@ -1211,7 +1222,6 @@ pub async fn catbird_mls_create_conversation(
     member_dids: Array,
 ) -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
-    use catbird_mls::orchestrator::types::ConversationMetadata;
     use catbird_mls::KeyPackageData;
 
     let (api_client, user_did) = with_state(|s| {
@@ -1238,8 +1248,20 @@ pub async fn catbird_mls_create_conversation(
     let (commit_bytes, welcome_bytes) = if member_dids_vec.is_empty() {
         (None, None)
     } else {
+        let (credentials, user_did) = with_state(|s| {
+            let did = s
+                .user_did
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))?;
+            Ok((Arc::clone(&s.credentials), did))
+        })?;
+        let actor_device_id = credentials
+            .get_device_uuid(&user_did)
+            .await
+            .unwrap_or_default()
+            .unwrap_or_default();
         let kp_refs = api_client
-            .get_key_packages(&member_dids_vec)
+            .get_key_packages(&actor_device_id, &member_dids_vec)
             .await
             .map_err(|e| js_err!("get_key_packages failed: {:?}", e))?;
 
@@ -1276,44 +1298,58 @@ pub async fn catbird_mls_create_conversation(
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect();
-    let metadata = ConversationMetadata {
-        name: Some(name.clone()),
-        description: None,
-        avatar_url: None,
-    };
 
-    let server_result = api_client
-        .create_conversation(
-            &group_id_str,
-            if member_dids_vec.is_empty() {
-                None
-            } else {
-                Some(&member_dids_vec)
-            },
-            Some(&metadata),
-            commit_bytes.as_deref(),
-            welcome_bytes.as_deref(),
-        )
+    let mut req_body = serde_json::json!({
+        "groupId": group_id_str,
+        "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+        "members": member_dids_vec,
+    });
+    if let Some(welcome) = &welcome_bytes {
+        req_body["welcomeMessage"] = serde_json::json!({ "$bytes": B64.encode(welcome) });
+    }
+    let create_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CreateConversation,
+        method: "POST".to_string(),
+        path: "/xrpc/blue.catbird.chat.createConversation".to_string(),
+        body: Some(serde_json::to_vec(&req_body).map_err(|e| js_err!("JSON error: {:?}", e))?),
+    };
+    let resp = api_client
+        .submit_prepared_request(create_req)
         .await
         .map_err(|e| js_err!("create_conversation failed: {:?}", e))?;
+    if resp.status != 200 {
+        return Err(js_err!(
+            "create_conversation failed with status {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+        ));
+    }
+    let output: serde_json::Value =
+        serde_json::from_slice(&resp.body).map_err(|e| js_err!("JSON decode: {:?}", e))?;
+    let (convo_id, server_epoch) = if let Some(res) = output.get("result") {
+        let coords = res.get("coordinates").unwrap_or(res);
+        (
+            coords
+                .get("conversationId")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&group_id_str)
+                .to_string(),
+            coords.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0),
+        )
+    } else {
+        (group_id_str.clone(), 0)
+    };
 
-    let convo_id = &server_result.conversation.group_id;
-
-    // Cache epoch after group creation. Prefer server-reported epoch; fall back
-    // to querying the local MLS context (which is already at 1+ after add_members).
-    let create_epoch = {
-        let server_epoch = server_result.conversation.epoch;
-        if server_epoch > 0 {
-            server_epoch
-        } else {
-            with_state(|s| {
-                Ok(s.mls_context
-                    .as_ref()
-                    .and_then(|ctx| ctx.get_epoch(group_id_bytes.clone()).ok())
-                    .unwrap_or(0))
-            })
-            .unwrap_or(0)
-        }
+    let create_epoch = if server_epoch > 0 {
+        server_epoch
+    } else {
+        with_state(|s| {
+            Ok(s.mls_context
+                .as_ref()
+                .and_then(|ctx| ctx.get_epoch(group_id_bytes.clone()).ok())
+                .unwrap_or(0))
+        })
+        .unwrap_or(0)
     };
     SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), create_epoch));
 
@@ -1331,7 +1367,7 @@ pub async fn catbird_mls_create_conversation(
             .map_err(|e| js_err!("export_group_info: {:?}", e))
     });
     if let Ok(gi) = gi_result {
-        if let Err(e) = api_client.publish_group_info(convo_id, &gi).await {
+        if let Err(e) = api_client.publish_group_info(&convo_id, &gi).await {
             web_sys::console::warn_1(&js_err!(
                 "catbird-mls-web: publish_group_info failed after create: {:?}",
                 e
@@ -1434,16 +1470,32 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
             .map_err(|e| js_err!("rejoin create_external_commit failed: {:?}", e))
     })?;
 
-    // TODO(A7): confirmation_tag stubbed as None until pyramid wiring (#15/#18).
-    let server_result = api_client
-        .process_external_commit(
-            convo_id,
-            &ext_commit.commit_data,
-            ext_commit.group_info.as_deref(),
-            None,
-        )
+    let input = serde_json::json!({
+        "action": "externalCommit",
+        "convoId": convo_id,
+        "commit": { "$bytes": B64.encode(&ext_commit.commit_data) },
+        "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+    });
+    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
+        method: "POST".to_string(),
+        path: "/xrpc/blue.catbird.chat.submitTransition".to_string(),
+        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
+    };
+    let response = api_client
+        .submit_prepared_request(req)
         .await
         .map_err(|e| js_err!("rejoin process_external_commit failed: {:?}", e))?;
+    if response.status != 200 {
+        return Err(js_err!(
+            "rejoin process_external_commit failed with status {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ));
+    }
+    let output: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(|e| js_err!("JSON decode: {:?}", e))?;
+    let server_epoch = output.get("newEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let local_epoch = with_state(|s| {
         let ctx = s
@@ -1454,11 +1506,9 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
             .map_err(|e| js_err!("rejoin merge_pending_commit failed: {:?}", e))
     })?;
 
-    // Cache the server's epoch for this conversation so sendMessage uses it
-    // instead of the local MLS epoch (which may differ from the server's counter).
     SERVER_EPOCHS.with(|m| {
         m.borrow_mut()
-            .insert(convo_id.to_string(), server_result.epoch)
+            .insert(convo_id.to_string(), server_epoch)
     });
 
     // Publish updated GroupInfo so other clients can also external-commit join
@@ -1490,7 +1540,7 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
     web_sys::console::log_1(&js_err!(
         "catbird-mls-web: rejoin_group({}) — server_epoch={}, local_epoch={}",
         convo_id,
-        server_result.epoch,
+        server_epoch,
         local_epoch
     ));
 
@@ -1590,11 +1640,21 @@ async fn send_payload_message_internal(
             }
         };
 
-        match api_client
-            .send_message_with_id(&convo_id, &encrypt_result.ciphertext, epoch, &msg_id)
-            .await
-        {
-            Ok(_send_resp) => {
+        let send_input = serde_json::json!({
+            "convoId": convo_id,
+            "ciphertext": { "$bytes": B64.encode(&encrypt_result.ciphertext) },
+            "epoch": epoch,
+            "msgId": msg_id,
+            "paddedSize": encrypt_result.ciphertext.len() as u32,
+        });
+        let send_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+            operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage,
+            method: "POST".to_string(),
+            path: "/xrpc/blue.catbird.chat.sendMessage".to_string(),
+            body: Some(serde_json::to_vec(&send_input).map_err(|e| js_err!("JSON error: {:?}", e))?),
+        };
+        match api_client.submit_prepared_request(send_req).await {
+            Ok(resp) if resp.status == 200 => {
                 // Persist to IndexedDB so messages survive navigation/reload
                 let now = chrono::Utc::now();
                 {
@@ -1634,57 +1694,34 @@ async fn send_payload_message_internal(
                     });
                 return to_js(&message);
             }
-            Err(e) => {
-                let (is_409, server_epoch_hint) = match &e {
-                    catbird_mls::orchestrator::error::OrchestratorError::ServerError {
-                        status,
-                        body,
-                    } => {
-                        let is_conflict = *status == 409;
-                        let hint = if is_conflict {
-                            serde_json::from_str::<serde_json::Value>(body)
-                                .ok()
-                                .and_then(|v| v.get("serverEpoch").and_then(|e| e.as_u64()))
-                        } else {
-                            None
-                        };
-                        (is_conflict, hint)
-                    }
-                    _ => (false, None),
+            Ok(resp) => {
+                let is_409 = resp.status == 409;
+                let server_epoch_hint = if is_409 {
+                    serde_json::from_slice::<serde_json::Value>(&resp.body)
+                        .ok()
+                        .and_then(|v| v.get("serverEpoch").and_then(|e| e.as_u64()))
+                } else {
+                    None
                 };
-                last_err = format!("{:?}", e);
-
-                if is_409 && attempt < 2 {
-                    if let Some(correct_epoch) = server_epoch_hint {
-                        // Server told us the correct epoch — cache and retry (no rejoin needed)
-                        web_sys::console::warn_1(&js_err!(
-                            "catbird-mls-web: send_message 409 (sent epoch={}, server={}), retrying with correct epoch (attempt {})",
-                            epoch,
-                            correct_epoch,
-                            attempt + 1
-                        ));
-                        SERVER_EPOCHS
-                            .with(|m| m.borrow_mut().insert(convo_id.clone(), correct_epoch));
-                        continue;
-                    } else {
-                        // 409 without serverEpoch hint — we'd need to rejoin to make
-                        // progress, but External Commit in the send hot path causes
-                        // epoch inflation (spec §5.3). Flag for deferred recovery and
-                        // surface the error; the sync loop / explicit rejoin
-                        // entrypoint will handle the actual rejoin.
-                        use catbird_mls::orchestrator::storage::MLSStorageBackend;
-                        web_sys::console::warn_1(&js_err!(
-                            "catbird-mls-web: send_message 409 (epoch={}), no server hint — flagging {} for deferred rejoin",
-                            epoch,
-                            convo_id
-                        ));
-                        let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
-                        let _ = storage.mark_needs_rejoin(&convo_id).await;
-                        return Err(js_err!(
-                            "Epoch conflict with no server hint — sync in progress, please retry"
-                        ));
+                if is_409 {
+                    web_sys::console::warn_1(&js_err!(
+                        "catbird-mls-web: send_message 409 conflict for {}: server_epoch_hint={:?}, client_epoch={}",
+                        convo_id,
+                        server_epoch_hint,
+                        epoch
+                    ));
+                    if let Some(target_epoch) = server_epoch_hint {
+                        SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), target_epoch));
                     }
                 }
+                return Err(js_err!(
+                    "send_message failed with status {}: {}",
+                    resp.status,
+                    String::from_utf8_lossy(&resp.body)
+                ));
+            }
+            Err(e) => {
+                return Err(js_err!("send_message failed: {:?}", e));
             }
         }
     }
@@ -2193,8 +2230,20 @@ pub async fn catbird_mls_add_group_members(
         .ok_or_else(|| js_err!("Invalid conversation/group ID: {}", conversation_id))?;
 
     // 1. Fetch key packages for all new members in one batch request.
+    let (credentials, user_did) = with_state(|s| {
+        let did = s
+            .user_did
+            .clone()
+            .ok_or_else(|| js_err!("Not authenticated"))?;
+        Ok((Arc::clone(&s.credentials), did))
+    })?;
+    let actor_device_id = credentials
+        .get_device_uuid(&user_did)
+        .await
+        .unwrap_or_default()
+        .unwrap_or_default();
     let kp_refs = api_client
-        .get_key_packages(&member_dids_vec)
+        .get_key_packages(&actor_device_id, &member_dids_vec)
         .await
         .map_err(|e| js_err!("get_key_packages failed: {:?}", e))?;
 
@@ -2222,51 +2271,40 @@ pub async fn catbird_mls_add_group_members(
     })?;
 
     // 3. Send commit + welcome to server.
-    let server_result = api_client
-        .add_members(
-            &conversation_id,
-            &member_dids_vec,
-            &add_result.commit_data,
-            Some(&add_result.welcome_data),
-        )
-        .await
-        .map_err(|e| {
-            // Clear pending commit so group isn't stuck on failure.
-            let _ = with_state(|s| {
-                if let Some(ctx) = s.mls_context.as_ref() {
-                    let _ = ctx.clear_pending_commit(group_id_bytes.clone());
-                }
-                Ok(())
-            });
-            js_err!("add_members server call failed: {:?}", e)
-        })?;
-
-    if !server_result.success {
+    let mut input = serde_json::json!({
+        "action": "addMembers",
+        "convoId": conversation_id,
+        "memberDids": member_dids_vec,
+        "commit": { "$bytes": B64.encode(&add_result.commit_data) },
+        "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+    });
+    input["welcome"] = serde_json::json!({ "$bytes": B64.encode(&add_result.welcome_data) });
+    let add_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
+        method: "POST".to_string(),
+        path: "/xrpc/blue.catbird.chat.submitTransition".to_string(),
+        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
+    };
+    let response = api_client.submit_prepared_request(add_req).await.map_err(|e| {
         let _ = with_state(|s| {
             if let Some(ctx) = s.mls_context.as_ref() {
                 let _ = ctx.clear_pending_commit(group_id_bytes.clone());
             }
             Ok(())
         });
-        return Err(js_err!("Server rejected add_members commit"));
-    }
-
-    // 4. Merge pending commit locally so epoch advances.
-    with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.merge_pending_commit(group_id_bytes.clone())
-            .map_err(|e| js_err!("merge_pending_commit failed: {:?}", e))
+        js_err!("add_members server call failed: {:?}", e)
     })?;
-
-    // 5. Cache the new server epoch.
-    if server_result.new_epoch > 0 {
-        SERVER_EPOCHS.with(|m| {
-            m.borrow_mut()
-                .insert(conversation_id.clone(), server_result.new_epoch)
+    if response.status != 200 {
+        let _ = with_state(|s| {
+            if let Some(ctx) = s.mls_context.as_ref() {
+                let _ = ctx.clear_pending_commit(group_id_bytes.clone());
+            }
+            Ok(())
         });
+        return Err(js_err!(
+            "add_members server call failed with status {}",
+            response.status
+        ));
     }
 
     Ok(())
@@ -2326,14 +2364,29 @@ pub async fn catbird_mls_remove_participants(
     conversation_id: String,
     target_did: String,
 ) -> Result<(), JsValue> {
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-
     let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
 
-    api_client
-        .remove_members(&conversation_id, &[target_did], &[])
+    let input = serde_json::json!({
+        "convoId": conversation_id,
+        "targetDid": target_did,
+    });
+    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestLeave,
+        method: "POST".to_string(),
+        path: "/xrpc/blue.catbird.chat.requestLeave".to_string(),
+        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
+    };
+    let resp = api_client
+        .submit_prepared_request(req)
         .await
         .map_err(|e| js_err!("remove_group_member failed: {:?}", e))?;
+    if resp.status != 200 {
+        return Err(js_err!(
+            "remove_group_member failed with status {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+        ));
+    }
 
     Ok(())
 }
@@ -2341,14 +2394,28 @@ pub async fn catbird_mls_remove_participants(
 /// Leave a conversation.
 #[wasm_bindgen]
 pub async fn catbird_mls_leave_conversation(conversation_id: String) -> Result<(), JsValue> {
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-
     let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
 
-    api_client
-        .leave_conversation(&conversation_id)
+    let input = serde_json::json!({
+        "convoId": conversation_id,
+    });
+    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestLeave,
+        method: "POST".to_string(),
+        path: "/xrpc/blue.catbird.chat.requestLeave".to_string(),
+        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
+    };
+    let resp = api_client
+        .submit_prepared_request(req)
         .await
         .map_err(|e| js_err!("leave_conversation failed: {:?}", e))?;
+    if resp.status != 200 {
+        return Err(js_err!(
+            "leave_conversation failed with status {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+        ));
+    }
 
     Ok(())
 }
@@ -2370,16 +2437,9 @@ pub async fn catbird_mls_send_typing(
         Ok((s.base_url.clone(), token, s.proxy_did.clone()))
     })?;
 
-    let action_name = if is_typing { "typing" } else { "typingStop" };
-    let no_op_ciphertext = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 512]);
     let input = serde_json::json!({
         "convoId": conversation_id,
-        "delivery": "ephemeral",
-        "action": action_name,
-        "msgId": uuid::Uuid::new_v4().to_string(),
-        "epoch": 0,
-        "paddedSize": 512,
-        "ciphertext": { "$bytes": no_op_ciphertext },
+        "isTyping": is_typing,
     });
 
     let client = proxy_client(&proxy_did);

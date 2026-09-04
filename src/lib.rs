@@ -53,10 +53,14 @@ use base64::Engine as _;
 use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
 use catbird_mls::orchestrator::api_client::MLSAPIClient;
 use catbird_mls::orchestrator::credentials::CredentialStore;
+use catbird_mls::orchestrator::storage::MLSStorageBackend;
 use catbird_mls::MLSError;
 use credentials::SqliteCredentialStore;
 use storage::WasmStorageBackend;
 use wasm_mls_context::WasmMLSContext;
+
+const MAX_CONVERSATION_PAGES: usize = 100;
+const MAX_CONVERSATION_ITEMS: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // Re-exports
@@ -99,8 +103,25 @@ macro_rules! js_err {
 /// server normalises to hex in its responses.  Try hex first; fall back to
 /// base64url for any IDs that were cached before normalisation.
 fn decode_group_id(id: &str) -> Option<Vec<u8>> {
-    // Hex: only [0-9a-fA-F] and even length
-    if id.len() % 2 == 0 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+    // Any parseable UUID shape (canonical, uppercase, compact, or mixed
+    // casing) is a stable conversation identity. Reject it before either
+    // legacy decoder; otherwise compact UUIDs are valid-looking 16-byte hex
+    // groups and hyphenated UUIDs can fall through base64url.
+    if uuid::Uuid::parse_str(id).is_ok() {
+        return None;
+    }
+
+    decode_group_coordinate(id)
+}
+
+/// Decode a group coordinate after its provenance is already known (server
+/// response, persisted mapping, or reset payload). Group IDs are exactly
+/// 16-byte hex/base64 coordinates; unlike a caller-supplied ambiguous handle,
+/// a 32-hex coordinate may syntactically resemble a compact UUID and must be
+/// accepted here so the crypto path can operate on the server's group bytes.
+fn decode_group_coordinate(id: &str) -> Option<Vec<u8>> {
+    // Group coordinates are exactly 16 bytes, represented by 32 hex digits.
+    if id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()) {
         let bytes: Result<Vec<u8>, _> = (0..id.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&id[i..i + 2], 16))
@@ -113,6 +134,7 @@ fn decode_group_id(id: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(id)
         .ok()
+        .filter(|bytes| bytes.len() == 16)
 }
 
 // ---------------------------------------------------------------------------
@@ -123,12 +145,45 @@ fn decode_group_id(id: &str) -> Option<Vec<u8>> {
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
     pub id: String,
+    /// Current MLS group identifier (hex). This is mutable across resets;
+    /// callers must use `id` for UI/API identity.
+    pub group_id: String,
     pub display_name: String,
     pub members: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_views: Option<Vec<catbird_mls::orchestrator::types::MemberView>>,
+    /// Immutable projection kind (`direct` or `group`).
+    pub conversation_kind: String,
     pub last_message: Option<String>,
     pub last_message_at: Option<String>,
     pub unread_count: u32,
     pub is_group: bool,
+}
+
+/// Keep roster persistence and UI projections on the shared MemberView shape.
+/// Legacy local group-state rows only contain DIDs, so infer the local creator
+/// role there while preserving server-provided roles everywhere else.
+fn member_views_from_dids(
+    dids: Vec<String>,
+    local_user_did: &str,
+) -> Vec<catbird_mls::orchestrator::types::MemberView> {
+    use catbird_mls::orchestrator::types::{MemberRole, MemberView};
+    let mut seen = std::collections::HashSet::new();
+    dids.into_iter()
+        .filter(|did| !did.is_empty() && seen.insert(did.clone()))
+        .map(|did| MemberView {
+            role: if did == local_user_did {
+                MemberRole::Admin
+            } else {
+                MemberRole::Member
+            },
+            did,
+        })
+        .collect()
+}
+
+fn conversation_is_group(members: &[catbird_mls::orchestrator::types::MemberView]) -> bool {
+    members.len() != 2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +248,171 @@ pub struct SearchResult {
 pub struct OptInStatusResult {
     pub did: String,
     pub opted_in: bool,
+}
+
+/// Resolve a UI/API identifier to the stable conversation id and current MLS
+/// group id. New callers pass the stable UUID. A legacy caller may still pass
+/// a group id, but it must resolve through the durable per-user alias map;
+/// unknown or ambiguous aliases fail closed before any crypto operation.
+fn resolve_conversation_identity(identifier: &str) -> Result<(String, String), JsValue> {
+    let (storage, user_did) = with_state(|s| {
+        let did = s
+            .user_did
+            .clone()
+            .ok_or_else(|| js_err!("Not authenticated"))?;
+        Ok((Arc::clone(&s.storage), did))
+    })?;
+
+    // A canonical stable UUID is authoritative when it exists. Before
+    // rejecting any other parseable UUID shape, consult the *exact* durable
+    // alias key: legacy group coordinates can be compact/uppercase UUID-shaped
+    // strings and are authorized by storage provenance, never by syntax.
+    let parseable_uuid = uuid::Uuid::parse_str(identifier).is_ok();
+    if parseable_uuid && canonical_uuid_string(identifier, "conversation identity").is_ok() {
+        let canonical = canonical_uuid_string(identifier, "conversation identity")
+            .map_err(|error| js_err!("{}", error))?;
+        if let Some(mapping) = storage
+            .resolve_conversation_mapping(&user_did, &canonical)
+            .map_err(|e| js_err!("conversation identity lookup failed: {}", e))?
+        {
+            return Ok(mapping);
+        }
+    }
+    // Check raw aliases before the UUID-shape rejection. This is deliberately
+    // exact: do not lowercase or reformat an alias before resolving it.
+    if let Some(mapping) = storage
+        .resolve_conversation_mapping(&user_did, identifier)
+        .map_err(|e| js_err!("conversation identity lookup failed: {}", e))?
+    {
+        return Ok(mapping);
+    }
+    if parseable_uuid {
+        return Err(js_err!(
+            "conversation identifier is not a canonical stable UUID and has no authorized exact group alias: {}",
+            identifier
+        ));
+    }
+
+    let group_id = decode_group_id(identifier)
+        .map(|bytes| hex::encode(bytes))
+        .ok_or_else(|| {
+            js_err!(
+                "conversation identifier is neither a canonical UUID nor a valid MLS group id: {}",
+                identifier
+            )
+        })?;
+    storage
+        .resolve_conversation_mapping(&user_did, &group_id)
+        .map_err(|e| js_err!("conversation identity lookup failed: {}", e))?
+        .ok_or_else(|| {
+            js_err!(
+                "group '{}' has no unique persisted stable conversation mapping",
+                group_id
+            )
+        })
+}
+
+/// Resolve a legacy group handle to the canonical stable conversation UUID.
+/// Browser workers use this before subscription bookkeeping so aliases cannot
+/// create duplicate WebSocket handles.
+#[wasm_bindgen]
+pub fn catbird_mls_resolve_conversation_id(identifier: String) -> Result<String, JsValue> {
+    resolve_conversation_identity(&identifier).map(|(conversation_id, _)| conversation_id)
+}
+
+/// Parse the current group id from either the string or `$bytes` shape used
+/// by create-conversation coordinate responses.
+fn parse_response_group_id(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    if let Some(group_id) = value.as_str() {
+        return decode_group_coordinate(group_id).map(hex::encode);
+    }
+    let encoded = value.get("$bytes").and_then(|bytes| bytes.as_str())?;
+    B64.decode(encoded)
+        .ok()
+        .filter(|bytes| bytes.len() == 16)
+        .map(hex::encode)
+}
+
+async fn persist_conversation_projection(
+    storage: &WasmStorageBackend,
+    user_did: &str,
+    conversation_id: &str,
+    group_id: &str,
+    epoch: u64,
+    members: Vec<catbird_mls::orchestrator::types::MemberView>,
+) -> Result<(), JsValue> {
+    storage
+        .upsert_conversation_projection(
+            user_did,
+            conversation_id,
+            group_id,
+            epoch,
+            &members,
+            None,
+            None,
+        )
+        .map_err(|e| js_err!("persist conversation projection failed: {}", e))?;
+    Ok(())
+}
+
+/// Persist a joined group without bypassing a pending reset winner. Normal
+/// joins install/update the stable projection; a join that lands the exact
+/// pending target completes the mapping, historical alias, roster, group
+/// state, and reset authority in one transaction.
+async fn persist_join_projection(
+    storage: &WasmStorageBackend,
+    user_did: &str,
+    conversation_id: &str,
+    group_id: &str,
+    epoch: u64,
+    members: Vec<catbird_mls::orchestrator::types::MemberView>,
+) -> Result<(), JsValue> {
+    use catbird_mls::orchestrator::storage::MLSStorageBackend;
+    use catbird_mls::orchestrator::types::ConversationState;
+
+    let state = storage
+        .get_conversation_state(conversation_id)
+        .await
+        .map_err(|e| js_err!("joined conversation state lookup failed: {:?}", e))?;
+    if let Some(ConversationState::ResetPending {
+        new_group_id,
+        reset_generation,
+        ..
+    }) = state
+    {
+        if new_group_id != group_id {
+            return Err(js_err!(
+                "joined group {} does not match pending reset target {}",
+                group_id,
+                new_group_id
+            ));
+        }
+        let expected_state_version = storage
+            .conversation_state_version(user_did, conversation_id)
+            .map_err(|e| js_err!("joined conversation state version failed: {}", e))?;
+        let committed = storage
+            .complete_reset_pending_projection(
+                user_did,
+                conversation_id,
+                reset_generation,
+                expected_state_version,
+                group_id,
+                epoch,
+                &members,
+            )
+            .map_err(|e| js_err!("joined reset projection failed: {}", e))?;
+        if !committed {
+            return Err(js_err!(
+                "joined reset projection lost generation/target CAS for {}",
+                conversation_id
+            ));
+        }
+        return Ok(());
+    }
+
+    persist_conversation_projection(storage, user_did, conversation_id, group_id, epoch, members)
+        .await
 }
 
 fn image_attachment_from_message(
@@ -513,7 +733,7 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
             Ok(ids) => {
                 let mut loaded = 0u32;
                 for id_str in &ids {
-                    let Some(gid_bytes) = decode_group_id(id_str) else {
+                    let Some(gid_bytes) = decode_group_coordinate(id_str) else {
                         web_sys::console::warn_1(
                             &format!("catbird-mls-web: invalid group_id in storage: {}", id_str)
                                 .into(),
@@ -601,6 +821,7 @@ pub fn catbird_mls_set_auth(did: String, token: String) -> Result<(), JsValue> {
     with_state_mut(|state| {
         state.api_client.set_auth(did.clone(), token.clone());
         save_session(&state.storage_prefix, &did, &token)?;
+        state.storage.set_active_user_did(Some(did.clone()));
         state.user_did = Some(did);
         state.auth_token = Some(token);
         Ok(())
@@ -613,6 +834,7 @@ pub fn catbird_mls_clear_auth() -> Result<(), JsValue> {
     with_state_mut(|state| {
         state.api_client.clear_auth();
         clear_session(&state.storage_prefix);
+        state.storage.set_active_user_did(None);
         state.user_did = None;
         state.auth_token = None;
         Ok(())
@@ -629,6 +851,7 @@ pub fn catbird_mls_try_restore_session() -> Result<bool, JsValue> {
     match load_session(&storage_prefix) {
         Some((did, token)) => with_state_mut(|state| {
             state.api_client.set_auth(did.clone(), token.clone());
+            state.storage.set_active_user_did(Some(did.clone()));
             state.user_did = Some(did);
             state.auth_token = Some(token);
             Ok(true)
@@ -654,13 +877,95 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
     use catbird_mls::orchestrator::credentials::CredentialStore;
 
-    let (api_client, credentials, user_did) = with_state(|s| {
+    let (api_client, credentials, storage, user_did) = with_state(|s| {
         let did = s
             .user_did
             .clone()
             .ok_or_else(|| js_err!("Not authenticated — call catbird_mls_set_auth() first"))?;
-        Ok((Arc::clone(&s.api_client), Arc::clone(&s.credentials), did))
+        Ok((
+            Arc::clone(&s.api_client),
+            Arc::clone(&s.credentials),
+            Arc::clone(&s.storage),
+            did,
+        ))
     })?;
+
+    // Replay owner-bound speculative cleanup intents before any new setup
+    // work. A crash/cancellation between MLS group creation and server
+    // projection therefore cannot strand a group indefinitely; a target that
+    // has since been adopted by the stable mapping is retained idempotently.
+    for (intent_conversation, intent_group, reason) in storage
+        .list_cleanup_intents(&user_did)
+        .map_err(|e| js_err!("cleanup intent replay failed: {}", e))?
+    {
+        match storage
+            .resolve_conversation_mapping(&user_did, &intent_group)
+            .map_err(|e| js_err!("cleanup intent ownership lookup failed: {}", e))?
+        {
+            Some((stable_id, _))
+                if stable_id == intent_conversation
+                    // A create intent is armed before the server chooses the
+                    // stable UUID, so its recorded conversation field is the
+                    // speculative group itself. Any authenticated stable
+                    // projection adopting that exact target is the intended
+                    // outcome and may clear the replay intent idempotently.
+                    || (reason == "create-speculative" && intent_conversation == intent_group) =>
+            {
+                storage
+                    .clear_cleanup_intent(&user_did, &intent_group)
+                    .map_err(|e| js_err!("clear adopted cleanup intent failed: {}", e))?;
+            }
+            Some((stable_id, _)) => {
+                return Err(js_err!(
+                    "cleanup intent {} conflicts with stable conversation {}",
+                    intent_group,
+                    stable_id
+                ));
+            }
+            None => {
+                let Some(group_bytes) = decode_group_coordinate(&intent_group) else {
+                    return Err(js_err!(
+                        "cleanup intent {} has an invalid exact group coordinate",
+                        intent_group
+                    ));
+                };
+                with_state(|s| {
+                    if let Some(ctx) = s.mls_context.as_ref() {
+                        ctx.delete_group(group_bytes.clone()).map_err(|e| {
+                            js_err!("cleanup intent {} MLS delete failed: {:?}", intent_group, e)
+                        })?;
+                    }
+                    Ok(())
+                })?;
+                storage
+                    .delete_group_state(&intent_group)
+                    .await
+                    .map_err(|e| {
+                        js_err!(
+                            "cleanup intent {} group-state delete failed: {:?}",
+                            intent_group,
+                            e
+                        )
+                    })?;
+                storage
+                    .delete_conversation_by_group(&user_did, &intent_group)
+                    .map_err(|e| {
+                        js_err!(
+                            "cleanup intent {} projection delete failed: {}",
+                            intent_group,
+                            e
+                        )
+                    })?;
+                storage
+                    .clear_cleanup_intent(&user_did, &intent_group)
+                    .map_err(|e| js_err!("cleanup intent {} clear failed: {}", intent_group, e))?;
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "catbird-mls-web: replayed {} cleanup intent for {}",
+                    reason, intent_group
+                )));
+            }
+        }
+    }
 
     web_sys::console::log_1(&js_err!(
         "catbird-mls-web: catbird_mls_setup() starting for {}",
@@ -922,7 +1227,10 @@ pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
                         LOCAL_KP_COUNT.with(|c| *c.borrow_mut() += 1);
                     }
                     Ok(resp) => {
-                        web_sys::console::warn_1(&js_err!("Key package publish failed with status {}", resp.status));
+                        web_sys::console::warn_1(&js_err!(
+                            "Key package publish failed with status {}",
+                            resp.status
+                        ));
                         break;
                     }
                     Err(e) => {
@@ -978,19 +1286,22 @@ pub async fn catbird_mls_join_group(convo_id: String) -> Result<JsValue, JsValue
 /// Internal join helper — returns a JSON value, reusable from auto-join paths.
 async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
+    use catbird_mls::orchestrator::storage::MLSStorageBackend;
 
-    let (api_client, user_did) = with_state(|s| {
+    let (resolved_convo_id, _) = resolve_conversation_identity(convo_id)?;
+
+    let (api_client, storage, user_did) = with_state(|s| {
         let did = s
             .user_did
             .clone()
             .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), did))
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), did))
     })?;
 
     let identity_bytes = user_did.as_bytes().to_vec();
 
     // 1. Try Welcome first
-    match api_client.get_welcome(convo_id).await {
+    match api_client.get_welcome(&resolved_convo_id).await {
         Ok(welcome_bytes) => {
             let join_result = with_state(|s| {
                 let ctx = s
@@ -1011,8 +1322,10 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
                             .unwrap_or(0))
                     })
                     .unwrap_or(0);
-                    SERVER_EPOCHS
-                        .with(|m| m.borrow_mut().insert(convo_id.to_string(), welcome_epoch));
+                    SERVER_EPOCHS.with(|m| {
+                        m.borrow_mut()
+                            .insert(resolved_convo_id.clone(), welcome_epoch)
+                    });
 
                     // MLS metadata cutover: bootstrap encrypted metadata so
                     // the conversation list / header render the title +
@@ -1023,6 +1336,28 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
                         .iter()
                         .map(|b| format!("{:02x}", b))
                         .collect::<String>();
+                    let members =
+                        match fetch_roster_for_convo(&api_client, &resolved_convo_id).await {
+                            Ok(roster) if !roster.is_empty() => roster,
+                            Ok(_) | Err(_) => storage
+                                .get_group_state(&group_id_hex_for_bootstrap)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|state| member_views_from_dids(state.members, &user_did))
+                                .unwrap_or_else(|| {
+                                    member_views_from_dids(vec![user_did.clone()], &user_did)
+                                }),
+                        };
+                    persist_join_projection(
+                        &storage,
+                        &user_did,
+                        &resolved_convo_id,
+                        &group_id_hex_for_bootstrap,
+                        welcome_epoch,
+                        members,
+                    )
+                    .await?;
                     if let Err(e) = wasm_bootstrap_group_metadata(group_id_hex_for_bootstrap).await
                     {
                         web_sys::console::warn_1(&JsValue::from_str(&format!(
@@ -1053,7 +1388,7 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
 
     // 2. External commit fallback
     let group_info_bytes = api_client
-        .get_group_info(convo_id)
+        .get_group_info(&resolved_convo_id)
         .await
         .map_err(|e| js_err!("get_group_info failed: {:?}", e))?;
 
@@ -1070,12 +1405,13 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
     // 3. Send external commit to server
     let input = serde_json::json!({
         "action": "externalCommit",
-        "convoId": convo_id,
+        "convoId": resolved_convo_id.clone(),
         "commit": { "$bytes": B64.encode(&ext_commit.commit_data) },
         "idempotencyKey": uuid::Uuid::new_v4().to_string(),
     });
     let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
+        operation:
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
         method: "POST".to_string(),
         path: "/xrpc/blue.catbird.chat.submitTransition".to_string(),
         body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
@@ -1108,8 +1444,33 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
     // Cache server epoch so send_message uses it instead of local MLS epoch
     SERVER_EPOCHS.with(|m| {
         m.borrow_mut()
-            .insert(convo_id.to_string(), server_epoch)
+            .insert(resolved_convo_id.clone(), server_epoch)
     });
+
+    let group_id_hex = ext_commit
+        .group_id
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    let members = match fetch_roster_for_convo(&api_client, &resolved_convo_id).await {
+        Ok(roster) if !roster.is_empty() => roster,
+        Ok(_) | Err(_) => storage
+            .get_group_state(&group_id_hex)
+            .await
+            .ok()
+            .flatten()
+            .map(|state| member_views_from_dids(state.members, &user_did))
+            .unwrap_or_else(|| member_views_from_dids(vec![user_did.clone()], &user_did)),
+    };
+    persist_join_projection(
+        &storage,
+        &user_did,
+        &resolved_convo_id,
+        &group_id_hex,
+        server_epoch.max(local_epoch),
+        members,
+    )
+    .await?;
 
     // Publish updated GroupInfo so other clients can also external-commit join
     let publish_result = with_state(|s| {
@@ -1122,7 +1483,10 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
     });
     match publish_result {
         Ok(gi_bytes) => {
-            if let Err(e) = api_client.publish_group_info(convo_id, &gi_bytes).await {
+            if let Err(e) = api_client
+                .publish_group_info(&resolved_convo_id, &gi_bytes)
+                .await
+            {
                 web_sys::console::warn_1(&js_err!(
                     "catbird-mls-web: publish_group_info failed after join: {:?}",
                     e
@@ -1167,51 +1531,305 @@ async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, Js
 // Conversation commands
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedCreateResponse {
+    Created {
+        conversation_id: String,
+        group_id: String,
+        epoch: u64,
+    },
+    ExistingDirect {
+        conversation_id: String,
+        group_id: String,
+        epoch: u64,
+    },
+}
+
+fn canonical_uuid_text(value: &serde_json::Value, field: &str) -> Result<String, String> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("{} must be a string", field))?;
+    canonical_uuid_string(text, field)
+}
+
+fn canonical_uuid_string(text: &str, field: &str) -> Result<String, String> {
+    let parsed = uuid::Uuid::parse_str(text).map_err(|_| format!("{} must be a UUID", field))?;
+    let canonical = parsed.hyphenated().to_string();
+    if canonical != text {
+        return Err(format!("{} must use canonical lowercase UUID text", field));
+    }
+    if parsed.get_version() != Some(uuid::Version::Random)
+        || parsed.get_variant() != uuid::Variant::RFC4122
+    {
+        return Err(format!("{} must be a canonical UUIDv4", field));
+    }
+    Ok(text.to_owned())
+}
+
+/// Strictly decode the closed conversation-creation union. The server's
+/// created group must equal the exact group proposed by the client; missing or
+/// unknown tags never fall back to a speculative local group.
+fn parse_create_response(
+    output: &serde_json::Value,
+    proposed_group_id: &str,
+) -> Result<ParsedCreateResponse, String> {
+    let result = output
+        .get("result")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "create response is missing result object".to_string())?;
+    let result_type = result
+        .get("$type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "create response is missing exact result $type".to_string())?;
+    let coordinates = result
+        .get("coordinates")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "create result is missing coordinates".to_string())?;
+    let conversation_id = canonical_uuid_text(
+        coordinates
+            .get("conversationId")
+            .ok_or_else(|| "create coordinates missing conversationId".to_string())?,
+        "coordinates.conversationId",
+    )?;
+    let group_value = coordinates
+        .get("groupId")
+        .ok_or_else(|| "create coordinates missing groupId".to_string())?;
+    let response_group_id = parse_response_group_id(Some(group_value))
+        .ok_or_else(|| "create coordinates groupId is not an exact 16-byte group id".to_string())?;
+    let proposed_group_id = decode_group_coordinate(proposed_group_id)
+        .map(|bytes| hex::encode(bytes))
+        .ok_or_else(|| "proposed group id is not an exact 16-byte group id".to_string())?;
+    let epoch = coordinates
+        .get("epoch")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "create coordinates missing nonnegative epoch".to_string())?;
+
+    match result_type {
+        "blue.catbird.chat.defs#conversationCreatedResult" => {
+            if result
+                .get("entry")
+                .and_then(serde_json::Value::as_object)
+                .is_none()
+            {
+                return Err("conversationCreatedResult is missing entry".to_string());
+            }
+            if response_group_id != proposed_group_id {
+                return Err(format!(
+                    "created result group {} differs from proposed group {}",
+                    response_group_id, proposed_group_id
+                ));
+            }
+            Ok(ParsedCreateResponse::Created {
+                conversation_id,
+                group_id: response_group_id,
+                epoch,
+            })
+        }
+        "blue.catbird.chat.defs#existingDirectConversationResult" => {
+            if result
+                .get("conversationKind")
+                .and_then(serde_json::Value::as_str)
+                != Some("direct")
+            {
+                return Err(
+                    "existingDirectConversationResult must declare conversationKind=direct"
+                        .to_string(),
+                );
+            }
+            let top_level_id = result
+                .get("conversationId")
+                .ok_or_else(|| {
+                    "existingDirectConversationResult is missing conversationId".to_string()
+                })
+                .and_then(|value| canonical_uuid_text(value, "conversationId"))?;
+            if top_level_id != conversation_id {
+                return Err("existing direct result has mismatched conversation ids".to_string());
+            }
+            Ok(ParsedCreateResponse::ExistingDirect {
+                conversation_id,
+                group_id: response_group_id,
+                epoch,
+            })
+        }
+        other => Err(format!(
+            "unknown conversation creation result tag: {}",
+            other
+        )),
+    }
+}
+
+fn validate_existing_direct_view(
+    view: &catbird_mls::orchestrator::types::ConversationView,
+    expected_conversation_id: &str,
+    expected_group_id: &str,
+) -> Result<(), String> {
+    if view.conversation_id != expected_conversation_id {
+        return Err("existing direct view has a mismatched stable conversation id".to_string());
+    }
+    let actual_group = decode_group_coordinate(&view.group_id)
+        .map(hex::encode)
+        .ok_or_else(|| "existing direct view has an invalid group coordinate".to_string())?;
+    let expected_group = decode_group_coordinate(expected_group_id)
+        .map(hex::encode)
+        .ok_or_else(|| "existing direct result has an invalid group coordinate".to_string())?;
+    if actual_group != expected_group {
+        return Err("existing direct view has a mismatched group coordinate".to_string());
+    }
+    if view.members.len() != 2 {
+        return Err("existing direct view must contain exactly two members".to_string());
+    }
+    let mut dids = std::collections::HashSet::new();
+    let admins = view
+        .members
+        .iter()
+        .filter(|member| {
+            dids.insert(member.did.clone())
+                && matches!(
+                    member.role,
+                    catbird_mls::orchestrator::types::MemberRole::Admin
+                )
+        })
+        .count();
+    if dids.len() != 2 || admins != 1 {
+        return Err(
+            "existing direct view must preserve unique creator/admin and invitee/member roles"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[wasm_bindgen]
 pub async fn catbird_mls_list_conversations() -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
 
-    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
+    let (api_client, storage, user_did) = with_state(|s| {
+        let user_did = s
+            .user_did
+            .clone()
+            .ok_or_else(|| js_err!("Not authenticated"))?;
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
+    })?;
 
-    let page = api_client
-        .get_conversations(50, None)
-        .await
-        .map_err(|e| js_err!("get_conversations failed: {:?}", e))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut convos = Vec::new();
+    let mut cursor = None;
+    let mut page_count = 0usize;
+    loop {
+        page_count = page_count.saturating_add(1);
+        if page_count > MAX_CONVERSATION_PAGES {
+            return Err(js_err!("get_conversations exceeded the page ceiling"));
+        }
+        let page = api_client
+            .get_conversations(50, cursor.as_deref())
+            .await
+            .map_err(|e| js_err!("get_conversations failed: {:?}", e))?;
+        if page.conversations.len() > 50
+            || convos.len().saturating_add(page.conversations.len()) > MAX_CONVERSATION_ITEMS
+        {
+            return Err(js_err!("get_conversations exceeded the item ceiling"));
+        }
+        for c in page.conversations {
+            // The stable conversation id is the sole UI/API identity. A
+            // duplicate across pages must not create a second Svelte row or
+            // regress the already-authoritative group coordinate.
+            let conversation_id = c.conversation_id.clone();
+            canonical_uuid_string(&conversation_id, "conversationId")
+                .map_err(|e| js_err!("invalid conversation list identity: {}", e))?;
+            let listed_group_id = decode_group_coordinate(&c.group_id)
+                .map(|bytes| hex::encode(bytes))
+                .ok_or_else(|| js_err!("conversation {} has invalid groupId", conversation_id))?;
+            if !seen.insert(conversation_id.clone()) {
+                continue;
+            }
+            // A server page can race a completed reset and still contain the
+            // predecessor group alias. Preserve the locally fenced current
+            // coordinate instead of letting that stale snapshot regress the
+            // stable projection (or fail the entire list operation).
+            let mut group_id = listed_group_id.clone();
+            let mut members = c.members.clone();
+            let mut epoch = c.epoch;
+            let stale_alias = if let Some((_, current_group)) = storage
+                .resolve_conversation_mapping(&user_did, &conversation_id)
+                .map_err(|e| js_err!("conversation mapping lookup failed: {}", e))?
+            {
+                if current_group != listed_group_id
+                    && storage
+                        .conversation_group_aliases(&user_did, &conversation_id)
+                        .map_err(|e| js_err!("conversation alias lookup failed: {}", e))?
+                        .iter()
+                        .any(|alias| alias == &listed_group_id)
+                {
+                    if let Some(local) = storage
+                        .get_conversation(&user_did, &conversation_id)
+                        .await
+                        .map_err(|e| js_err!("stale conversation lookup failed: {:?}", e))?
+                    {
+                        group_id = local.group_id;
+                        members = local.members;
+                        epoch = local.epoch;
+                    } else {
+                        group_id = current_group;
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !stale_alias {
+                persist_conversation_projection(
+                    &storage,
+                    &user_did,
+                    &conversation_id,
+                    &group_id,
+                    epoch,
+                    members.clone(),
+                )
+                .await?;
+            }
 
-    let convos: Vec<Conversation> = page
-        .conversations
-        .into_iter()
-        .map(|c| {
-            let member_dids: Vec<String> = c.members.iter().map(|m| m.did.clone()).collect();
             // MLS metadata cutover: read display name from the local
-            // decrypted-blob cache only. The plaintext 0xff00 extension and
-            // server-visible `convoView.metadata.name` are both retired —
-            // bootstrap (`wasm_bootstrap_group_metadata`) populates the
-            // `conversations.title` column from the encrypted blob path
-            // after every Welcome / commit-merge that touches metadata.
-            let cached_title: Option<String> = with_state(|s| {
-                Ok(s.storage
-                    .get_metadata_text(&c.group_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|(title, _desc)| title))
-            })
-            .ok()
-            .flatten();
+            // decrypted-blob cache only; storage errors are not absence.
+            let cached_title = storage
+                .get_metadata_text(&group_id)
+                .map_err(|e| js_err!("conversation metadata lookup failed: {}", e))?
+                .and_then(|(title, _desc)| title);
+            let member_dids: Vec<String> = members.iter().map(|m| m.did.clone()).collect();
             let display_name = cached_title
                 .filter(|t: &String| !t.is_empty())
                 .unwrap_or_else(|| member_dids.join(", "));
-            Conversation {
-                id: c.group_id,
+            let conversation_kind = storage
+                .conversation_kind(&user_did, &conversation_id)
+                .map_err(|e| js_err!("conversation kind lookup failed: {}", e))?
+                .unwrap_or_else(|| {
+                    if conversation_is_group(&members) {
+                        "group".to_string()
+                    } else {
+                        "direct".to_string()
+                    }
+                });
+            convos.push(Conversation {
+                id: conversation_id,
+                group_id,
                 display_name,
                 members: member_dids.clone(),
+                member_views: Some(members.clone()),
+                conversation_kind: conversation_kind.clone(),
                 last_message: None,
                 last_message_at: None,
                 unread_count: 0,
-                is_group: member_dids.len() > 2,
-            }
-        })
-        .collect();
+                is_group: conversation_kind == "group",
+            });
+        }
+        let Some(next) = page.cursor else { break };
+        if !seen_cursors.insert(next.clone()) {
+            return Err(js_err!("get_conversations pagination repeated cursor"));
+        }
+        cursor = Some(next);
+    }
 
     to_js(&convos)
 }
@@ -1222,17 +1840,34 @@ pub async fn catbird_mls_create_conversation(
     member_dids: Array,
 ) -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
+    use catbird_mls::orchestrator::storage::MLSStorageBackend;
     use catbird_mls::KeyPackageData;
 
-    let (api_client, user_did) = with_state(|s| {
+    let (api_client, storage, user_did) = with_state(|s| {
         let did = s
             .user_did
             .clone()
             .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), did))
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), did))
     })?;
 
     let member_dids_vec = array_to_strings(&member_dids);
+    if member_dids_vec.len() > MAX_CONVERSATION_ITEMS
+        || member_dids_vec
+            .iter()
+            .any(|did| did.is_empty() || did == &user_did)
+    {
+        return Err(js_err!(
+            "conversation invitee list contains an invalid or self DID"
+        ));
+    }
+    let mut unique_member_dids = std::collections::HashSet::new();
+    if member_dids_vec
+        .iter()
+        .any(|did| !unique_member_dids.insert(did.clone()))
+    {
+        return Err(js_err!("conversation invitee list contains duplicate DIDs"));
+    }
     let identity_bytes = user_did.as_bytes().to_vec();
 
     let group_id_bytes = with_state(|s| {
@@ -1245,7 +1880,39 @@ pub async fn catbird_mls_create_conversation(
         Ok(result.group_id)
     })?;
 
-    let (commit_bytes, welcome_bytes) = if member_dids_vec.is_empty() {
+    // Arm cancellation recovery immediately after the speculative MLS group
+    // is created.  Key-package lookup, commit construction, and the network
+    // request can all fail after this point; leaving the intent until after
+    // those steps would strand a group with no replay/cleanup owner.
+    let group_id_str = group_id_bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    if let Err(error) = storage.mark_cleanup_intent(
+        &user_did,
+        &group_id_str,
+        &group_id_str,
+        "create-speculative",
+    ) {
+        let cleanup_error = with_state(|s| {
+            if let Some(ctx) = s.mls_context.as_ref() {
+                ctx.delete_group(group_id_bytes.clone())
+                    .map_err(|e| js_err!("speculative MLS cleanup failed: {:?}", e))?;
+            }
+            Ok(())
+        })
+        .err();
+        return Err(match cleanup_error {
+            Some(cleanup_error) => js_err!(
+                "cannot arm speculative create cleanup: {}; speculative cleanup failed: {:?}",
+                error,
+                cleanup_error
+            ),
+            None => js_err!("cannot arm speculative create cleanup: {}", error),
+        });
+    }
+
+    let (_commit_bytes, welcome_bytes) = if member_dids_vec.is_empty() {
         (None, None)
     } else {
         let (credentials, user_did) = with_state(|s| {
@@ -1293,12 +1960,6 @@ pub async fn catbird_mls_create_conversation(
         (Some(add_result.commit_data), Some(add_result.welcome_data))
     };
 
-    // Encode as hex to match server convention (GroupId = hex-encoded string)
-    let group_id_str: String = group_id_bytes
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
-
     let mut req_body = serde_json::json!({
         "groupId": group_id_str,
         "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
@@ -1308,7 +1969,8 @@ pub async fn catbird_mls_create_conversation(
         req_body["welcomeMessage"] = serde_json::json!({ "$bytes": B64.encode(welcome) });
     }
     let create_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CreateConversation,
+        operation:
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CreateConversation,
         method: "POST".to_string(),
         path: "/xrpc/blue.catbird.chat.createConversation".to_string(),
         body: Some(serde_json::to_vec(&req_body).map_err(|e| js_err!("JSON error: {:?}", e))?),
@@ -1326,20 +1988,181 @@ pub async fn catbird_mls_create_conversation(
     }
     let output: serde_json::Value =
         serde_json::from_slice(&resp.body).map_err(|e| js_err!("JSON decode: {:?}", e))?;
-    let (convo_id, server_epoch) = if let Some(res) = output.get("result") {
-        let coords = res.get("coordinates").unwrap_or(res);
-        (
-            coords
-                .get("conversationId")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&group_id_str)
-                .to_string(),
-            coords.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0),
-        )
-    } else {
-        (group_id_str.clone(), 0)
+    let parsed = parse_create_response(&output, &group_id_str)
+        .map_err(|error| js_err!("invalid create conversation result: {}", error))?;
+
+    // The server can report that a direct conversation already exists. The
+    // locally-created MLS group is speculative and must be discarded; return
+    // one projection for the existing stable conversation instead of adding a
+    // second row keyed by the fresh group id.
+    if let ParsedCreateResponse::ExistingDirect {
+        conversation_id: convo_id,
+        group_id: existing_group_id,
+        epoch: server_epoch,
+    } = parsed.clone()
+    {
+        with_state(|s| {
+            if let Some(ctx) = s.mls_context.as_ref() {
+                ctx.delete_group(group_id_bytes.clone())
+                    .map_err(|e| js_err!("existing direct MLS group cleanup failed: {:?}", e))?;
+            }
+            Ok(())
+        })?;
+        storage
+            .delete_group_state(&group_id_str)
+            .await
+            .map_err(|e| js_err!("existing direct group cleanup failed: {:?}", e))?;
+        storage
+            .delete_conversation_by_group(&user_did, &group_id_str)
+            .map_err(|e| js_err!("existing direct conversation cleanup failed: {}", e))?;
+        storage
+            .clear_cleanup_intent(&user_did, &group_id_str)
+            .map_err(|e| js_err!("existing direct cleanup intent clear failed: {}", e))?;
+
+        let mut existing_view = storage
+            .get_conversation(&user_did, &convo_id)
+            .await
+            .map_err(|e| js_err!("existing conversation lookup failed: {:?}", e))?;
+        // A legacy local projection may have a group and member DIDs but no
+        // persisted roles/creator, so treat any failed final-view validation
+        // as incomplete and fetch the authoritative server projection.
+        let local_view_incomplete = existing_view.as_ref().is_some_and(|view| {
+            validate_existing_direct_view(view, &convo_id, &existing_group_id).is_err()
+        });
+        if existing_view.is_none() || local_view_incomplete {
+            // A race loser may have no local projection (fresh browser,
+            // cleared storage, or a reset during create). Fetch the
+            // authoritative server view instead of fabricating one from the
+            // speculative request.
+            let mut cursor = None;
+            let mut seen_cursors = std::collections::HashSet::new();
+            let mut page_count = 0usize;
+            loop {
+                page_count = page_count.saturating_add(1);
+                if page_count > MAX_CONVERSATION_PAGES {
+                    return Err(js_err!(
+                        "existing direct authoritative lookup exceeded the page ceiling"
+                    ));
+                }
+                let page = api_client
+                    .get_conversations(50, cursor.as_deref())
+                    .await
+                    .map_err(|e| js_err!("existing direct authoritative lookup failed: {:?}", e))?;
+                if page.conversations.len() > 50 {
+                    return Err(js_err!(
+                        "existing direct authoritative lookup exceeded the item ceiling"
+                    ));
+                }
+                if let Some(found) = page
+                    .conversations
+                    .into_iter()
+                    .find(|view| view.conversation_id == convo_id)
+                {
+                    existing_view = Some(found);
+                    break;
+                }
+                let Some(next) = page.cursor else { break };
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(js_err!(
+                        "existing direct conversation pagination repeated cursor"
+                    ));
+                }
+                cursor = Some(next);
+            }
+        }
+        if local_view_incomplete
+            && existing_view
+                .as_ref()
+                .is_some_and(|view| view.group_id.is_empty() || view.members.is_empty())
+        {
+            return Err(js_err!(
+                "existingDirectConversationResult authoritative conversation {} is incomplete",
+                convo_id
+            ));
+        }
+        let existing_view = existing_view.ok_or_else(|| {
+            js_err!(
+                "existingDirectConversationResult authoritative conversation {} was not found",
+                convo_id
+            )
+        })?;
+        validate_existing_direct_view(&existing_view, &convo_id, &existing_group_id)
+            .map_err(|error| js_err!("invalid existing direct authoritative view: {}", error))?;
+        let members = existing_view
+            .members
+            .iter()
+            .map(|member| member.did.clone())
+            .collect::<Vec<_>>();
+        let epoch = if server_epoch > 0 {
+            server_epoch
+        } else {
+            existing_view.epoch
+        };
+        storage
+            .upsert_conversation_projection(
+                &user_did,
+                &convo_id,
+                &existing_group_id,
+                epoch,
+                &existing_view.members,
+                None,
+                None,
+            )
+            .map_err(|e| js_err!("persist existing direct projection failed: {}", e))?;
+
+        let display_name = storage
+            .get_metadata_text(&existing_group_id)
+            .map_err(|e| js_err!("existing direct metadata lookup failed: {}", e))?
+            .and_then(|(title, _)| title)
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| {
+                if members.is_empty() {
+                    name.clone()
+                } else {
+                    members.join(", ")
+                }
+            });
+        SERVER_EPOCHS.with(|cache| cache.borrow_mut().insert(convo_id.clone(), epoch));
+        return to_js(&Conversation {
+            id: convo_id,
+            group_id: existing_group_id,
+            display_name,
+            members: members.clone(),
+            member_views: Some(existing_view.members.clone()),
+            conversation_kind: "direct".to_string(),
+            last_message: None,
+            last_message_at: None,
+            unread_count: 0,
+            is_group: members.len() != 2,
+        });
+    }
+
+    let ParsedCreateResponse::Created {
+        conversation_id: convo_id,
+        group_id: current_group_id,
+        epoch: server_epoch,
+    } = parsed
+    else {
+        unreachable!("existing direct result returned above")
     };
 
+    let create_member_views: Vec<catbird_mls::orchestrator::types::MemberView> =
+        std::iter::once(catbird_mls::orchestrator::types::MemberView {
+            did: user_did.clone(),
+            role: catbird_mls::orchestrator::types::MemberRole::Admin,
+        })
+        .chain(member_dids_vec.iter().cloned().map(|did| {
+            catbird_mls::orchestrator::types::MemberView {
+                did,
+                role: catbird_mls::orchestrator::types::MemberRole::Member,
+            }
+        }))
+        .collect();
+    let create_member_dids: Vec<String> = create_member_views
+        .iter()
+        .map(|member| member.did.clone())
+        .collect();
+    let create_is_group = create_member_dids.len() != 2;
     let create_epoch = if server_epoch > 0 {
         server_epoch
     } else {
@@ -1351,6 +2174,20 @@ pub async fn catbird_mls_create_conversation(
         })
         .unwrap_or(0)
     };
+    storage
+        .upsert_conversation_projection(
+            &user_did,
+            &convo_id,
+            &current_group_id,
+            create_epoch,
+            &create_member_views,
+            None,
+            None,
+        )
+        .map_err(|e| js_err!("persist created conversation projection failed: {}", e))?;
+    storage
+        .clear_cleanup_intent(&user_did, &group_id_str)
+        .map_err(|e| js_err!("create cleanup intent clear failed: {}", e))?;
     SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), create_epoch));
 
     // Mark as recently created so fetch_new_messages won't try to auto-join
@@ -1377,12 +2214,19 @@ pub async fn catbird_mls_create_conversation(
 
     let convo = Conversation {
         id: convo_id.clone(),
+        group_id: current_group_id,
         display_name: name,
-        members: member_dids_vec,
+        members: create_member_dids,
+        member_views: Some(create_member_views),
+        conversation_kind: if create_is_group {
+            "group".to_string()
+        } else {
+            "direct".to_string()
+        },
         last_message: None,
         last_message_at: None,
         unread_count: 0,
-        is_group: true,
+        is_group: create_is_group,
     };
 
     to_js(&convo)
@@ -1395,6 +2239,7 @@ pub async fn catbird_mls_subscribe(
     on_event: js_sys::Function,
     on_status: js_sys::Function,
 ) -> Result<websocket::WsSubscription, JsValue> {
+    let (resolved_convo_id, _) = resolve_conversation_identity(&convo_id)?;
     let (base_url, auth_token) = with_state(|s| {
         let token = s
             .auth_token
@@ -1404,7 +2249,12 @@ pub async fn catbird_mls_subscribe(
     })?;
 
     websocket::connect(
-        convo_id, base_url, auth_token, on_message, on_event, on_status,
+        resolved_convo_id,
+        base_url,
+        auth_token,
+        on_message,
+        on_event,
+        on_status,
     )
     .await
 }
@@ -1432,6 +2282,8 @@ pub async fn catbird_mls_unsubscribe(_convo_id: String) -> Result<(), JsValue> {
 async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
 
+    let (resolved_convo_id, resolved_group_id) = resolve_conversation_identity(convo_id)?;
+
     let (api_client, user_did) = with_state(|s| {
         let did = s
             .user_did
@@ -1443,7 +2295,7 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
     let identity_bytes = user_did.as_bytes().to_vec();
 
     // Delete existing group so OpenMLS doesn't complain about duplicate group IDs
-    let group_id_bytes = decode_group_id(convo_id);
+    let group_id_bytes = decode_group_coordinate(&resolved_group_id);
     if let Some(ref gid) = group_id_bytes {
         STATE.with(|s| {
             let borrowed = s.borrow();
@@ -1456,7 +2308,7 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
     }
 
     let group_info_bytes = api_client
-        .get_group_info(convo_id)
+        .get_group_info(&resolved_convo_id)
         .await
         .map_err(|e| js_err!("rejoin get_group_info failed: {:?}", e))?;
 
@@ -1472,12 +2324,13 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
 
     let input = serde_json::json!({
         "action": "externalCommit",
-        "convoId": convo_id,
+        "convoId": resolved_convo_id,
         "commit": { "$bytes": B64.encode(&ext_commit.commit_data) },
         "idempotencyKey": uuid::Uuid::new_v4().to_string(),
     });
     let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
+        operation:
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
         method: "POST".to_string(),
         path: "/xrpc/blue.catbird.chat.submitTransition".to_string(),
         body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
@@ -1508,7 +2361,7 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
 
     SERVER_EPOCHS.with(|m| {
         m.borrow_mut()
-            .insert(convo_id.to_string(), server_epoch)
+            .insert(resolved_convo_id.clone(), server_epoch)
     });
 
     // Publish updated GroupInfo so other clients can also external-commit join
@@ -1522,7 +2375,10 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
     });
     match publish_result {
         Ok(gi_bytes) => {
-            if let Err(e) = api_client.publish_group_info(convo_id, &gi_bytes).await {
+            if let Err(e) = api_client
+                .publish_group_info(&resolved_convo_id, &gi_bytes)
+                .await
+            {
                 web_sys::console::warn_1(&js_err!(
                     "catbird-mls-web: publish_group_info failed after rejoin: {:?}",
                     e
@@ -1539,7 +2395,7 @@ async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
 
     web_sys::console::log_1(&js_err!(
         "catbird-mls-web: rejoin_group({}) — server_epoch={}, local_epoch={}",
-        convo_id,
+        resolved_convo_id,
         server_epoch,
         local_epoch
     ));
@@ -1553,16 +2409,21 @@ async fn send_payload_message_internal(
 ) -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
 
-    let (api_client, user_did) = with_state(|s| {
+    let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&convo_id)?;
+    let (api_client, storage, user_did) = with_state(|s| {
         let did = s
             .user_did
             .clone()
             .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), did))
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), did))
     })?;
 
-    let group_id_bytes = decode_group_id(&convo_id)
-        .ok_or_else(|| js_err!("Invalid convo_id '{}': not hex or base64url", convo_id))?;
+    let group_id_bytes = decode_group_coordinate(&group_id_hex).ok_or_else(|| {
+        js_err!(
+            "Invalid MLS group id '{}': not hex or base64url",
+            group_id_hex
+        )
+    })?;
 
     // Encode as MLSMessagePayload JSON envelope (interoperable with iOS Catbird)
     let payload_bytes = payload
@@ -1576,8 +2437,7 @@ async fn send_payload_message_internal(
     let msg_id = uuid::Uuid::new_v4().to_string();
 
     // Try sending up to 3 times, syncing epoch on 409 conflict
-    let mut last_err = String::new();
-    for attempt in 0..3 {
+    for _attempt in 0..3 {
         // Try encrypt; if group not found locally, auto-join first
         let encrypt_result = {
             let first_try = with_state(|s| {
@@ -1602,10 +2462,9 @@ async fn send_payload_message_internal(
                     use catbird_mls::orchestrator::storage::MLSStorageBackend;
                     web_sys::console::warn_1(&js_err!(
                         "catbird-mls-web: group {} not found locally for send — flagging for deferred rejoin",
-                        convo_id
+                        resolved_convo_id
                     ));
-                    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
-                    let _ = storage.mark_needs_rejoin(&convo_id).await;
+                    let _ = storage.mark_needs_rejoin(&resolved_convo_id).await;
                     return Err(js_err!(
                         "Group not found locally — sync in progress, please retry"
                     ));
@@ -1628,30 +2487,33 @@ async fn send_payload_message_internal(
             // If MLS context returned an epoch, use it and update cache
             if let Some(e) = mls_epoch {
                 if e > 0 {
-                    SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), e));
+                    SERVER_EPOCHS.with(|m| m.borrow_mut().insert(resolved_convo_id.clone(), e));
                 }
                 // Still prefer server cache if it's higher (server may be ahead after commits)
-                let cached = SERVER_EPOCHS.with(|m| m.borrow().get(&convo_id).copied());
+                let cached = SERVER_EPOCHS.with(|m| m.borrow().get(&resolved_convo_id).copied());
                 cached.unwrap_or(e)
             } else {
                 SERVER_EPOCHS
-                    .with(|m| m.borrow().get(&convo_id).copied())
+                    .with(|m| m.borrow().get(&resolved_convo_id).copied())
                     .unwrap_or(0)
             }
         };
 
         let send_input = serde_json::json!({
-            "convoId": convo_id,
+            "convoId": resolved_convo_id.clone(),
             "ciphertext": { "$bytes": B64.encode(&encrypt_result.ciphertext) },
             "epoch": epoch,
-            "msgId": msg_id,
+            "msgId": msg_id.clone(),
             "paddedSize": encrypt_result.ciphertext.len() as u32,
         });
         let send_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-            operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage,
+            operation:
+                catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage,
             method: "POST".to_string(),
             path: "/xrpc/blue.catbird.chat.sendMessage".to_string(),
-            body: Some(serde_json::to_vec(&send_input).map_err(|e| js_err!("JSON error: {:?}", e))?),
+            body: Some(
+                serde_json::to_vec(&send_input).map_err(|e| js_err!("JSON error: {:?}", e))?,
+            ),
         };
         match api_client.submit_prepared_request(send_req).await {
             Ok(resp) if resp.status == 200 => {
@@ -1659,10 +2521,9 @@ async fn send_payload_message_internal(
                 let now = chrono::Utc::now();
                 {
                     use catbird_mls::orchestrator::storage::MLSStorageBackend;
-                    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
                     let stored_msg = catbird_mls::orchestrator::types::Message {
                         id: msg_id.clone(),
-                        conversation_id: convo_id.clone(),
+                        conversation_id: resolved_convo_id.clone(),
                         sender_did: user_did.clone(),
                         text: display_text.clone(),
                         timestamp: now,
@@ -1682,7 +2543,7 @@ async fn send_payload_message_internal(
                 let message =
                     ui_message_from_orchestrator(catbird_mls::orchestrator::types::Message {
                         id: msg_id.clone(),
-                        conversation_id: convo_id,
+                        conversation_id: resolved_convo_id.clone(),
                         sender_did: user_did,
                         text: display_text.clone(),
                         timestamp: now,
@@ -1706,12 +2567,15 @@ async fn send_payload_message_internal(
                 if is_409 {
                     web_sys::console::warn_1(&js_err!(
                         "catbird-mls-web: send_message 409 conflict for {}: server_epoch_hint={:?}, client_epoch={}",
-                        convo_id,
+                        resolved_convo_id,
                         server_epoch_hint,
                         epoch
                     ));
                     if let Some(target_epoch) = server_epoch_hint {
-                        SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), target_epoch));
+                        SERVER_EPOCHS.with(|m| {
+                            m.borrow_mut()
+                                .insert(resolved_convo_id.clone(), target_epoch)
+                        });
                     }
                 }
                 return Err(js_err!(
@@ -1726,7 +2590,7 @@ async fn send_payload_message_internal(
         }
     }
 
-    Err(js_err!("send_message failed after retries: {}", last_err))
+    Err(js_err!("send_message failed after retries"))
 }
 
 #[wasm_bindgen]
@@ -1822,21 +2686,23 @@ pub async fn catbird_mls_messages(
     convo_id: String,
     before: Option<String>,
 ) -> Result<JsValue, JsValue> {
-    use catbird_mls::orchestrator::storage::MLSStorageBackend;
-
+    let (resolved_convo_id, _group_id) = resolve_conversation_identity(&convo_id)?;
     let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
 
-    let before_seq = before.as_deref().and_then(|b| b.parse::<u64>().ok());
-
     let stored = storage
-        .get_messages(&convo_id, 50, before_seq)
+        .get_messages_before_cursor(&resolved_convo_id, 50, before.as_deref())
         .await
         .map_err(|e| js_err!("get_messages failed: {:?}", e))?;
 
     let messages: Vec<Message> = stored
         .into_iter()
         .filter(|m| m.has_displayable_body())
-        .map(ui_message_from_orchestrator)
+        .map(|mut message| {
+            // Legacy rows may still carry the group id. Normalize the UI/API
+            // projection to the stable conversation identity.
+            message.conversation_id = resolved_convo_id.clone();
+            ui_message_from_orchestrator(message)
+        })
         .collect();
 
     to_js(&messages)
@@ -1848,39 +2714,50 @@ pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue,
     use catbird_mls::orchestrator::storage::MLSStorageBackend;
     use catbird_mls::orchestrator::types::MLSMessagePayload;
 
+    let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&convo_id)?;
     let (api_client, user_did, storage) = with_state(|s| {
         let did = s.user_did.clone().unwrap_or_default();
         Ok((Arc::clone(&s.api_client), did, Arc::clone(&s.storage)))
     })?;
 
-    let stored_cursor = SYNC_CURSORS.with(|m| m.borrow().get(&convo_id).cloned());
+    let stored_cursor = SYNC_CURSORS.with(|m| m.borrow().get(&resolved_convo_id).cloned());
     let (envelopes, new_cursor) = api_client
-        .get_messages(&convo_id, stored_cursor.as_deref(), 50, None, None, None)
+        .get_messages(
+            &resolved_convo_id,
+            stored_cursor.as_deref(),
+            50,
+            None,
+            None,
+            None,
+        )
         .await
         .map_err(|e| js_err!("fetch_new_messages failed: {:?}", e))?;
 
     // Update sync cursor for next poll
     if let Some(ref cursor) = new_cursor {
-        SYNC_CURSORS.with(|m| m.borrow_mut().insert(convo_id.clone(), cursor.clone()));
+        SYNC_CURSORS.with(|m| {
+            m.borrow_mut()
+                .insert(resolved_convo_id.clone(), cursor.clone())
+        });
     }
 
-    let group_id_bytes = decode_group_id(&convo_id);
+    let group_id_bytes = decode_group_coordinate(&group_id_hex);
 
     web_sys::console::log_1(&js_err!(
         "catbird-mls-web: fetch_new_messages({}) — {} envelopes, group_id_decoded={}",
-        convo_id,
+        resolved_convo_id,
         envelopes.len(),
         group_id_bytes.is_some()
     ));
 
     // Before decrypting, check if the group exists locally. If not, try to join.
     // Skip auto-join for groups we just created (we're already a member).
-    let recently_created = RECENTLY_CREATED.with(|s| s.borrow().contains(&convo_id));
+    let recently_created = RECENTLY_CREATED.with(|s| s.borrow().contains(&resolved_convo_id));
     if let Some(ref gid) = group_id_bytes {
         if recently_created {
             web_sys::console::log_1(&js_err!(
                 "catbird-mls-web: skipping auto-join for recently created group {}",
-                convo_id
+                resolved_convo_id
             ));
         } else {
             let group_exists = STATE.with(|s| {
@@ -1894,19 +2771,19 @@ pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue,
             });
 
             if !group_exists {
-                match try_join_group_internal(&convo_id).await {
+                match try_join_group_internal(&resolved_convo_id).await {
                     Ok(result) => {
                         let status = result["status"].as_str().unwrap_or("unknown");
                         web_sys::console::log_1(&js_err!(
                             "catbird-mls-web: auto-joined group {} ({})",
-                            convo_id,
+                            resolved_convo_id,
                             status
                         ));
                     }
                     Err(e) => {
                         web_sys::console::warn_1(&js_err!(
                             "catbird-mls-web: auto-join failed for {}: {:?}",
-                            convo_id,
+                            resolved_convo_id,
                             e
                         ));
                     }
@@ -1971,7 +2848,7 @@ pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue,
                                 return Some((
                                     catbird_mls::orchestrator::types::Message {
                                         id: msg_id.clone(),
-                                        conversation_id: env.conversation_id.clone(),
+                                        conversation_id: resolved_convo_id.clone(),
                                         sender_did: sender.clone(),
                                         text,
                                         timestamp: env.timestamp,
@@ -2029,9 +2906,10 @@ pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue,
             None => None,
         };
 
-        let Some((storage_msg, _sender_did)) = decoded else {
+        let Some((mut storage_msg, _sender_did)) = decoded else {
             continue;
         };
+        storage_msg.conversation_id = resolved_convo_id.clone();
 
         // Record as seen for dedup against WebSocket path
         SEEN_MSG_IDS.with(|s| {
@@ -2061,12 +2939,29 @@ pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue,
         });
         if let Some(epoch) = updated_epoch {
             if epoch > 0 {
-                SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), epoch));
+                SERVER_EPOCHS.with(|m| m.borrow_mut().insert(resolved_convo_id.clone(), epoch));
             }
         }
     }
 
     to_js(&messages)
+}
+
+/// Build the shared MLS reaction envelope. Reactions are application
+/// messages, not a cleartext delivery-service action; the stable conversation
+/// route and current group coordinate are selected by
+/// `send_payload_message_internal` after identity resolution.
+fn reaction_payload_for_wire(
+    message_id: &str,
+    emoji: &str,
+    action: &str,
+) -> Result<catbird_mls::orchestrator::types::MLSMessagePayload, String> {
+    let action = match action {
+        "add" => catbird_mls::orchestrator::types::ReactionAction::Add,
+        "remove" => catbird_mls::orchestrator::types::ReactionAction::Remove,
+        other => return Err(format!("unsupported reaction action: {}", other)),
+    };
+    Ok(catbird_mls::orchestrator::types::MLSMessagePayload::reaction(message_id, emoji, action))
 }
 
 #[wasm_bindgen]
@@ -2076,92 +2971,24 @@ pub async fn catbird_mls_send_reaction(
     emoji: String,
     action: String,
 ) -> Result<(), JsValue> {
-    let (base_url, auth_token, proxy_did) = with_state(|s| {
-        let token = s
-            .auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((s.base_url.clone(), token, s.proxy_did.clone()))
-    })?;
-
-    let client = proxy_client(&proxy_did);
-    let action_name = if action == "remove" {
-        "removeReaction"
-    } else {
-        "addReaction"
-    };
-
-    let no_op_ciphertext = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 512]);
-
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "delivery": "ephemeral",
-        "action": action_name,
-        "targetMessageId": message_id,
-        "reactionEmoji": emoji,
-        "msgId": uuid::Uuid::new_v4().to_string(),
-        "epoch": 0,
-        "paddedSize": 512,
-        "ciphertext": { "$bytes": no_op_ciphertext },
-    });
-
-    let resp = client
-        .post(format!(
-            "{}/xrpc/blue.catbird.chat.sendMessage",
-            base_url
-        ))
-        .bearer_auth(&auth_token)
-        .json(&input)
-        .send()
-        .await
-        .map_err(|e| js_err!("Reaction update failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(js_err!("Reaction update failed ({}): {}", status, body));
-    }
+    let (resolved_convo_id, _) = resolve_conversation_identity(&conversation_id)?;
+    let payload = reaction_payload_for_wire(&message_id, &emoji, &action)
+        .map_err(|error| js_err!("send reaction failed: {}", error))?;
+    // The shared send path encrypts the complete reaction envelope with the
+    // current MLS group, submits the stable conversation route, and persists
+    // the resulting message. Historical-alias message IDs remain untouched
+    // inside the encrypted payload for cross-reset targeting.
+    send_payload_message_internal(resolved_convo_id, payload).await?;
 
     Ok(())
 }
 
 #[wasm_bindgen]
 pub async fn catbird_mls_update_cursor(
-    conversation_id: String,
-    cursor: String,
+    _conversation_id: String,
+    _cursor: String,
 ) -> Result<(), JsValue> {
-    let (base_url, auth_token, proxy_did) = with_state(|s| {
-        let token = s
-            .auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((s.base_url.clone(), token, s.proxy_did.clone()))
-    })?;
-
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "cursor": cursor,
-    });
-
-    let client = proxy_client(&proxy_did);
-    let resp = client
-        .post(format!(
-            "{}/xrpc/blue.catbird.chat.submitTransition",
-            base_url
-        ))
-        .bearer_auth(&auth_token)
-        .json(&input)
-        .send()
-        .await
-        .map_err(|e| js_err!("Update cursor failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(js_err!("Update cursor failed ({}): {}", status, body));
-    }
-
-    Ok(())
+    Err(js_err!("legacy mlsChat updateCursor is disabled; subscription cursors are managed via subscribeEvents"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2172,6 +2999,7 @@ pub async fn catbird_mls_update_cursor(
 pub async fn catbird_mls_get_members(conversation_id: String) -> Result<JsValue, JsValue> {
     use catbird_mls::orchestrator::storage::MLSStorageBackend;
 
+    let (resolved_convo_id, _group_id) = resolve_conversation_identity(&conversation_id)?;
     let (storage, user_did) = with_state(|s| {
         let did = s
             .user_did
@@ -2181,7 +3009,7 @@ pub async fn catbird_mls_get_members(conversation_id: String) -> Result<JsValue,
     })?;
 
     let convo = storage
-        .get_conversation(&user_did, &conversation_id)
+        .get_conversation(&user_did, &resolved_convo_id)
         .await
         .map_err(|e| js_err!("get_group_members storage error: {:?}", e))?;
 
@@ -2193,7 +3021,10 @@ pub async fn catbird_mls_get_members(conversation_id: String) -> Result<JsValue,
                 did: m.did.clone(),
                 handle: String::new(),
                 display_name: None,
-                role: format!("{:?}", m.role),
+                role: match m.role {
+                    catbird_mls::orchestrator::types::MemberRole::Admin => "admin".to_string(),
+                    catbird_mls::orchestrator::types::MemberRole::Member => "member".to_string(),
+                },
             })
             .collect(),
         None => vec![],
@@ -2225,9 +3056,11 @@ pub async fn catbird_mls_add_group_members(
 
     let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
 
-    // Resolve conversation ID → group ID bytes (hex-encoded on server).
-    let group_id_bytes = decode_group_id(&conversation_id)
-        .ok_or_else(|| js_err!("Invalid conversation/group ID: {}", conversation_id))?;
+    // Resolve stable conversation ID → current group ID bytes. Legacy group
+    // callers remain accepted when no durable mapping exists.
+    let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&conversation_id)?;
+    let group_id_bytes = decode_group_coordinate(&group_id_hex)
+        .ok_or_else(|| js_err!("Invalid conversation/group ID: {}", group_id_hex))?;
 
     // 1. Fetch key packages for all new members in one batch request.
     let (credentials, user_did) = with_state(|s| {
@@ -2273,27 +3106,31 @@ pub async fn catbird_mls_add_group_members(
     // 3. Send commit + welcome to server.
     let mut input = serde_json::json!({
         "action": "addMembers",
-        "convoId": conversation_id,
+        "convoId": resolved_convo_id,
         "memberDids": member_dids_vec,
         "commit": { "$bytes": B64.encode(&add_result.commit_data) },
         "idempotencyKey": uuid::Uuid::new_v4().to_string(),
     });
     input["welcome"] = serde_json::json!({ "$bytes": B64.encode(&add_result.welcome_data) });
     let add_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
+        operation:
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
         method: "POST".to_string(),
         path: "/xrpc/blue.catbird.chat.submitTransition".to_string(),
         body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
     };
-    let response = api_client.submit_prepared_request(add_req).await.map_err(|e| {
-        let _ = with_state(|s| {
-            if let Some(ctx) = s.mls_context.as_ref() {
-                let _ = ctx.clear_pending_commit(group_id_bytes.clone());
-            }
-            Ok(())
-        });
-        js_err!("add_members server call failed: {:?}", e)
-    })?;
+    let response = api_client
+        .submit_prepared_request(add_req)
+        .await
+        .map_err(|e| {
+            let _ = with_state(|s| {
+                if let Some(ctx) = s.mls_context.as_ref() {
+                    let _ = ctx.clear_pending_commit(group_id_bytes.clone());
+                }
+                Ok(())
+            });
+            js_err!("add_members server call failed: {:?}", e)
+        })?;
     if response.status != 200 {
         let _ = with_state(|s| {
             if let Some(ctx) = s.mls_context.as_ref() {
@@ -2323,40 +3160,10 @@ pub async fn catbird_mls_add_participants(
 
 #[wasm_bindgen]
 pub async fn catbird_mls_demote_member(
-    conversation_id: String,
-    target_did: String,
+    _conversation_id: String,
+    _target_did: String,
 ) -> Result<(), JsValue> {
-    let (base_url, auth_token, proxy_did) = with_state(|s| {
-        let token = s
-            .auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((s.base_url.clone(), token, s.proxy_did.clone()))
-    })?;
-
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "targetDid": target_did,
-    });
-
-    let client = proxy_client(&proxy_did);
-    let resp = client
-        .post(format!(
-            "{}/xrpc/blue.catbird.chat.submitTransition",
-            base_url
-        ))
-        .bearer_auth(&auth_token)
-        .json(&input)
-        .send()
-        .await
-        .map_err(|e| js_err!("demote_member failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(js_err!("demote_member failed: {}", body));
-    }
-
-    Ok(())
+    Err(js_err!("demoteAdmin is a signed policy transition and is not wired in WASM"))
 }
 
 #[wasm_bindgen]
@@ -2364,10 +3171,11 @@ pub async fn catbird_mls_remove_participants(
     conversation_id: String,
     target_did: String,
 ) -> Result<(), JsValue> {
+    let (resolved_convo_id, _group_id) = resolve_conversation_identity(&conversation_id)?;
     let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
 
     let input = serde_json::json!({
-        "convoId": conversation_id,
+        "convoId": resolved_convo_id,
         "targetDid": target_did,
     });
     let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
@@ -2394,10 +3202,11 @@ pub async fn catbird_mls_remove_participants(
 /// Leave a conversation.
 #[wasm_bindgen]
 pub async fn catbird_mls_leave_conversation(conversation_id: String) -> Result<(), JsValue> {
+    let (resolved_convo_id, _group_id) = resolve_conversation_identity(&conversation_id)?;
     let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
 
     let input = serde_json::json!({
-        "convoId": conversation_id,
+        "convoId": resolved_convo_id,
     });
     let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
         operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestLeave,
@@ -2426,41 +3235,10 @@ pub async fn catbird_mls_leave_conversation(conversation_id: String) -> Result<(
 
 #[wasm_bindgen]
 pub async fn catbird_mls_send_typing(
-    conversation_id: String,
-    is_typing: bool,
+    _conversation_id: String,
+    _is_typing: bool,
 ) -> Result<(), JsValue> {
-    let (base_url, auth_token, proxy_did) = with_state(|s| {
-        let token = s
-            .auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((s.base_url.clone(), token, s.proxy_did.clone()))
-    })?;
-
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "isTyping": is_typing,
-    });
-
-    let client = proxy_client(&proxy_did);
-    let resp = client
-        .post(format!(
-            "{}/xrpc/blue.catbird.chat.publishTyping",
-            base_url
-        ))
-        .bearer_auth(&auth_token)
-        .json(&input)
-        .send()
-        .await
-        .map_err(|e| js_err!("Typing update failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(js_err!("Typing update failed ({}): {}", status, body));
-    }
-
-    Ok(())
+    Err(js_err!("Typing is temporarily unavailable: canonical signed typing transport is not wired in WASM"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2469,40 +3247,10 @@ pub async fn catbird_mls_send_typing(
 
 #[wasm_bindgen]
 pub async fn catbird_mls_promote_member(
-    conversation_id: String,
-    target_did: String,
+    _conversation_id: String,
+    _target_did: String,
 ) -> Result<(), JsValue> {
-    let (base_url, auth_token, proxy_did) = with_state(|s| {
-        let token = s
-            .auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((s.base_url.clone(), token, s.proxy_did.clone()))
-    })?;
-
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "targetDid": target_did,
-    });
-
-    let client = proxy_client(&proxy_did);
-    let resp = client
-        .post(format!(
-            "{}/xrpc/blue.catbird.chat.submitTransition",
-            base_url
-        ))
-        .bearer_auth(&auth_token)
-        .json(&input)
-        .send()
-        .await
-        .map_err(|e| js_err!("promote_member failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(js_err!("promote_member failed: {}", body));
-    }
-
-    Ok(())
+    Err(js_err!("promoteAdmin is a signed policy transition and is not wired in WASM"))
 }
 
 /// Read MLS group metadata (title/description/avatar) from local decrypted
@@ -2513,13 +3261,25 @@ pub async fn catbird_mls_promote_member(
 /// commit-merge). Returns `null` if no bootstrap has run for this group.
 #[wasm_bindgen]
 pub fn catbird_mls_get_group_metadata(conversation_id: String) -> Result<JsValue, JsValue> {
-    let group_id_hex = match decode_group_id(&conversation_id) {
-        Some(b) => hex::encode(b),
-        None => return Ok(JsValue::NULL),
-    };
+    let (_resolved_convo_id, group_id_hex) = resolve_conversation_identity(&conversation_id)?;
+    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+    let text = storage
+        .get_metadata_text(&group_id_hex)
+        .map_err(|e| js_err!("get group metadata failed: {}", e))?;
+    let avatar = storage
+        .get_metadata_avatar(&group_id_hex)
+        .map_err(|e| js_err!("get group avatar failed: {}", e))?;
 
-    let text = with_state(|s| Ok(s.storage.get_metadata_text(&group_id_hex).ok().flatten()))?;
-    let avatar = with_state(|s| Ok(s.storage.get_metadata_avatar(&group_id_hex).ok().flatten()))?;
+    // A successfully resolved projection with no bootstrapped metadata is the
+    // only absence case. Unknown mappings and storage failures have already
+    // returned errors above and must not be collapsed into `null`.
+    if text
+        .as_ref()
+        .is_some_and(|(title, description)| title.is_none() && description.is_none())
+        && avatar.is_none()
+    {
+        return Ok(JsValue::NULL);
+    }
 
     match text {
         Some((title, description)) => {
@@ -2561,12 +3321,17 @@ pub async fn catbird_mls_update_group_metadata(
 ) -> Result<JsValue, JsValue> {
     use catbird_mls::metadata;
 
-    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
-    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+    let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&conversation_id)?;
+    let (api_client, storage, user_did) = with_state(|s| {
+        let user_did = s
+            .user_did
+            .clone()
+            .ok_or_else(|| js_err!("Not authenticated"))?;
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
+    })?;
 
-    let group_id_bytes = decode_group_id(&conversation_id)
-        .ok_or_else(|| js_err!("Invalid conversation/group ID: {}", conversation_id))?;
-    let group_id_hex = hex::encode(&group_id_bytes);
+    let group_id_bytes = decode_group_coordinate(&group_id_hex)
+        .ok_or_else(|| js_err!("Invalid conversation/group ID: {}", group_id_hex))?;
 
     // 1. Stage the GroupContextExtensions commit locally.
     let commit_bytes = with_state(|s| {
@@ -2580,7 +3345,7 @@ pub async fn catbird_mls_update_group_metadata(
 
     // 2. Send commit to server (action = "updateMetadata").
     let (success, new_epoch) = match api_client
-        .commit_update_metadata(&conversation_id, &commit_bytes)
+        .commit_update_metadata(&resolved_convo_id, &commit_bytes)
         .await
     {
         Ok(r) => r,
@@ -2620,7 +3385,7 @@ pub async fn catbird_mls_update_group_metadata(
 
     // 4. Cache server epoch.
     if new_epoch > 0 {
-        SERVER_EPOCHS.with(|m| m.borrow_mut().insert(conversation_id.clone(), new_epoch));
+        SERVER_EPOCHS.with(|m| m.borrow_mut().insert(resolved_convo_id.clone(), new_epoch));
     }
 
     // 5. Read post-merge MetadataReference + derive metadata key from new
@@ -2709,15 +3474,17 @@ pub async fn catbird_mls_update_group_metadata(
 
     // 9. Persist the decrypted state locally so the conversation list /
     //    header render the new title/description without a re-fetch.
-    let _ = storage.upsert_metadata(
-        &group_id_hex,
-        Some(&payload.title),
-        Some(&payload.description),
-        metadata_version as i64,
-        avatar_blob_locator.as_deref(),
-        avatar_content_type.as_deref(),
-        avatar_bytes.as_deref(),
-    );
+    storage
+        .upsert_metadata(
+            &group_id_hex,
+            Some(&payload.title),
+            Some(&payload.description),
+            metadata_version as i64,
+            avatar_blob_locator.as_deref(),
+            avatar_content_type.as_deref(),
+            avatar_bytes.as_deref(),
+        )
+        .map_err(|e| js_err!("persist group metadata failed: {}", e))?;
 
     // 10. Echo result back to JS.
     let reference_json = serde_json::to_value(&reference)
@@ -2749,10 +3516,15 @@ pub async fn catbird_mls_update_group_metadata(
 pub async fn wasm_bootstrap_group_metadata(group_id_hex: String) -> Result<JsValue, JsValue> {
     use catbird_mls::metadata;
 
-    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
-    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+    let (api_client, storage, user_did) = with_state(|s| {
+        let user_did = s
+            .user_did
+            .clone()
+            .ok_or_else(|| js_err!("Not authenticated"))?;
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
+    })?;
 
-    let group_id_bytes = decode_group_id(&group_id_hex)
+    let group_id_bytes = decode_group_coordinate(&group_id_hex)
         .ok_or_else(|| js_err!("Invalid group_id_hex: {}", group_id_hex))?;
     let group_id_hex_norm = hex::encode(&group_id_bytes);
 
@@ -2844,15 +3616,17 @@ pub async fn wasm_bootstrap_group_metadata(group_id_hex: String) -> Result<JsVal
     }
 
     // Persist locally.
-    let _ = storage.upsert_metadata(
-        &group_id_hex_norm,
-        Some(&payload.title),
-        Some(&payload.description),
-        metadata_version as i64,
-        payload.avatar_blob_locator.as_deref(),
-        payload.avatar_content_type.as_deref(),
-        avatar_bytes.as_deref(),
-    );
+    storage
+        .upsert_metadata(
+            &group_id_hex_norm,
+            Some(&payload.title),
+            Some(&payload.description),
+            metadata_version as i64,
+            payload.avatar_blob_locator.as_deref(),
+            payload.avatar_content_type.as_deref(),
+            avatar_bytes.as_deref(),
+        )
+        .map_err(|e| js_err!("persist group metadata failed: {}", e))?;
 
     // Build JS object.
     let avatar_b64 = avatar_bytes
@@ -2889,21 +3663,29 @@ pub async fn wasm_republish_metadata_after_reset(
 ) -> Result<JsValue, JsValue> {
     use catbird_mls::metadata;
 
-    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
-    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+    let (api_client, storage, user_did) = with_state(|s| {
+        let user_did = s
+            .user_did
+            .clone()
+            .ok_or_else(|| js_err!("Not authenticated"))?;
+        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
+    })?;
 
-    let group_id_bytes = decode_group_id(&new_group_id_hex)
+    let group_id_bytes = decode_group_coordinate(&new_group_id_hex)
         .ok_or_else(|| js_err!("Invalid new_group_id_hex: {}", new_group_id_hex))?;
     let group_id_hex_norm = hex::encode(&group_id_bytes);
 
-    // 1. Read locally cached title/description/avatar from previous group.
-    let (title_opt, desc_opt) = storage
-        .get_metadata_text(&group_id_hex_norm)
-        .map_err(|e| js_err!("get_metadata_text: {}", e))?
-        .unwrap_or((None, None));
-    let avatar = storage
-        .get_metadata_avatar(&group_id_hex_norm)
-        .map_err(|e| js_err!("get_metadata_avatar: {}", e))?;
+    // 1. Resolve the target through the durable stable/alias map, then read
+    // metadata from the stable projection. Reset keeps historical group rows
+    // for crypto/AAD but metadata belongs to the stable application row.
+    let stable_conversation_id = storage
+        .resolve_conversation_mapping(&user_did, &group_id_hex_norm)
+        .map_err(|e| js_err!("metadata identity lookup failed: {}", e))?
+        .map(|(conversation_id, _)| conversation_id)
+        .ok_or_else(|| js_err!("metadata group {} has no stable mapping", group_id_hex_norm))?;
+    let (title_opt, desc_opt, avatar, _stored_metadata_version) = storage
+        .get_metadata_for_conversation(&user_did, &stable_conversation_id)
+        .map_err(|e| js_err!("get stable metadata: {}", e))?;
 
     let title = title_opt.unwrap_or_default();
     let description = desc_opt.unwrap_or_default();
@@ -2925,7 +3707,7 @@ pub async fn wasm_republish_metadata_after_reset(
     })?;
 
     let (success, new_epoch) = api_client
-        .commit_update_metadata(&group_id_hex_norm, &commit_bytes)
+        .commit_update_metadata(&stable_conversation_id, &commit_bytes)
         .await
         .map_err(|e| {
             let _ = with_state(|s| {
@@ -3037,15 +3819,17 @@ pub async fn wasm_republish_metadata_after_reset(
 
     // 6. Persist the (possibly-new-locator) avatar metadata so subsequent
     //    bootstraps round-trip cleanly.
-    let _ = storage.upsert_metadata(
-        &group_id_hex_norm,
-        Some(&title),
-        Some(&description),
-        metadata_version as i64,
-        avatar_blob_locator.as_deref(),
-        avatar_content_type.as_deref(),
-        avatar_bytes.as_deref(),
-    );
+    storage
+        .upsert_metadata(
+            &group_id_hex_norm,
+            Some(&title),
+            Some(&description),
+            metadata_version as i64,
+            avatar_blob_locator.as_deref(),
+            avatar_content_type.as_deref(),
+            avatar_bytes.as_deref(),
+        )
+        .map_err(|e| js_err!("persist reset metadata failed: {}", e))?;
 
     let _ = reset_generation;
     to_js(&serde_json::json!({
@@ -3067,6 +3851,9 @@ pub async fn catbird_mls_get_profiles(dids: Array) -> Result<JsValue, JsValue> {
     if dids.is_empty() {
         return to_js(&Vec::<ProfileView>::new());
     }
+    if dids.len() > MAX_CONVERSATION_ITEMS {
+        return Err(js_err!("profile request exceeded the item ceiling"));
+    }
 
     let auth_token = with_state(|s| {
         s.auth_token
@@ -3075,43 +3862,50 @@ pub async fn catbird_mls_get_profiles(dids: Array) -> Result<JsValue, JsValue> {
     })?;
 
     let client = reqwest::Client::new();
-    let mut url =
-        reqwest::Url::parse("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles")
-            .map_err(|e| js_err!("URL parse error: {}", e))?;
+    let mut profiles = Vec::with_capacity(dids.len());
+    // app.bsky.actor.getProfiles has a hard 25-actor request limit. Chunking
+    // here also gives callers a deterministic item ceiling per HTTP request.
+    for chunk in dids.chunks(25) {
+        let mut url =
+            reqwest::Url::parse("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles")
+                .map_err(|e| js_err!("URL parse error: {}", e))?;
+        for did in chunk {
+            url.query_pairs_mut().append_pair("actors", did);
+        }
 
-    for did in &dids {
-        url.query_pairs_mut().append_pair("actors", did);
+        let resp = client
+            .get(url)
+            .bearer_auth(&auth_token)
+            .send()
+            .await
+            .map_err(|e| js_err!("Profile fetch failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(js_err!("Profile fetch failed: {}", resp.status()));
+        }
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| js_err!("Profile parse failed: {}", e))?;
+
+        if let Some(arr) = data["profiles"].as_array() {
+            if arr.len() > 25 {
+                return Err(js_err!(
+                    "Profile response exceeded the 25-item page ceiling"
+                ));
+            }
+            if profiles.len().saturating_add(arr.len()) > MAX_CONVERSATION_ITEMS {
+                return Err(js_err!("profile results exceeded the item ceiling"));
+            }
+            profiles.extend(arr.iter().map(|p| ProfileView {
+                did: p["did"].as_str().unwrap_or("").to_string(),
+                handle: p["handle"].as_str().unwrap_or("").to_string(),
+                display_name: p["displayName"].as_str().map(str::to_string),
+                avatar: p["avatar"].as_str().map(str::to_string),
+            }));
+        }
     }
-
-    let resp = client
-        .get(url)
-        .bearer_auth(&auth_token)
-        .send()
-        .await
-        .map_err(|e| js_err!("Profile fetch failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(js_err!("Profile fetch failed: {}", resp.status()));
-    }
-
-    let data: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| js_err!("Profile parse failed: {}", e))?;
-
-    let profiles: Vec<ProfileView> = data["profiles"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|p| ProfileView {
-                    did: p["did"].as_str().unwrap_or("").to_string(),
-                    handle: p["handle"].as_str().unwrap_or("").to_string(),
-                    display_name: p["displayName"].as_str().map(str::to_string),
-                    avatar: p["avatar"].as_str().map(str::to_string),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
 
     to_js(&profiles)
 }
@@ -3327,27 +4121,21 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
 
         // 2. Try Welcome → External Commit ladder.
         if try_join_group_internal(&convo_id).await.is_ok() {
-            let _ = storage
-                .set_conversation_state(&convo_id, ConversationState::Active)
-                .await;
-            let _ = storage.clear_reset_pending_for_delete(&convo_id, reset_generation).await;
-            let _ = storage.clear_rejoin_flag(&convo_id).await;
             web_sys::console::log_1(&js_err!(
-                "[deferred-recovery] {}: cleared via Welcome/ExternalCommit",
+                "[deferred-recovery] {}: atomically completed via Welcome/ExternalCommit",
                 convo_id
             ));
             continue;
         }
 
         // 3. First-responder bootstrap fallback.
-        let new_group_id_bytes = match hex::decode(&new_group_id_hex) {
-            Ok(b) => b,
-            Err(e) => {
+        let new_group_id_bytes = match decode_group_coordinate(&new_group_id_hex) {
+            Some(bytes) => bytes,
+            None => {
                 web_sys::console::warn_1(&js_err!(
-                    "[deferred-recovery] {}: ResetPending.new_group_id is not valid hex ({}): {:?}",
+                    "[deferred-recovery] {}: ResetPending.new_group_id is not an exact 16-byte coordinate ({})",
                     convo_id,
-                    new_group_id_hex,
-                    e
+                    new_group_id_hex
                 ));
                 continue;
             }
@@ -3375,6 +4163,14 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
         }
 
         // 3b. Build the local group at the predetermined id.
+        storage
+            .mark_cleanup_intent(
+                &user_did,
+                &convo_id,
+                &new_group_id_hex,
+                "reset-bootstrap-speculative",
+            )
+            .map_err(|e| js_err!("{} reset cleanup intent failed: {}", convo_id, e))?;
         let identity_bytes = user_did.as_bytes().to_vec();
         let creation = with_state(|s| {
             let ctx = s
@@ -3427,7 +4223,7 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
             "newGroupId": &new_group_id_hex,
             "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
             "groupInfo": &group_info_bytes,
-            "members": &roster,
+            "members": roster.iter().map(|member| member.did.clone()).collect::<Vec<_>>(),
             "currentEpoch": 1,
         });
         let url = format!(
@@ -3462,12 +4258,10 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
-            // 3e. Race winner — clear reset_pending.
-            let _ = storage
-                .set_conversation_state(&convo_id, ConversationState::Active)
-                .await;
-            let _ = storage.clear_reset_pending_for_delete(&convo_id, reset_generation).await;
-            let _ = storage.clear_rejoin_flag(&convo_id).await;
+            // 3e. Race winner — commit the stable mapping, historical alias,
+            // group state, roster, and reset-authority clear as one exact
+            // generation-fenced transaction. Recovery remains pending when
+            // any part of that commit fails.
             let local_epoch = with_state(|s| {
                 Ok(s.mls_context
                     .as_ref()
@@ -3475,6 +4269,55 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
                     .unwrap_or(0))
             })
             .unwrap_or(0);
+            let expected_state_version = match storage
+                .conversation_state_version(&user_did, &convo_id)
+            {
+                Ok(version) => version,
+                Err(e) => {
+                    web_sys::console::warn_1(&js_err!(
+                        "[deferred-recovery] {}: reset state-version lookup failed: {} — keeping reset_pending",
+                        convo_id,
+                        e
+                    ));
+                    continue;
+                }
+            };
+            let committed = storage.complete_reset_pending_projection(
+                &user_did,
+                &convo_id,
+                reset_generation,
+                expected_state_version,
+                &new_group_id_hex,
+                local_epoch,
+                &roster,
+            );
+            match committed {
+                Ok(true) => {
+                    storage
+                        .clear_cleanup_intent(&user_did, &new_group_id_hex)
+                        .map_err(|e| {
+                            js_err!(
+                                "{} reset cleanup intent clear failed after commit: {}",
+                                convo_id,
+                                e
+                            )
+                        })?;
+                }
+                Ok(false) => {
+                    web_sys::console::warn_1(&js_err!(
+                        "[deferred-recovery] {}: reset winner lost generation/target CAS; keeping reset_pending",
+                        convo_id
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    web_sys::console::warn_1(&js_err!(
+                        "[deferred-recovery] {}: atomic reset projection failed: {} — keeping reset_pending",
+                        convo_id, e
+                    ));
+                    continue;
+                }
+            }
             SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), local_epoch));
             web_sys::console::log_1(&js_err!(
                 "[deferred-recovery] {}: bootstrap WON at epoch {} (gen {})",
@@ -3526,25 +4369,50 @@ async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
 async fn fetch_roster_for_convo(
     api_client: &Arc<WasmApiClient>,
     convo_id: &str,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<Vec<catbird_mls::orchestrator::types::MemberView>, String> {
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
     let mut cursor: Option<String> = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut page_count = 0usize;
+    let mut item_count = 0usize;
     loop {
+        page_count = page_count.saturating_add(1);
+        if page_count > MAX_CONVERSATION_PAGES {
+            return Err(format!(
+                "server conversation pagination exceeded page ceiling for {convo_id}"
+            ));
+        }
         let page = api_client
             .get_conversations(50, cursor.as_deref())
             .await
             .map_err(|e| format!("get_conversations failed: {:?}", e))?;
+        if page.conversations.len() > 50 {
+            return Err(format!(
+                "server conversation page exceeded item ceiling for {convo_id}"
+            ));
+        }
+        item_count = item_count.saturating_add(page.conversations.len());
+        if item_count > MAX_CONVERSATION_ITEMS {
+            return Err(format!(
+                "server conversation pagination exceeded item ceiling for {convo_id}"
+            ));
+        }
         for cv in &page.conversations {
             if cv.conversation_id == convo_id {
-                return Ok(cv.members.iter().map(|m| m.did.clone()).collect());
+                return Ok(cv.members.clone());
             }
         }
-        cursor = page.cursor;
-        if cursor.is_none() {
+        let Some(next) = page.cursor else {
             return Err(format!(
                 "server did not return convo {convo_id} in pagination"
             ));
+        };
+        if !seen_cursors.insert(next.clone()) {
+            return Err(format!(
+                "server conversation pagination repeated cursor for {convo_id}"
+            ));
         }
+        cursor = Some(next);
     }
 }
 
@@ -3897,6 +4765,208 @@ mod background_tasks_tests {
             !in_flight(),
             "dropping the cancelled pass must reset the flag via RAII"
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod conversation_identity_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn create_response(
+        result_type: &str,
+        conversation_id: &str,
+        group_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "result": {
+                "$type": result_type,
+                "conversationKind": "direct",
+                "conversationId": conversation_id,
+                "coordinates": {
+                    "conversationId": conversation_id,
+                    "groupId": group_id,
+                    "epoch": 3
+                },
+                "entry": {}
+            }
+        })
+    }
+
+    #[wasm_bindgen_test]
+    fn stable_conversation_ids_are_not_decoded_as_mls_group_ids() {
+        let stable_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
+        assert!(
+            decode_group_id(stable_id).is_none(),
+            "stable conversation UUIDs must resolve through storage, never base64-decode as group IDs"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn every_parseable_uuid_shape_is_reserved_for_conversation_identity() {
+        // UUID parsing is intentionally broader than the canonical wire form:
+        // uppercase and compact forms are still UUIDs and must not fall
+        // through the legacy group-id decoder.
+        for stable_id in [
+            "018F3F6A-7B2C-4D91-8A5E-0F123456789A",
+            "018f3f6a7b2c4d918a5e0f123456789a",
+        ] {
+            assert!(
+                decode_group_id(stable_id).is_none(),
+                "parseable UUID shape must never be interpreted as an MLS group: {stable_id}"
+            );
+        }
+
+        // Group coordinates are exactly one MLS group id (16 bytes), not any
+        // arbitrary even-length hex string or base64 payload.
+        assert!(decode_group_coordinate("00112233445566778899aabbccddeeff").is_some());
+        assert!(decode_group_id("00112233445566778899aabbccddeeff").is_none());
+        assert!(decode_group_id("00112233").is_none());
+        assert!(decode_group_id("not-a-group").is_none());
+    }
+
+    #[wasm_bindgen_test]
+    fn create_response_requires_the_closed_exact_union_and_matching_coordinates() {
+        let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
+        let proposed_group_id = "00112233445566778899aabbccddeeff";
+        let created_tag = "blue.catbird.chat.defs#conversationCreatedResult";
+        let existing_tag = "blue.catbird.chat.defs#existingDirectConversationResult";
+
+        assert!(matches!(
+            parse_create_response(
+                &create_response(created_tag, conversation_id, proposed_group_id),
+                proposed_group_id,
+            ),
+            Ok(ParsedCreateResponse::Created { .. })
+        ));
+        assert!(parse_create_response(
+            &create_response(
+                created_tag,
+                conversation_id,
+                "ffeeddccbbaa99887766554433221100"
+            ),
+            proposed_group_id,
+        )
+        .is_err());
+        assert!(parse_create_response(
+            &create_response(
+                "blue.catbird.chat.defs#unknownResult",
+                conversation_id,
+                proposed_group_id
+            ),
+            proposed_group_id,
+        )
+        .is_err());
+        assert!(parse_create_response(
+            &serde_json::json!({
+                "result": {
+                    "coordinates": {
+                        "conversationId": conversation_id,
+                        "groupId": proposed_group_id,
+                        "epoch": 3
+                    }
+                }
+            }),
+            proposed_group_id,
+        )
+        .is_err());
+        assert!(parse_create_response(
+            &create_response(
+                existing_tag,
+                "018F3F6A-7B2C-4D91-8A5E-0F123456789A",
+                proposed_group_id
+            ),
+            proposed_group_id,
+        )
+        .is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn create_response_rejects_noncanonical_or_wrong_length_coordinates() {
+        let created_tag = "blue.catbird.chat.defs#conversationCreatedResult";
+        let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
+        let proposed_group_id = "00112233445566778899aabbccddeeff";
+        assert!(parse_create_response(
+            &create_response(
+                created_tag,
+                "018f3f6a7b2c4d918a5e0f123456789a",
+                proposed_group_id
+            ),
+            proposed_group_id,
+        )
+        .is_err());
+        assert!(parse_create_response(
+            &create_response(created_tag, conversation_id, "00112233"),
+            proposed_group_id,
+        )
+        .is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn roster_projection_keeps_member_roles_and_derives_direct_shape() {
+        use catbird_mls::orchestrator::types::{MemberRole, MemberView};
+
+        let server_roster = vec![
+            MemberView {
+                did: "did:plc:creator".to_string(),
+                role: MemberRole::Admin,
+            },
+            MemberView {
+                did: "did:plc:invitee".to_string(),
+                role: MemberRole::Member,
+            },
+        ];
+        assert_eq!(server_roster.len(), 2);
+        assert!(!conversation_is_group(&server_roster));
+        assert_eq!(server_roster[0].role, MemberRole::Admin);
+
+        let fallback = member_views_from_dids(
+            vec!["did:plc:creator".to_string(), "did:plc:invitee".to_string()],
+            "did:plc:creator",
+        );
+        assert_eq!(fallback, server_roster);
+
+        let group = vec![
+            server_roster[0].clone(),
+            server_roster[1].clone(),
+            MemberView {
+                did: "did:plc:third".to_string(),
+                role: MemberRole::Member,
+            },
+        ];
+        assert!(conversation_is_group(&group));
+    }
+
+    #[wasm_bindgen_test]
+    fn reaction_payload_is_cross_client_compatible_for_current_and_historical_messages() {
+        use catbird_mls::orchestrator::types::{MLSMessagePayload, MLSMessageType, ReactionAction};
+
+        for (message_id, action) in [
+            ("post-reset-current-message", "add"),
+            ("pre-reset-historical-alias-message", "remove"),
+        ] {
+            let payload = reaction_payload_for_wire(message_id, "👍", action)
+                .expect("supported reaction action");
+            assert_eq!(payload.message_type, MLSMessageType::Reaction);
+            let reaction = payload.reaction.as_ref().expect("reaction body");
+            assert_eq!(reaction.message_id, message_id);
+            assert_eq!(reaction.emoji, "👍");
+            assert_eq!(
+                reaction.action,
+                if action == "add" {
+                    ReactionAction::Add
+                } else {
+                    ReactionAction::Remove
+                }
+            );
+            let encoded = payload.encode().expect("encode reaction payload");
+            let decoded = MLSMessagePayload::decode(&encoded).expect("decode reaction payload");
+            assert_eq!(decoded.message_type, MLSMessageType::Reaction);
+            assert_eq!(decoded.reaction.unwrap().message_id, message_id);
+        }
+        assert!(reaction_payload_for_wire("message", "👍", "toggle").is_err());
     }
 }
 

@@ -38,6 +38,8 @@ pub struct UiMessage {
     pub sender_handle: String,
     pub content: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub sequence_number: u64,
     /// `"pending"` | `"delivered"` | `"read"`
     pub status: String,
     /// `"text"` | `"system"` | `"encrypted"`
@@ -55,6 +57,7 @@ impl From<crate::Message> for UiMessage {
             sender_handle: message.sender_handle,
             content: message.content,
             timestamp: message.timestamp,
+            sequence_number: message.sequence_number,
             status: message.status,
             message_type: message.message_type,
             image: message.image,
@@ -104,6 +107,282 @@ enum FrameOutput {
     Event(String, JsValue),
 }
 
+/// Normalize a frame route before it reaches storage or crypto. Stable IDs
+/// must be canonical UUIDv4 text; legacy group handles are accepted only when
+/// their exact 16-byte coordinate is unambiguous to the storage mapping.
+fn normalize_frame_identifier(identifier: &str) -> Result<String, String> {
+    if uuid::Uuid::parse_str(identifier).is_ok() {
+        return crate::canonical_uuid_string(identifier, "frame conversation identity")
+            .map_err(|error| error.to_string());
+    }
+    crate::decode_group_id(identifier)
+        .map(hex::encode)
+        .ok_or_else(|| format!("frame conversation identifier is not a valid stable UUID or group id: {identifier}"))
+}
+
+/// Resolve a frame's stable-or-legacy coordinate to the subscription's one
+/// stable identity and current MLS group bytes. Storage and ambiguity errors
+/// are returned; an unknown identifier is never treated as the subscription's
+/// fallback group.
+fn resolve_message_identity(
+    identifier: &str,
+    subscribed_conversation_id: &str,
+) -> Result<(String, Vec<u8>), String> {
+    // Resolve through the same storage-backed identity function used by all
+    // send/read paths. It checks an exact authorized alias before rejecting a
+    // compact/uppercase UUID-shaped group coordinate.
+    let (stable_id, group_id) = crate::resolve_conversation_identity(identifier)
+        .map_err(|error| format!("conversation identity lookup failed: {:?}", error))?;
+    require_subscription_match(&stable_id, subscribed_conversation_id)?;
+    let group_bytes = crate::decode_group_coordinate(&group_id)
+        .ok_or_else(|| format!("mapped group {} is not an exact 16-byte id", group_id))?;
+    Ok((stable_id, group_bytes))
+}
+
+fn require_subscription_match(
+    frame_conversation_id: &str,
+    subscribed_conversation_id: &str,
+) -> Result<(), String> {
+    if frame_conversation_id != subscribed_conversation_id {
+        return Err(format!(
+            "frame stable conversation {} does not match subscription {}",
+            frame_conversation_id, subscribed_conversation_id
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the stable scope carried by server-sent ephemeral/control
+/// payloads. These events are never allowed to inherit the route's identity
+/// when the payload omits or mismatches it.
+fn validate_event_scope(
+    top: &[(CborValue, CborValue)],
+    subscribed_conversation_id: &str,
+    event_name: &str,
+) -> Result<String, String> {
+    let raw = cbor_str(top, "convoId")
+        .or_else(|| cbor_str(top, "conversationId"))
+        .ok_or_else(|| format!("{} is missing conversation scope", event_name))?;
+    let stable = crate::canonical_uuid_string(&raw, &format!("{} conversation scope", event_name))
+        .map_err(|error| error.to_string())?;
+    let subscribed = crate::canonical_uuid_string(
+        subscribed_conversation_id,
+        "subscription conversation scope",
+    )
+    .map_err(|error| error.to_string())?;
+    if stable != subscribed {
+        return Err(format!(
+            "{} conversation {} does not match subscription {}",
+            event_name, stable, subscribed
+        ));
+    }
+    Ok(stable)
+}
+
+fn validate_event_generation(
+    top: &[(CborValue, CborValue)],
+    key: &str,
+    event_name: &str,
+) -> Result<i32, String> {
+    let raw = cbor_int(top, key).ok_or_else(|| format!("{} is missing {}", event_name, key))?;
+    i32::try_from(raw)
+        .ok()
+        .filter(|generation| *generation >= 0)
+        .ok_or_else(|| format!("{} {} is out of range", event_name, key))
+}
+
+/// Validate a generation coordinate when an event carries one. Reaction and
+/// typing lexicons historically omitted this field, so absence remains
+/// compatible; a supplied value is never allowed to be negative or overflow
+/// the local reset-coordinate type.
+fn validate_optional_event_generation(
+    top: &[(CborValue, CborValue)],
+    key: &str,
+    event_name: &str,
+) -> Result<Option<i32>, String> {
+    if cbor_int(top, key).is_none() {
+        return Ok(None);
+    }
+    validate_event_generation(top, key, event_name).map(Some)
+}
+
+/// Validate an optional current-group coordinate carried by a scoped event.
+/// If present it must resolve to the subscribed stable conversation's current
+/// group; never let an event route inherit a different group implicitly.
+fn validate_event_group_scope(
+    top: &[(CborValue, CborValue)],
+    subscribed_conversation_id: &str,
+    event_name: &str,
+) -> Result<(), String> {
+    let Some(raw_group_id) = cbor_str(top, "groupId").or_else(|| cbor_str(top, "currentGroupId"))
+    else {
+        return Ok(());
+    };
+    let provided = crate::decode_group_coordinate(&raw_group_id)
+        .ok_or_else(|| format!("{} groupId is not an exact 16-byte coordinate", event_name))?;
+    let (_, current_group_id) = crate::resolve_conversation_identity(subscribed_conversation_id)
+        .map_err(|error| format!("{} group scope lookup failed: {:?}", event_name, error))?;
+    let current = crate::decode_group_coordinate(&current_group_id)
+        .ok_or_else(|| format!("{} current group mapping is invalid", event_name))?;
+    if provided != current {
+        return Err(format!(
+            "{} groupId does not match the current mapped group",
+            event_name
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod identity_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn message_frame(frame_conversation_id: &str) -> Vec<u8> {
+        let header = CborValue::Map(vec![
+            (CborValue::Text("op".into()), CborValue::Integer(0.into())),
+            (
+                CborValue::Text("t".into()),
+                CborValue::Text("#messageEvent".into()),
+            ),
+        ]);
+        let message = CborValue::Map(vec![
+            (CborValue::Text("id".into()), CborValue::Text("m1".into())),
+            (
+                CborValue::Text("convoId".into()),
+                CborValue::Text(frame_conversation_id.into()),
+            ),
+            (
+                CborValue::Text("createdAt".into()),
+                CborValue::Text("2026-01-01T00:00:00Z".into()),
+            ),
+            (
+                CborValue::Text("senderDid".into()),
+                CborValue::Text("did:plc:sender".into()),
+            ),
+        ]);
+        let payload = CborValue::Map(vec![(CborValue::Text("message".into()), message)]);
+        let mut frame = Vec::new();
+        ciborium::into_writer(&header, &mut frame).expect("encode header");
+        ciborium::into_writer(&payload, &mut frame).expect("encode payload");
+        frame
+    }
+
+    fn event_frame(event_type: &str, entries: Vec<(&str, CborValue)>) -> Vec<u8> {
+        let header = CborValue::Map(vec![
+            (CborValue::Text("op".into()), CborValue::Integer(0.into())),
+            (
+                CborValue::Text("t".into()),
+                CborValue::Text(event_type.into()),
+            ),
+        ]);
+        let payload = CborValue::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (CborValue::Text(key.into()), value))
+                .collect(),
+        );
+        let mut frame = Vec::new();
+        ciborium::into_writer(&header, &mut frame).expect("encode header");
+        ciborium::into_writer(&payload, &mut frame).expect("encode payload");
+        frame
+    }
+
+    #[wasm_bindgen_test]
+    fn cross_route_message_frame_is_rejected() {
+        assert!(normalize_frame_identifier("018F3F6A-7B2C-4D91-8A5E-0F123456789A").is_err());
+        assert!(normalize_frame_identifier("018f3f6a7b2c4d918a5e0f123456789a").is_err());
+        assert_eq!(
+            normalize_frame_identifier("ABEiM0RVZneImaq7zN3u_w").unwrap(),
+            "00112233445566778899aabbccddeeff"
+        );
+        require_subscription_match(
+            "018f3f6a-7b2c-4d91-8a5e-0f123456789b",
+            "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+        )
+        .expect_err("cross-route stable identities must be rejected");
+        let frame = message_frame("018f3f6a-7b2c-4d91-8a5e-0f123456789b");
+        let result = handle_frame(&frame, "018f3f6a-7b2c-4d91-8a5e-0f123456789a");
+        assert!(
+            result.is_err(),
+            "a frame for another stable conversation must not be delivered on this subscription"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn cleartext_reaction_frames_are_rejected() {
+        let frame = event_frame(
+            "#reactionEvent",
+            vec![
+                ("messageId", CborValue::Text("m1".into())),
+                ("did", CborValue::Text("did:plc:sender".into())),
+                ("reaction", CborValue::Text("👍".into())),
+                ("action", CborValue::Text("add".into())),
+            ],
+        );
+        assert!(
+            handle_frame(&frame, "018f3f6a-7b2c-4d91-8a5e-0f123456789a").is_err(),
+            "cleartext reaction events are not authenticated MLS payloads"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn reset_and_typing_frames_must_be_scoped_to_the_subscribed_conversation() {
+        let stable_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
+        let other_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789b";
+        let reset = event_frame(
+            "#groupResetEvent",
+            vec![
+                ("convoId", CborValue::Text(other_id.into())),
+                (
+                    "newGroupId",
+                    CborValue::Text("00112233445566778899aabbccddeeff".into()),
+                ),
+                ("resetGeneration", CborValue::Integer(2.into())),
+            ],
+        );
+        assert!(
+            handle_frame(&reset, stable_id).is_err(),
+            "a reset for another stable conversation must not arm this route"
+        );
+        let typing = event_frame(
+            "#typingEvent",
+            vec![
+                ("conversationId", CborValue::Text(other_id.into())),
+                ("action", CborValue::Text("typingStart".into())),
+            ],
+        );
+        assert!(
+            handle_frame(&typing, stable_id).is_err(),
+            "typing events must carry the subscribed stable conversation"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn reset_frames_fail_closed_before_emitting_without_durable_storage_cas() {
+        let frame = event_frame(
+            "#groupResetEvent",
+            vec![
+                (
+                    "convoId",
+                    CborValue::Text("018f3f6a-7b2c-4d91-8a5e-0f123456789a".into()),
+                ),
+                (
+                    "newGroupId",
+                    CborValue::Text("00112233445566778899aabbccddeeff".into()),
+                ),
+                ("resetGeneration", CborValue::Integer(2.into())),
+            ],
+        );
+        assert!(
+            handle_frame(&frame, "018f3f6a-7b2c-4d91-8a5e-0f123456789a").is_err(),
+            "the UI event must not race ahead of the durable reset CAS"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CBOR helper functions (ported verbatim from src-tauri/src/websocket.rs)
 // ---------------------------------------------------------------------------
@@ -123,6 +402,13 @@ fn cbor_int(map: &[(CborValue, CborValue)], key: &str) -> Option<i64> {
             let n: i128 = (*v).into();
             Some(n as i64)
         }
+        _ => None,
+    })
+}
+
+fn cbor_bool(map: &[(CborValue, CborValue)], key: &str) -> Option<bool> {
+    map.iter().find_map(|(k, v)| match (k, v) {
+        (CborValue::Text(k), CborValue::Bool(v)) if k == key => Some(*v),
         _ => None,
     })
 }
@@ -244,6 +530,19 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
             let ciphertext = cbor_bytes(msg_map, "ciphertext");
             let _epoch = cbor_int(msg_map, "epoch").unwrap_or(0);
             let sender_did_raw = cbor_str(msg_map, "senderDid").unwrap_or_default();
+            let (_frame_stable_id, frame_group_id) =
+                resolve_message_identity(&msg_convo_id, convo_id)?;
+            if let Some(raw_group_id) =
+                cbor_str(msg_map, "groupId").or_else(|| cbor_str(msg_map, "currentGroupId"))
+            {
+                let scoped_group = crate::decode_group_coordinate(&raw_group_id)
+                    .ok_or("messageEvent groupId is not an exact 16-byte coordinate")?;
+                if scoped_group != frame_group_id {
+                    return Err(
+                        "messageEvent groupId does not match the current mapped group".into(),
+                    );
+                }
+            }
 
             // Debug: log message map keys and ciphertext presence
             let keys: Vec<String> = msg_map
@@ -278,14 +577,9 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
 
             // Try to decrypt using the MLS context (available in WASM worker)
             let mut decrypt_err: Option<String> = None;
+            let mut decrypted_reaction: Option<ReactionEvent> = None;
             let decrypted = ciphertext.as_ref().and_then(|ct| {
-                let gid = match crate::decode_group_id(&msg_convo_id) {
-                    Some(g) => g,
-                    None => {
-                        decrypt_err = Some("failed to decode group_id".into());
-                        return None;
-                    }
-                };
+                let gid = frame_group_id.clone();
                 crate::STATE.with(|s| {
                     let borrowed = s.borrow();
                     let state = match borrowed.as_ref() {
@@ -304,10 +598,46 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                     };
                     match ctx.decrypt_message(gid.clone(), ct.clone()) {
                         Ok(res) if !res.plaintext.is_empty() => {
-                            use catbird_mls::orchestrator::types::MLSMessagePayload;
+                            use catbird_mls::orchestrator::types::{
+                                MLSMessagePayload, MLSMessageType, ReactionAction,
+                            };
+                            let sender = String::from_utf8(res.sender_credential.identity)
+                                .unwrap_or(sender_did_raw.clone());
                             let (text, payload_json) =
                                 match MLSMessagePayload::decode(&res.plaintext) {
                                     Ok(payload) => {
+                                        // Reactions are authenticated MLS
+                                        // control payloads, not displayable
+                                        // messages. Dispatch them before the
+                                        // display filter would discard them.
+                                        if payload.message_type == MLSMessageType::Reaction {
+                                            let reaction =
+                                                payload.reaction.as_ref().ok_or_else(|| {
+                                                    "reaction payload is missing its body"
+                                                });
+                                            match reaction {
+                                                Ok(reaction) => {
+                                                    decrypted_reaction = Some(ReactionEvent {
+                                                        conversation_id: convo_id.to_string(),
+                                                        message_id: reaction.message_id.clone(),
+                                                        sender_did: sender.clone(),
+                                                        emoji: reaction.emoji.clone(),
+                                                        action: match reaction.action {
+                                                            ReactionAction::Add => {
+                                                                "add".to_string()
+                                                            }
+                                                            ReactionAction::Remove => {
+                                                                "remove".to_string()
+                                                            }
+                                                        },
+                                                    });
+                                                }
+                                                Err(error) => {
+                                                    decrypt_err = Some(error.to_string());
+                                                }
+                                            }
+                                            return None;
+                                        }
                                         if !payload.is_displayable() {
                                             return None;
                                         }
@@ -322,13 +652,11 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                                         None,
                                     ),
                                 };
-                            let sender = String::from_utf8(res.sender_credential.identity)
-                                .unwrap_or(sender_did_raw.clone());
                             Some((
                                 crate::ui_message_from_orchestrator(
                                     catbird_mls::orchestrator::types::Message {
                                         id: id.clone(),
-                                        conversation_id: msg_convo_id.clone(),
+                                        conversation_id: convo_id.to_string(),
                                         sender_did: sender.clone(),
                                         text,
                                         timestamp: chrono::DateTime::parse_from_rfc3339(
@@ -383,6 +711,11 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 })
             });
 
+            if let Some(reaction) = decrypted_reaction {
+                let event_js = make_event_js("reaction", &reaction)?;
+                return Ok(Some(FrameOutput::Event("reaction".to_string(), event_js)));
+            }
+
             match decrypted {
                 Some((ui_msg, _sender)) => {
                     // Record msg_id as seen for dedup against polling path
@@ -420,7 +753,7 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                     js_sys::Reflect::set(
                         &obj,
                         &JsValue::from_str("convoId"),
-                        &JsValue::from_str(&msg_convo_id),
+                        &JsValue::from_str(convo_id),
                     )
                     .ok();
                     js_sys::Reflect::set(
@@ -466,6 +799,7 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 sender_handle: String::new(),
                 content,
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                sequence_number: 0,
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
@@ -495,6 +829,7 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 sender_handle: String::new(),
                 content: info_text,
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                sequence_number: 0,
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
@@ -522,6 +857,7 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 sender_handle: String::new(),
                 content: format!("{} added a new device", short_id(&member_did)),
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                sequence_number: 0,
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
@@ -531,26 +867,22 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
         }
 
         // ------------------------------------------------------------------
-        // Reaction event — no crypto required.
+        // Reaction events must arrive as authenticated MLS payloads. The
+        // historical cleartext relay is intentionally rejected; accepting it
+        // would let a server/event-route forge reactions without MLS
+        // authentication. Decrypted MLS reactions are dispatched in the
+        // message path below before display filtering.
         // ------------------------------------------------------------------
         "#reactionEvent" => {
             let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
                 .map_err(|e| format!("Failed to decode reactionEvent CBOR: {}", e))?;
-
             let CborValue::Map(ref top) = payload else {
-                return Ok(None);
+                return Err("reactionEvent payload is not a CBOR map".to_string());
             };
-
-            let reaction = ReactionEvent {
-                conversation_id: cbor_str(top, "convoId").unwrap_or_else(|| convo_id.to_string()),
-                message_id: cbor_str(top, "messageId").unwrap_or_default(),
-                sender_did: cbor_str(top, "did").unwrap_or_default(),
-                emoji: cbor_str(top, "reaction").unwrap_or_default(),
-                action: cbor_str(top, "action").unwrap_or_else(|| "add".to_string()),
-            };
-
-            let event_js = make_event_js("reaction", &reaction)?;
-            Ok(Some(FrameOutput::Event("reaction".to_string(), event_js)))
+            validate_event_scope(top, convo_id, "reactionEvent")?;
+            validate_event_group_scope(top, convo_id, "reactionEvent")?;
+            validate_optional_event_generation(top, "generation", "reactionEvent")?;
+            Err("cleartext reactionEvent is not an authenticated MLS payload".to_string())
         }
 
         // ------------------------------------------------------------------
@@ -599,11 +931,22 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 return Ok(None);
             };
 
-            let new_group_id = cbor_str(top, "newGroupId").unwrap_or_default();
-            let reset_generation = cbor_int(top, "resetGeneration").unwrap_or(0) as i32;
+            let convo_id_owned = validate_event_scope(top, convo_id, "groupResetEvent")?;
+            validate_event_group_scope(top, convo_id, "groupResetEvent")?;
+            let raw_new_group_id =
+                cbor_str(top, "newGroupId").ok_or("groupResetEvent is missing newGroupId")?;
+            let new_group_bytes = hex::decode(&raw_new_group_id)
+                .map_err(|_| "groupResetEvent newGroupId is not valid hex".to_string())?;
+            if new_group_bytes.len() != 16 || hex::encode(&new_group_bytes) != raw_new_group_id {
+                return Err(
+                    "groupResetEvent newGroupId must be exact lowercase 16-byte hex".to_string(),
+                );
+            }
+            let new_group_id = hex::encode(new_group_bytes);
+            let reset_generation =
+                validate_event_generation(top, "resetGeneration", "groupResetEvent")?;
             let reset_by = cbor_str(top, "resetBy").unwrap_or_default();
             let reason = cbor_str(top, "reason");
-            let convo_id_owned = convo_id.to_string();
             let notified_at_ms = chrono::Utc::now().timestamp_millis();
 
             web_sys::console::log_1(&JsValue::from_str(&format!(
@@ -614,84 +957,26 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 short_id(&reset_by)
             )));
 
-            // Side-effects: persist + adopt new group_id. spawn_local because
-            // MLSStorageBackend methods are async; the WASM event loop is
-            // single-threaded so STATE access from inside the future is safe
-            // as long as we don't hold a borrow across `await`.
-            let new_gid_for_task = new_group_id.clone();
-            let convo_id_for_task = convo_id_owned.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                use catbird_mls::orchestrator::storage::MLSStorageBackend;
-
-                let storage = crate::STATE.with(|s| {
+            // Persist and CAS before exposing the event. If this fails, the
+            // frame is rejected and no UI code is allowed to act on a reset
+            // that never became durable.
+            let storage = crate::STATE
+                .with(|s| {
                     s.borrow()
                         .as_ref()
-                        .map(|st| std::sync::Arc::clone(&st.storage))
-                });
-                let Some(storage) = storage else {
-                    web_sys::console::warn_1(&JsValue::from_str(
-                        "[catmos-ws] groupReset: STATE not initialized; skipping persistence",
-                    ));
-                    return;
-                };
-
-                // 1. Persist the RESET_PENDING payload.
-                if let Err(e) = storage
-                    .mark_reset_pending(
-                        &convo_id_for_task,
-                        &new_gid_for_task,
-                        reset_generation,
-                        notified_at_ms,
-                    )
-                    .await
-                {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] mark_reset_pending failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 2. Flip conversation state to ResetPending (carries payload).
-                if let Err(e) = storage
-                    .set_conversation_state(
-                        &convo_id_for_task,
-                        catbird_mls::orchestrator::types::ConversationState::ResetPending {
-                            new_group_id: new_gid_for_task.clone(),
-                            reset_generation,
-                            notified_at_ms,
-                        },
-                    )
-                    .await
-                {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] set ResetPending failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 3. Mark needs_rejoin so deferred recovery picks it up.
-                if let Err(e) = storage.mark_needs_rejoin(&convo_id_for_task).await {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] mark_needs_rejoin failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 4. Adopt the new group_id locally (so the next External
-                //    Commit targets the post-reset group). Empty newGroupId
-                //    means the server did not specify one — fall back to the
-                //    pre-reset lookup-by-conversation-id heuristic.
-                if !new_gid_for_task.is_empty() {
-                    if let Err(e) =
-                        storage.update_conversation_group_id(&convo_id_for_task, &new_gid_for_task)
-                    {
-                        web_sys::console::warn_1(&JsValue::from_str(&format!(
-                            "[catmos-ws] update_conversation_group_id failed for {} -> {}: {}",
-                            convo_id_for_task, new_gid_for_task, e
-                        )));
-                    }
-                }
-            });
+                        .map(|state| std::sync::Arc::clone(&state.storage))
+                })
+                .ok_or_else(|| {
+                    "groupResetEvent cannot persist without initialized STATE".to_string()
+                })?;
+            storage
+                .mark_reset_pending_sync(
+                    &convo_id_owned,
+                    &new_group_id,
+                    reset_generation,
+                    notified_at_ms,
+                )
+                .map_err(|error| format!("groupResetEvent durable CAS failed: {}", error))?;
 
             // Build the JS event payload.
             let obj = js_sys::Object::new();
@@ -776,18 +1061,66 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 return Ok(None);
             };
 
+            let convo_id_owned = validate_event_scope(top, convo_id, "resetRequestedEvent")?;
+            validate_event_group_scope(top, convo_id, "resetRequestedEvent")?;
             let crypto_session_id = cbor_str(top, "cryptoSessionId").unwrap_or_default();
-            let reset_generation = cbor_int(top, "generation").unwrap_or(0) as i32;
+            let reset_generation =
+                validate_event_generation(top, "generation", "resetRequestedEvent")?;
             let trigger = cbor_str(top, "trigger").unwrap_or_default();
             let request_event_id = cbor_str(top, "requestEventId").unwrap_or_default();
             let reason = cbor_str(top, "reason");
             // `expectedNewMlsGroupId` is `Option<String>` on the wire — the
             // common Phase 2.5 case is None (server has not minted). Treat
             // empty string the same as None for robustness.
-            let expected_new_mls_group_id: Option<String> =
-                cbor_str(top, "expectedNewMlsGroupId").filter(|s| !s.is_empty());
-            let convo_id_owned = convo_id.to_string();
+            let expected_new_mls_group_id: Option<String> = cbor_str(top, "expectedNewMlsGroupId")
+                .filter(|s| !s.is_empty())
+                .map(|raw| {
+                    let bytes = hex::decode(&raw).map_err(|_| {
+                        format!(
+                            "resetRequestedEvent expectedNewMlsGroupId is not valid hex: {}",
+                            raw
+                        )
+                    })?;
+                    if bytes.len() != 16 || hex::encode(&bytes) != raw {
+                        return Err(format!(
+                            "resetRequestedEvent expectedNewMlsGroupId is not exact lowercase 16-byte hex: {}",
+                            raw
+                        ));
+                    }
+                    Ok(raw)
+                })
+                .transpose()?;
             let notified_at_ms = chrono::Utc::now().timestamp_millis();
+
+            let storage = crate::STATE
+                .with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|state| std::sync::Arc::clone(&state.storage))
+                })
+                .ok_or_else(|| {
+                    "resetRequestedEvent cannot persist without initialized STATE".to_string()
+                })?;
+            // Reuse the durable target for a replay/reopen. Minting a fresh
+            // candidate before consulting storage would turn an idempotent
+            // replay into a conflicting target.
+            let new_group_id_hex = match expected_new_mls_group_id.clone() {
+                Some(hex_id) => hex_id,
+                None => storage
+                    .reset_target_for_generation(&convo_id_owned, reset_generation)
+                    .map_err(|error| {
+                        format!("resetRequestedEvent target lookup failed: {}", error)
+                    })?
+                    .unwrap_or_else(|| format!("{:032x}", uuid::Uuid::new_v4().as_u128())),
+            };
+            storage
+                .mark_reset_pending_sync(
+                    &convo_id_owned,
+                    &new_group_id_hex,
+                    reset_generation,
+                    notified_at_ms,
+                )
+                .map_err(|error| format!("resetRequestedEvent durable CAS failed: {}", error))?;
 
             web_sys::console::log_1(&JsValue::from_str(&format!(
                 "[catmos-ws] resetRequested: convo={} cryptoSession={} gen={} trigger={} reqId={} expected={}",
@@ -804,138 +1137,6 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
             let crypto_session_id_owned = crypto_session_id.clone();
             let trigger_owned = trigger.clone();
             let request_event_id_owned = request_event_id.clone();
-            let expected_for_task = expected_new_mls_group_id.clone();
-            let convo_id_for_task = convo_id_owned.clone();
-
-            // Side-effects: idempotency check + persist. spawn_local because
-            // MLSStorageBackend methods are async; the WASM event loop is
-            // single-threaded so STATE access from inside the future is safe
-            // as long as we don't hold a borrow across `await`.
-            wasm_bindgen_futures::spawn_local(async move {
-                use catbird_mls::orchestrator::storage::MLSStorageBackend;
-                use catbird_mls::orchestrator::types::ConversationState;
-
-                let storage = crate::STATE.with(|s| {
-                    s.borrow()
-                        .as_ref()
-                        .map(|st| std::sync::Arc::clone(&st.storage))
-                });
-                let Some(storage) = storage else {
-                    web_sys::console::warn_1(&JsValue::from_str(
-                        "[catmos-ws] resetRequested: STATE not initialized; skipping persistence",
-                    ));
-                    return;
-                };
-
-                // 1. Idempotency: if we are already in ResetPending at the
-                //    same generation, drop the duplicate (mirrors
-                //    recovery.rs:1400-1412).
-                match storage.get_conversation_state(&convo_id_for_task).await {
-                    Ok(Some(ConversationState::ResetPending {
-                        reset_generation: existing_gen,
-                        new_group_id: existing_gid,
-                        ..
-                    })) if existing_gen == reset_generation => {
-                        web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "[catmos-ws] resetRequested: already in ResetPending at gen={} (existing newGroupId={}); idempotent no-op",
-                            reset_generation, existing_gid,
-                        )));
-                        return;
-                    }
-                    Ok(Some(ConversationState::ResetPending {
-                        reset_generation: existing_gen,
-                        ..
-                    })) => {
-                        web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "[catmos-ws] resetRequested: superseding ResetPending at old gen={} with new gen={}",
-                            existing_gen, reset_generation,
-                        )));
-                    }
-                    Ok(_) | Err(_) => {
-                        // No persisted state, or state read failed — fall
-                        // through and persist. A read error here is
-                        // non-fatal; the writes below are authoritative.
-                    }
-                }
-
-                // 2. Resolve new_group_id eagerly (mirrors
-                //    recovery.rs:1430-1456). Server-supplied wins; else mint
-                //    a UUIDv4-style 32-hex-char id locally for first-
-                //    responder race bootstrap.
-                let new_group_id_hex = match expected_for_task {
-                    Some(hex_id) if !hex_id.is_empty() => {
-                        web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "[catmos-ws] resetRequested: using server-supplied expectedNewMlsGroupId={}",
-                            hex_id,
-                        )));
-                        hex_id
-                    }
-                    _ => {
-                        let minted = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
-                        web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "[catmos-ws] resetRequested: server passed None; minting client-side candidate={}",
-                            minted,
-                        )));
-                        minted
-                    }
-                };
-
-                // 3. Persist the RESET_PENDING payload.
-                if let Err(e) = storage
-                    .mark_reset_pending(
-                        &convo_id_for_task,
-                        &new_group_id_hex,
-                        reset_generation,
-                        notified_at_ms,
-                    )
-                    .await
-                {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] mark_reset_pending failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 4. Flip conversation state to ResetPending (carries
-                //    payload).
-                if let Err(e) = storage
-                    .set_conversation_state(
-                        &convo_id_for_task,
-                        ConversationState::ResetPending {
-                            new_group_id: new_group_id_hex.clone(),
-                            reset_generation,
-                            notified_at_ms,
-                        },
-                    )
-                    .await
-                {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] set ResetPending failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 5. Mark needs_rejoin so deferred recovery picks it up.
-                if let Err(e) = storage.mark_needs_rejoin(&convo_id_for_task).await {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] mark_needs_rejoin failed for {}: {:?}",
-                        convo_id_for_task, e
-                    )));
-                }
-
-                // 6. Adopt the new group_id locally (so the next External
-                //    Commit / first-responder bootstrap targets the post-
-                //    reset group). Always non-empty here because step 2
-                //    minted one when server passed None.
-                if let Err(e) =
-                    storage.update_conversation_group_id(&convo_id_for_task, &new_group_id_hex)
-                {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[catmos-ws] update_conversation_group_id failed for {} -> {}: {}",
-                        convo_id_for_task, new_group_id_hex, e
-                    )));
-                }
-            });
 
             // Build the JS event payload. Surfaced to the UI so a "Repairing
             // conversation…" banner can render while deferred recovery
@@ -977,14 +1178,15 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 &JsValue::from_str(&request_event_id_owned),
             )
             .ok();
-            if let Some(ref expected) = expected_new_mls_group_id {
-                js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("expectedNewMlsGroupId"),
-                    &JsValue::from_str(expected),
-                )
-                .ok();
-            }
+            // Surface the effective durable target, including a replayed or
+            // freshly minted candidate. Consumers must never act on a
+            // different local target than the CAS just accepted.
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("expectedNewMlsGroupId"),
+                &JsValue::from_str(&new_group_id_hex),
+            )
+            .ok();
             if let Some(ref r) = reason {
                 js_sys::Reflect::set(&obj, &JsValue::from_str("reason"), &JsValue::from_str(r))
                     .ok();
@@ -1011,11 +1213,18 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                 return Ok(None);
             };
 
+            let scoped_conversation_id = validate_event_scope(top, convo_id, "typingEvent")?;
+            validate_event_group_scope(top, convo_id, "typingEvent")?;
+            validate_optional_event_generation(top, "generation", "typingEvent")?;
             let action = cbor_str(top, "action").unwrap_or_default();
             let typing = TypingEvent {
-                conversation_id: cbor_str(top, "convoId").unwrap_or_else(|| convo_id.to_string()),
-                sender_did: cbor_str(top, "did").unwrap_or_default(),
-                is_typing: action != "typingStop",
+                conversation_id: scoped_conversation_id,
+                sender_did: cbor_str(top, "did")
+                    .or_else(|| cbor_str(top, "actorDid"))
+                    .unwrap_or_default(),
+                is_typing: cbor_bool(top, "isTyping")
+                    .or_else(|| cbor_bool(top, "typing"))
+                    .unwrap_or(action != "typingStop"),
             };
 
             let event_js = make_event_js("typing", &typing)?;

@@ -116,12 +116,12 @@ fn decode_group_id(id: &str) -> Option<Vec<u8>> {
 
 /// Decode a group coordinate after its provenance is already known (server
 /// response, persisted mapping, or reset payload). Group IDs are exactly
-/// 16-byte hex/base64 coordinates; unlike a caller-supplied ambiguous handle,
+/// 32-byte canonical or retained 16-byte legacy hex/base64 coordinates; unlike a caller-supplied ambiguous handle,
 /// a 32-hex coordinate may syntactically resemble a compact UUID and must be
 /// accepted here so the crypto path can operate on the server's group bytes.
 fn decode_group_coordinate(id: &str) -> Option<Vec<u8>> {
-    // Group coordinates are exactly 16 bytes, represented by 32 hex digits.
-    if id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+    // Legacy coordinates remain readable after upgrading to canonical 32-byte groups.
+    if matches!(id.len(), 32 | 64) && id.chars().all(|c| c.is_ascii_hexdigit()) {
         let bytes: Result<Vec<u8>, _> = (0..id.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&id[i..i + 2], 16))
@@ -134,7 +134,7 @@ fn decode_group_coordinate(id: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(id)
         .ok()
-        .filter(|bytes| bytes.len() == 16)
+        .filter(|bytes| matches!(bytes.len(), 16 | 32))
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +195,8 @@ pub struct Message {
     pub sender_handle: String,
     pub content: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub sequence_number: u64,
     pub status: String,
     pub message_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -330,7 +332,7 @@ fn parse_response_group_id(value: Option<&serde_json::Value>) -> Option<String> 
     let encoded = value.get("$bytes").and_then(|bytes| bytes.as_str())?;
     B64.decode(encoded)
         .ok()
-        .filter(|bytes| bytes.len() == 16)
+        .filter(|bytes| matches!(bytes.len(), 16 | 32))
         .map(hex::encode)
 }
 
@@ -448,6 +450,7 @@ fn ui_message_from_orchestrator(message: catbird_mls::orchestrator::types::Messa
         sender_handle: String::new(),
         content: message.text,
         timestamp: message.timestamp.to_rfc3339(),
+        sequence_number: message.sequence_number,
         status: if message.is_own {
             "sent".to_string()
         } else {
@@ -4926,7 +4929,7 @@ mod conversation_identity_tests {
             vec!["did:plc:creator".to_string(), "did:plc:invitee".to_string()],
             "did:plc:creator",
         );
-        assert_eq!(fallback, server_roster);
+        assert_eq!(serde_json::to_value(fallback).unwrap(), serde_json::to_value(&server_roster).unwrap());
 
         let group = vec![
             server_roster[0].clone(),

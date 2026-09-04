@@ -142,8 +142,8 @@ impl WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let output: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let devices = output.get("devices").and_then(|v| v.as_array());
         Ok(devices.map(|d| !d.is_empty()).unwrap_or(false))
     }
@@ -207,8 +207,8 @@ impl WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let output: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let locator = output
             .get("blobLocator")
             .or_else(|| output.get("blobId"))
@@ -306,8 +306,8 @@ impl WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let output: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let blob_id = output
             .get("blobId")
             .or_else(|| output.get("blobLocator"))
@@ -374,10 +374,13 @@ impl WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let output: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let new_epoch = output.get("newEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
-        let success = output.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+        let success = output
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         Ok((success, new_epoch))
     }
 }
@@ -433,11 +436,13 @@ impl MLSAPIClient for WasmApiClient {
             .map_err(|e| OrchestratorError::Api(e.to_string()))?
             .to_vec();
 
-        Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
-            status,
-            content_type,
-            body,
-        })
+        Ok(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status,
+                content_type,
+                body,
+            },
+        )
     }
 
     async fn get_conversations(
@@ -468,43 +473,22 @@ impl MLSAPIClient for WasmApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
-        let output: blue_catbird::chat::get_conversations::GetConversationsOutput<String> =
-            serde_json::from_slice(&body)
-                .map_err(|e| OrchestratorError::Api(format!("getConversations parse: {e}")))?;
+        let output = catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
+            .map_err(|error| OrchestratorError::Api(format!("Canonical getConversations decode: {error}")))?;
 
         let mut conversations = Vec::new();
         for item in output.items {
-            if let blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(state_item) = item {
-                let s = state_item.state;
-                let coords = s.coordinates;
-                let members = s
-                    .participants
-                    .into_iter()
-                    .map(|p| MemberView {
-                        did: p.user_did.to_string(),
-                        role: if p.role.eq_ignore_ascii_case("admin") {
-                            MemberRole::Admin
-                        } else {
-                            MemberRole::Member
-                        },
-                    })
-                    .collect();
-                conversations.push(ConversationView {
-                    group_id: hex::encode(coords.group_id.as_ref()),
-                    conversation_id: coords.conversation_id.to_string(),
-                    epoch: coords.epoch.max(0) as u64,
-                    members,
-                    metadata: None,
-                    created_at: None,
-                    updated_at: None,
-                    sequencer_did: None,
-                });
+            if let blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(
+                state_item,
+            ) = item
+            {
+                conversations.push(canonical_conversation_view(&state_item.state));
             }
         }
 
         Ok(ConversationListPage {
             conversations,
-            cursor: output.next_page_cursor,
+            cursor: output.next_page_cursor.map(|value| value.to_string()),
         })
     }
 
@@ -539,30 +523,14 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let output: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let mut envelopes = Vec::new();
         if let Some(entries) = output.get("entries").and_then(|v| v.as_array()) {
             for entry in entries {
-                let entry_id = entry.get("entryId").and_then(|v| v.as_str()).unwrap_or("");
-                let epoch = entry.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
-                let ct_bytes = entry.get("ciphertext").and_then(|v| {
-                    if let Some(s) = v.as_str() {
-                        B64.decode(s).ok()
-                    } else if let Some(b) = v.get("$bytes").and_then(|b| b.as_str()) {
-                        B64.decode(b).ok()
-                    } else {
-                        None
-                    }
-                }).unwrap_or_default();
-                envelopes.push(IncomingEnvelope {
-                    conversation_id: convo_id.to_string(),
-                    sender_did: String::new(),
-                    ciphertext: ct_bytes,
-                    timestamp: chrono::Utc::now(),
-                    server_message_id: Some(entry_id.to_string()),
-                    server_epoch: Some(epoch),
-                });
+                if let Some(envelope) = IncomingEnvelope::from_canonical_entry(entry, convo_id)? {
+                    envelopes.push(envelope);
+                }
             }
         }
         let next_cursor = output.get("nextAfterSeq").map(|v| v.to_string());
@@ -752,6 +720,25 @@ impl MLSAPIClient for WasmApiClient {
     }
 }
 
+fn canonical_conversation_view(
+    state: &catbird_atproto::blue_catbird::chat::ConversationState,
+) -> ConversationView {
+    ConversationView {
+        canonical_state: Some(state.clone()),
+        group_id: hex::encode(state.coordinates.group_id.as_ref()),
+        conversation_id: state.coordinates.conversation_id.to_string(),
+        epoch: state.coordinates.epoch as u64,
+        members: state.participants.iter().map(|participant| MemberView {
+            did: participant.user_did.to_string(),
+            role: if participant.role == "admin" { MemberRole::Admin } else { MemberRole::Member },
+        }).collect(),
+        metadata: None,
+        created_at: None,
+        updated_at: None,
+        sequencer_did: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,5 +747,64 @@ mod tests {
     fn wasm_api_client_can_construct() {
         let client = WasmApiClient::new("http://localhost:8080".to_string());
         assert_eq!(client.base_url, "http://localhost:8080");
+    }
+}
+
+#[cfg(test)]
+mod canonical_admission_projection_tests {
+    use super::*;
+    use catbird_mls::orchestrator::canonical_transport::{decode_conversation_state, encode_conversation_state, decode_conversations_inventory};
+
+    fn inventory(wire: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "items": [{"$type": "blue.catbird.chat.defs#conversationInventoryState", "state": wire}],
+            "hasMore": true, "nextPageCursor": "page-2", "inventorySessionId": "inventory-session",
+            "snapshotEventCursor": "event-fence", "snapshotExpiresAt": "2026-09-05T12:00:00.000Z"
+        })).unwrap()
+    }
+
+
+    #[test]
+    fn canonical_pending_and_accepted_leafless_views_keep_exact_snapshot() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        for (status, version) in [("pending", 41), ("active", 42)] {
+            let mut wire = fixture.clone();
+            wire["participants"][1]["status"] = serde_json::json!(status);
+            wire["coordinates"]["stateVersion"] = serde_json::json!(version);
+            wire["snapshotSeq"] = serde_json::json!(version + 4);
+            let expected = decode_conversation_state(wire.to_string().as_bytes()).unwrap();
+            let mut page = decode_conversations_inventory(&inventory(wire)).unwrap();
+            assert_eq!(page.next_page_cursor.as_deref(), Some("page-2"));
+            assert_eq!(page.inventory_session_id, "inventory-session");
+            assert_eq!(page.snapshot_event_cursor, "event-fence");
+            let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(item) = page.items.remove(0) else { panic!("missing canonical state") };
+            let state = item.state;
+            assert_eq!(state, expected);
+            let view = canonical_conversation_view(&state);
+            assert_eq!(view.canonical_state.as_ref(), Some(&state));
+            assert_eq!(view.epoch, state.coordinates.epoch as u64);
+            assert_eq!(view.group_id, hex::encode(state.coordinates.group_id.as_ref()));
+            let persisted: ConversationView = serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
+            let retained = persisted.canonical_state.unwrap();
+            assert_eq!(decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(), state);
+            assert_eq!(retained.participants[1].status, status);
+            assert_eq!(retained.participants[1].leaf_count, 0);
+            assert_eq!(retained.participants[1].invitation_provenance, state.participants[1].invitation_provenance);
+            assert!(view.created_at.is_none());
+            assert!(view.metadata.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_view_is_unknown_and_malformed_canonical_state_is_rejected() {
+        let mut wire: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let state = decode_conversation_state(wire.to_string().as_bytes()).unwrap();
+        let view = canonical_conversation_view(&state);
+        let mut old_view = serde_json::to_value(view).unwrap();
+        assert!(old_view.as_object_mut().unwrap().remove("canonicalState").is_some());
+        let legacy: ConversationView = serde_json::from_value(old_view).unwrap();
+        assert!(legacy.canonical_state.is_none());
+        wire["participants"][1]["status"] = serde_json::json!("unknown");
+        assert!(decode_conversations_inventory(&inventory(wire)).is_err());
     }
 }

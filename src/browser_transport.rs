@@ -185,9 +185,13 @@ fn read_query_whitelist(operation: CanonicalOperation) -> &'static [&'static str
         CanonicalOperation::GetConversationState => &["actorDeviceId", "conversationId"],
         CanonicalOperation::GetDevices => &["actorDeviceId", "userDids"],
         CanonicalOperation::GetEntries => &["actorDeviceId", "afterSeq", "conversationId", "limit"],
-        CanonicalOperation::GetLeafRecoveryInbox => &["actorDeviceId", "inventorySessionId", "limit", "pageCursor"],
+        CanonicalOperation::GetLeafRecoveryInbox => {
+            &["actorDeviceId", "inventorySessionId", "limit", "pageCursor"]
+        }
         CanonicalOperation::GetOwnDevices => &["actorDeviceId", "limit", "pageCursor"],
-        CanonicalOperation::GetPendingWelcomes => &["actorDeviceId", "inventorySessionId", "limit", "pageCursor"],
+        CanonicalOperation::GetPendingWelcomes => {
+            &["actorDeviceId", "inventorySessionId", "limit", "pageCursor"]
+        }
         _ => &[],
     }
 }

@@ -82,7 +82,7 @@ pub struct WasmMLSContext {
     /// Cached in-memory groups: group_id bytes → MlsGroup.
     groups: RefCell<HashMap<Vec<u8>, MlsGroup>>,
     /// Cached signing keys: identity bytes → SignatureKeyPair.
-    signers: RefCell<HashMap<Vec<u8>, SignatureKeyPair>>,
+    signers: RefCell<HashMap<Vec<u8>, Rc<SignatureKeyPair>>>,
     /// Task #56: receiver-side staged commits awaiting explicit merge.
     ///
     /// Keyed by `(group_id, target_epoch)`. Populated by `decrypt_message`
@@ -155,7 +155,10 @@ impl WasmMLSContext {
     ///
     /// Creates a new pair on first call, persists it via `StorageProvider`,
     /// and caches it in `self.signers`.
-    fn get_or_create_signer(&self, identity_bytes: &[u8]) -> Result<SignatureKeyPair, MLSError> {
+    fn get_or_create_signer(
+        &self,
+        identity_bytes: &[u8],
+    ) -> Result<Rc<SignatureKeyPair>, MLSError> {
         if let Some(s) = self.signers.borrow().get(identity_bytes) {
             return Ok(s.clone());
         }
@@ -167,7 +170,8 @@ impl WasmMLSContext {
             .store(self.provider.storage())
             .map_err(|e| MLSError::OpenMLS(format!("signer.store: {e:?}")))?;
 
-        let result = signer.clone();
+        let signer = Rc::new(signer);
+        let result = Rc::clone(&signer);
         self.signers
             .borrow_mut()
             .insert(identity_bytes.to_vec(), signer);
@@ -183,9 +187,11 @@ impl WasmMLSContext {
         &self,
         identity: Vec<u8>,
         pub_key: Vec<u8>,
-    ) -> Result<SignatureKeyPair, MLSError> {
+    ) -> Result<Rc<SignatureKeyPair>, MLSError> {
         if let Some(s) = self.signers.borrow().get(&identity) {
-            return Ok(s.clone());
+            if s.public() == pub_key.as_slice() {
+                return Ok(Rc::clone(s));
+            }
         }
 
         let s = SignatureKeyPair::read(self.provider.storage(), &pub_key, SignatureScheme::ED25519)
@@ -195,7 +201,8 @@ impl WasmMLSContext {
                 )
             })?;
 
-        self.signers.borrow_mut().insert(identity, s.clone());
+        let s = Rc::new(s);
+        self.signers.borrow_mut().insert(identity, Rc::clone(&s));
         Ok(s)
     }
 
@@ -340,8 +347,13 @@ impl WasmMLSContext {
         };
 
         let group_config = Self::make_create_config(&config);
-        let group = MlsGroup::new(&self.provider, &signer, &group_config, cred_with_key)
-            .map_err(|e| MLSError::OpenMLS(format!("MlsGroup::new: {e:?}")))?;
+        let group = MlsGroup::new(
+            &self.provider,
+            signer.as_ref(),
+            &group_config,
+            cred_with_key,
+        )
+        .map_err(|e| MLSError::OpenMLS(format!("MlsGroup::new: {e:?}")))?;
 
         let group_id = group.group_id().as_slice().to_vec();
         self.groups.borrow_mut().insert(group_id.clone(), group);
@@ -381,7 +393,7 @@ impl WasmMLSContext {
         let openmls_group_id = openmls::prelude::GroupId::from_slice(&group_id);
         let group = MlsGroup::new_with_group_id(
             &self.provider,
-            &signer,
+            signer.as_ref(),
             &group_config,
             openmls_group_id,
             cred_with_key,
@@ -447,10 +459,9 @@ impl WasmMLSContext {
         };
         let signer = self.signer_from_identity(identity, pub_key)?;
 
-        let (commit_msg, welcome, _group_info) =
-            group
-                .add_members(&self.provider, &signer, &kps)
-                .map_err(|e| MLSError::OpenMLS(format!("add_members: {e:?}")))?;
+        let (commit_msg, welcome, _group_info) = group
+            .add_members(&self.provider, signer.as_ref(), &kps)
+            .map_err(|e| MLSError::OpenMLS(format!("add_members: {e:?}")))?;
 
         let commit_data = commit_msg
             .tls_serialize_detached()
@@ -510,7 +521,7 @@ impl WasmMLSContext {
         let signer = self.signer_from_identity(identity, pub_key)?;
 
         let (commit_msg, _welcome, _group_info) = group
-            .remove_members(&self.provider, &signer, &leaf_indices)
+            .remove_members(&self.provider, signer.as_ref(), &leaf_indices)
             .map_err(|e| MLSError::OpenMLS(format!("remove_members: {e:?}")))?;
 
         commit_msg
@@ -665,7 +676,7 @@ impl WasmMLSContext {
             .build(
                 self.provider.rand(),
                 self.provider.crypto(),
-                &signer,
+                signer.as_ref(),
                 |_| true,
             )
             .map_err(|e| MLSError::OpenMLS(format!("build metadata commit: {e:?}")))?
@@ -880,7 +891,7 @@ impl WasmMLSContext {
             .expect("ensure_loaded guarantees presence");
 
         let group_info = group
-            .export_group_info(self.provider.crypto(), &signer, true)
+            .export_group_info(self.provider.crypto(), signer.as_ref(), true)
             .map_err(|e| MLSError::OpenMLS(format!("export_group_info: {e:?}")))?;
 
         group_info
@@ -961,7 +972,7 @@ impl WasmMLSContext {
 
         let (group, commit_msg, group_info_out) = MlsGroup::join_by_external_commit(
             &self.provider,
-            &signer,
+            signer.as_ref(),
             None,
             verifiable_group_info,
             &join_config,
@@ -1029,7 +1040,7 @@ impl WasmMLSContext {
         let signer = self.signer_from_identity(identity, pub_key)?;
 
         let msg_out = group
-            .create_message(&self.provider, &signer, &plaintext)
+            .create_message(&self.provider, signer.as_ref(), &plaintext)
             .map_err(|e| MLSError::OpenMLS(format!("create_message: {e:?}")))?;
 
         let raw = msg_out
@@ -1067,7 +1078,29 @@ impl WasmMLSContext {
             .process_message(&self.provider, protocol_msg)
             .map_err(|e| MLSError::OpenMLS(format!("process_message: {e:?}")))?;
 
-        let epoch = group.epoch().as_u64();
+        // Interpret the same AppData update operations as the shared native
+        // adapter, then keep the resulting commit staged for explicit merge.
+        let processed = if let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved) =
+            processed.content()
+        {
+            use openmls::messages::proposals::AppDataUpdateOperation;
+            let mut updater = group.app_data_dictionary_updater();
+            for proposal in unresolved.app_data_update_proposals() {
+                match proposal.operation() {
+                    AppDataUpdateOperation::Update(data) => updater.set(ComponentData::from_parts(
+                        proposal.component_id(),
+                        data.clone(),
+                    )),
+                    AppDataUpdateOperation::Remove => updater.remove(&proposal.component_id()),
+                }
+            }
+            group
+                .resolve_app_data_commit(&self.provider, processed, updater.changes())
+                .map_err(|_| MLSError::InvalidCommit)?
+        } else {
+            processed
+        };
+        let epoch = processed.epoch().as_u64();
 
         // Extract credential data before consuming `processed`.
         let sender_credential = {
@@ -1109,6 +1142,16 @@ impl WasmMLSContext {
                 ))
             }
 
+            // These outcomes do not carry authenticated plaintext. The
+            // legacy browser Result adapter has no durable own-echo proof
+            // authority, so it must not merge a pending commit or invent a
+            // successfully decrypted message. Matches native's legacy wrapper.
+            ProcessedMessageContent::OwnPendingCommit
+            | ProcessedMessageContent::OwnPrivateMessage => Err(MLSError::DecryptionFailed),
+            ProcessedMessageContent::UnresolvedAppDataCommit(_) => Err(MLSError::Internal(
+                "AppData commit remained unresolved after resolution".into(),
+            )),
+
             ProcessedMessageContent::ProposalMessage(_) => Err(MLSError::invalid_input(
                 "received a proposal (not application data)",
             )),
@@ -1138,7 +1181,7 @@ impl WasmMLSContext {
         };
 
         let bundle = KeyPackage::builder()
-            .build(CIPHERSUITE, &self.provider, &signer, cred_with_key)
+            .build(CIPHERSUITE, &self.provider, signer.as_ref(), cred_with_key)
             .map_err(|e| MLSError::OpenMLS(format!("KeyPackage::builder: {e:?}")))?;
         let key_package = bundle.key_package().clone();
 
@@ -1257,3 +1300,6 @@ impl WasmMLSContext {
         .map_err(|e| MLSError::invalid_input(e.to_string()))
     }
 }
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod compatibility_tests;

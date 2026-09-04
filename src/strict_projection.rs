@@ -1345,9 +1345,8 @@ pub(crate) fn parse_generated_request(
         GetBlobRequestBody, GetBlobUsageRequestBody, GetConversationStateRequestBody,
         GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody, GetOwnDevicesRequestBody,
         GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody,
-        PrepareBlobUploadRequestBody, PublishTypingRequestBody,
-        RejectWelcomeRequestBody, ReplenishKeyPackagesRequestBody,
-        RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
+        PrepareBlobUploadRequestBody, PublishTypingRequestBody, RejectWelcomeRequestBody,
+        ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
         RequestResetRequestBody, RevokeDeviceRequestBody, SendMessageRequestBody,
         SubmitTransitionRequestBody, SubscribeEventsRequestBody, UploadBlobRequestBody,
     };

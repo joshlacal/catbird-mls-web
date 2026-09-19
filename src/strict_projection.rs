@@ -1351,6 +1351,14 @@ pub(crate) fn parse_generated_request(
         SubmitTransitionRequestBody, SubscribeEventsRequestBody, UploadBlobRequestBody,
     };
     match operation {
+        CanonicalOperation::PrepareDirectRequest
+        | CanonicalOperation::PublishDirectRequest
+        | CanonicalOperation::CancelDirectRequestPreparation
+        | CanonicalOperation::GetDirectRequestOutcome
+        | CanonicalOperation::PublishDirectRequestKeys => Err(
+            "browser direct-request lifecycle is unavailable; v1 projection cannot authorize wire2"
+                .into(),
+        ),
         CanonicalOperation::AcceptConversation => {
             parse!(AcceptConversationRequestBody, AcceptConversation)
         }

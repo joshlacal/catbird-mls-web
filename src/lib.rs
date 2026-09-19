@@ -76,6 +76,7 @@ pub use credentials::SqliteCredentialStore as SqliteCredentialStoreExport;
 pub use mls_storage::WasmSqliteStorage;
 pub use sqlite_conn::{SqliteConn, WasmSqliteError};
 pub use storage::WasmStorageBackend as WasmStorageBackendExport;
+pub use wasm_mls_context::WasmMLSContext as WasmMLSContextExport;
 
 // ---------------------------------------------------------------------------
 // Panic hook

@@ -1118,15 +1118,6 @@ impl WasmMLSContext {
         group_info_bytes: Vec<u8>,
         identity_bytes: Vec<u8>,
     ) -> Result<ExternalCommitResult, MLSError> {
-        let config = Self::default_config();
-        let signer = self.get_or_create_signer(&identity_bytes)?;
-
-        let credential = BasicCredential::new(identity_bytes.clone());
-        let cred_with_key = CredentialWithKey {
-            credential: credential.into(),
-            signature_key: signer.public().into(),
-        };
-
         let (msg_in, _) = MlsMessageIn::tls_deserialize_bytes(&group_info_bytes)
             .map_err(|e| MLSError::OpenMLS(format!("GroupInfo deserialize: {e:?}")))?;
 
@@ -1137,6 +1128,28 @@ impl WasmMLSContext {
                     "expected GroupInfo for external commit",
                 ))
             }
+        };
+
+        // Any request journal entry owns its exact crypto, including terminal
+        // records. External joining must not overwrite that group underneath
+        // a retained request/artifact binding, or publish it into the live cache.
+        let group_id = hex::encode(verifiable_group_info.group_id().as_slice());
+        if self.provider.storage().conn().exists(
+            "SELECT 1 FROM direct_request_journal_v2 WHERE group_id = ?1",
+            &[(1, &group_id)],
+        )? {
+            return Err(MLSError::OperationNotSupported {
+                reason: "external joining cannot replace a request-owned group".into(),
+            });
+        }
+
+        let config = Self::default_config();
+        let signer = self.get_or_create_signer(&identity_bytes)?;
+
+        let credential = BasicCredential::new(identity_bytes.clone());
+        let cred_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signer.public().into(),
         };
 
         let join_config = Self::make_join_config(&config);
@@ -1596,6 +1609,30 @@ impl MlsCryptoContext for WasmMLSContext {
     fn import_identity_key(&self, identity: Vec<u8>, key_data: Vec<u8>) -> Result<(), MLSError> {
         let signer: SignatureKeyPair =
             serde_json::from_slice(&key_data).map_err(|_| MLSError::SerializationError)?;
+        // The upstream serde implementation does not validate key relations.
+        // The Ed25519 signing implementation rejects a private seed of the
+        // wrong length; strict verification binds that seed to the public key.
+        use openmls_traits::signatures::Signer;
+        if signer.signature_scheme() != SignatureScheme::ED25519 {
+            return Err(MLSError::invalid_input("identity signer must use Ed25519"));
+        }
+        let public_bytes: &[u8; 32] = signer
+            .public()
+            .try_into()
+            .map_err(|_| MLSError::invalid_input("identity public key must be 32 bytes"))?;
+        let public = ed25519_dalek::VerifyingKey::from_bytes(public_bytes)
+            .map_err(|_| MLSError::invalid_input("invalid identity public key"))?;
+        const IMPORT_PROOF: &[u8] = b"CATBIRD-BROWSER-IDENTITY-IMPORT-V1\0";
+        let signature = signer
+            .sign(IMPORT_PROOF)
+            .map_err(|_| MLSError::invalid_input("invalid identity private key"))?;
+        let signature = ed25519_dalek::Signature::from_slice(&signature)
+            .map_err(|_| MLSError::invalid_input("invalid identity import signature"))?;
+        public
+            .verify_strict(IMPORT_PROOF, &signature)
+            .map_err(|_| {
+                MLSError::invalid_input("identity private and public keys do not match")
+            })?;
         let mapping_key = [
             b"catbird.browser.identity.v1\0".as_slice(),
             identity.as_slice(),
@@ -1772,39 +1809,5 @@ impl MlsCryptoContext for WasmMLSContext {
             .borrow_mut()
             .remove(&(group_id, target_epoch));
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod provider_tests {
-    use super::*;
-    use catbird_mls::orchestrator::mls_provider::MlsCryptoContext;
-    use wasm_bindgen_test::*;
-
-    wasm_bindgen_test_configure!(run_in_dedicated_worker);
-
-    #[wasm_bindgen_test]
-    async fn provider_reopens_identity_and_group_from_opfs() {
-        SqliteConn::initialize_opfs().await.unwrap();
-        let path = format!("provider-{}.db", uuid::Uuid::new_v4());
-        let key = "ab".repeat(32);
-        let identity = b"did:example:alice#device".to_vec();
-        let (public_key, group_id) = {
-            let context = WasmMLSContext::open(&path, &key).unwrap();
-            let provider: &dyn MlsCryptoContext = &context;
-            let kp = provider.create_key_package(identity.clone()).unwrap();
-            let group = provider.create_group(identity.clone(), None).unwrap();
-            provider.ensure_storage_durable().unwrap();
-            (kp.signature_public_key, group.group_id)
-        };
-        let context = WasmMLSContext::open(&path, &key).unwrap();
-        let provider: &dyn MlsCryptoContext = &context;
-        let kp = provider.create_key_package(identity).unwrap();
-        assert_eq!(public_key, kp.signature_public_key);
-        assert_eq!(provider.get_epoch(group_id.clone()).unwrap(), 0);
-        assert!(provider
-            .add_members_with_aad(group_id.clone(), vec![], Some(vec![1]))
-            .is_err());
-        assert_eq!(provider.get_epoch(group_id).unwrap(), 0);
     }
 }

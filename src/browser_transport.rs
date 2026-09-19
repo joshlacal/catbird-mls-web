@@ -363,6 +363,13 @@ fn verify_signature(public_key: &[u8], transcript: &[u8], signature: &[u8]) -> R
 
 fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {
     let operation = match value {
+        "prepareDirectRequest"
+        | "publishDirectRequest"
+        | "cancelDirectRequestPreparation"
+        | "getDirectRequestOutcome"
+        | "publishDirectRequestKeys" => {
+            return Err("browser direct-request lifecycle is unavailable".into());
+        }
         "acceptConversation" => CanonicalOperation::AcceptConversation,
         "acknowledgeWelcome" => CanonicalOperation::AcknowledgeWelcome,
         "activateReset" => CanonicalOperation::ActivateReset,
@@ -401,6 +408,11 @@ fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {
 
 fn operation_name(operation: CanonicalOperation) -> &'static str {
     match operation {
+        CanonicalOperation::PrepareDirectRequest => "prepareDirectRequest",
+        CanonicalOperation::PublishDirectRequest => "publishDirectRequest",
+        CanonicalOperation::CancelDirectRequestPreparation => "cancelDirectRequestPreparation",
+        CanonicalOperation::GetDirectRequestOutcome => "getDirectRequestOutcome",
+        CanonicalOperation::PublishDirectRequestKeys => "publishDirectRequestKeys",
         CanonicalOperation::AcceptConversation => "acceptConversation",
         CanonicalOperation::AcknowledgeWelcome => "acknowledgeWelcome",
         CanonicalOperation::ActivateReset => "activateReset",

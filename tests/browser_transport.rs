@@ -653,3 +653,41 @@ fn signer_bridge_has_no_private_key_export_surface() {
     assert!(!names.contains("privateKey"));
     assert!(!names.contains("signingKeyBytes"));
 }
+
+#[wasm_bindgen_test]
+async fn request_routes_fail_before_signing_while_browser_capability_is_unavailable() {
+    catbird_mls_web::catbird_mls_set_signer_bridge(
+        Function::new_no_args("throw new Error('request signer must not be invoked')"),
+        fake_signer_key(false, "Ed25519", &["sign"]),
+        "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
+        "11111111-1111-4111-8111-111111111111".into(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        Uint8Array::new_with_length(32),
+        Some(1),
+    )
+    .unwrap();
+    for operation in [
+        "prepareDirectRequest",
+        "publishDirectRequest",
+        "cancelDirectRequestPreparation",
+        "getDirectRequestOutcome",
+        "publishDirectRequestKeys",
+    ] {
+        let signed_error =
+            catbird_mls_web::catbird_mls_prepare_signed_request(operation.into(), "{}".into())
+                .await
+                .unwrap_err();
+        assert!(signed_error
+            .as_string()
+            .unwrap()
+            .contains("browser direct-request lifecycle is unavailable"));
+        let unsigned_error =
+            catbird_mls_web::catbird_mls_prepare_unsigned_request(operation.into(), "{}".into())
+                .unwrap_err();
+        assert!(unsigned_error
+            .as_string()
+            .unwrap()
+            .contains("browser direct-request lifecycle is unavailable"));
+    }
+    catbird_mls_web::catbird_mls_clear_signer_bridge();
+}

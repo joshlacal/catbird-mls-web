@@ -37,7 +37,19 @@ globalThis.fetch=async(input, options)=>{
 await init();
 postMessage({ready:true});
 onmessage=async({data:{id,method,args}})=>{
- try{postMessage({id,value:await mls[method](...args)});}
+ try{
+  if(method==='fixtureSessionRace') {
+   const [owner,input]=args;
+   const staleRequest=mls.catbird_mls_request_command('save_request_draft',{ownerDid:owner,input,recipientLabel:'Race'});
+   const staleSend=mls.catbird_mls_send_message('11111111-1111-4111-8111-111111111111','stale same-task send');
+   const result=Promise.allSettled([staleRequest,staleSend]);
+   mls.catbird_mls_clear_auth();
+   mls.catbird_mls_set_auth(owner,'replacement-fixture-session');
+   postMessage({id,value:(await result).map(value=>({status:value.status,error:String(value.reason)}))});
+   return;
+  }
+  postMessage({id,value:await mls[method](...args)});
+ }
  catch(error){postMessage({id,error:String(error)});}
 };`;
 const server = createServer(async (request, response) => {
@@ -122,6 +134,33 @@ try {
   assert.equal(enrollments, 0);
   await page.evaluate(() => packageWorker.terminate());
   await initialize();
+  const competing = await page.evaluate(async config => {
+    const worker = new Worker('/worker.js', { type: 'module' });
+    try {
+      await new Promise((resolve, reject) => {
+        worker.onmessage = ({data}) => { if (data.ready) resolve(); };
+        worker.onerror = event => reject(new Error(event.message));
+      });
+      return await new Promise((resolve, reject) => {
+        worker.onmessage = ({data}) => { if (data.id === 1) resolve(data); };
+        worker.onerror = event => reject(new Error(event.message));
+        worker.postMessage({id: 1, method: 'catbird_mls_init', args: [config]});
+      });
+    } finally { worker.terminate(); }
+  }, config);
+  assert.match(competing.error, /OPFS|storage|Storage|handle|locked/i, 'a simultaneous Worker cannot acquire protected storage or fall back to RAM');
+  assert.equal(enrollments, 1, 'competing Worker failure must precede enrollment');
+  const racedInput = {draftId:randomUUID(),recipientDid:recipient,text:'Must never persist',invitation:null};
+  const raced = await call('fixtureSessionRace', owner, racedInput);
+  assert.equal(raced.length, 2);
+  for (const result of raced) {
+    assert.equal(result.status, 'rejected');
+    assert.match(result.error, /Browser session changed/);
+  }
+  assert.equal(preparations.length, 0, 'same-task stale request has zero transport effects');
+  await call('catbird_mls_setup');
+  const afterRace = await call('catbird_mls_request_command','get_request_workspace',{ownerDid:owner});
+  assert.equal(afterRace.drafts.length, 0, 'same-task stale request has zero protected draft effects');
   const input = { draftId: randomUUID(), recipientDid: recipient, text: 'Generated package protected draft', invitation: null };
   const command = (name, extra = {}) => call('catbird_mls_request_command', name, { ownerDid: owner, ...extra });
   await command('save_request_draft', { input, recipientLabel: 'Recipient' });
@@ -153,7 +192,7 @@ try {
   await call('catbird_mls_clear_auth');
   await assert.rejects(command('get_request_workspace'), /not ready for this account/);
   const wasm = await readFile(new URL('../pkg/catbird_mls_web_bg.wasm', import.meta.url));
-  console.log(JSON.stringify({ result: 'PASS', kind: 'generated-package-local-http-fixture', wasmSha256: createHash('sha256').update(wasm).digest('hex'), assertions: ['missing protected key before enrollment', 'real enrollment generation', 'immutable attempted draft', 'Worker termination and OPFS reopen', 'exact preparation and cancellation replay', 'account fencing'] }, null, 2));
+  console.log(JSON.stringify({ result: 'PASS', kind: 'generated-package-local-http-fixture', wasmSha256: createHash('sha256').update(wasm).digest('hex'), assertions: ['missing protected key before enrollment', 'real enrollment generation', 'immutable attempted draft', 'simultaneous Worker ownership fails closed', 'Worker termination and OPFS reopen', 'exact preparation and cancellation replay', 'account fencing', 'same-JS-task request and send invalidated before first poll'] }, null, 2));
 } finally {
   await browser.close();
   await new Promise(resolve => server.close(resolve));

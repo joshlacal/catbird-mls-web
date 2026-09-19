@@ -63,8 +63,12 @@ pub fn sqlite_transient() -> Option<unsafe extern "C" fn(*mut std::ffi::c_void)>
 /// with `SQLITE_THREADSAFE=0` is single-threaded (fine for WASM).
 pub struct SqliteConn {
     db: *mut sqlite3,
+    db_path: String,
 }
 
+thread_local! {
+    static OPEN_DATABASES: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
 impl SqliteConn {
     /// Register persistent OPFS storage in a dedicated Worker. A locked or
     /// unavailable pool is an error; never fall back to the default RAM VFS.
@@ -109,10 +113,18 @@ impl SqliteConn {
     /// Does NOT create any tables — the caller is responsible for schema setup
     /// via each consumer's `ensure_schema()` method.
     pub fn open(db_path: &str, key: &str) -> Result<Self, WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(WasmSqliteError::Serialization(
                 "database key must be 64 hexadecimal characters".into(),
             ));
+        }
+        if OPEN_DATABASES.with(|paths| paths.borrow().contains(db_path)) {
+            return Err(WasmSqliteError::Sqlite {
+                code: SQLITE_BUSY,
+                message: "Protected database already has a live owner in this Worker".into(),
+            });
         }
         let c_path =
             CString::new(db_path).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
@@ -139,7 +151,13 @@ impl SqliteConn {
             });
         }
 
-        let conn = Self { db };
+        OPEN_DATABASES.with(|paths| {
+            paths.borrow_mut().insert(db_path.to_owned());
+        });
+        let conn = Self {
+            db,
+            db_path: db_path.to_owned(),
+        };
 
         // Configure sqlite3mc encryption
         conn.exec_raw(&format!("PRAGMA key = '{}';", key))?;
@@ -179,6 +197,8 @@ impl SqliteConn {
     /// transactions already request the VFS durability barrier. Flush any
     /// remaining cache pages and propagate locked/storage errors.
     pub fn ensure_durable(&self) -> Result<(), WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         if unsafe { sqlite3_get_autocommit(self.db) } == 0 {
             return Err(WasmSqliteError::Sqlite {
                 code: SQLITE_BUSY,
@@ -194,6 +214,8 @@ impl SqliteConn {
 
     /// Execute a SQL statement with no parameters and no result.
     pub fn exec_raw(&self, sql: &str) -> Result<(), WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let ret = unsafe {
             sqlite3_exec(
@@ -212,6 +234,8 @@ impl SqliteConn {
 
     /// Read a value by key from a KV-style table (used by OpenMLS storage).
     pub fn get(&self, storage_key: &[u8]) -> Result<Option<Vec<u8>>, WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let sql = c"SELECT value FROM openmls_kv WHERE storage_key = ?1";
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -264,6 +288,8 @@ impl SqliteConn {
 
     /// Upsert a key-value pair (INSERT OR REPLACE) into the KV table.
     pub fn put(&self, storage_key: &[u8], value: &[u8]) -> Result<(), WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let sql = c"INSERT OR REPLACE INTO openmls_kv (storage_key, value) VALUES (?1, ?2)";
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -319,6 +345,8 @@ impl SqliteConn {
 
     /// Delete a key from the KV table.
     pub fn remove(&self, storage_key: &[u8]) -> Result<(), WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let sql = c"DELETE FROM openmls_kv WHERE storage_key = ?1";
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -366,6 +394,8 @@ impl SqliteConn {
         sql: &str,
         params: &[(i32, &str)],
     ) -> Result<(), WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -416,6 +446,8 @@ impl SqliteConn {
         text_params: &[(i32, &str)],
         int_params: &[(i32, i64)],
     ) -> Result<(), WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -483,6 +515,8 @@ impl SqliteConn {
         int_params: &[(i32, i64)],
         blob_params: &[(i32, &[u8])],
     ) -> Result<(), WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -556,6 +590,8 @@ impl SqliteConn {
         text_params: &[(i32, &str)],
         blob_params: &[(i32, &[u8])],
     ) -> Result<(), WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -622,6 +658,8 @@ impl SqliteConn {
         params: &[(i32, &str)],
         col_count: usize,
     ) -> Result<Vec<Vec<Option<String>>>, WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -691,6 +729,8 @@ impl SqliteConn {
         int_params: &[(i32, i64)],
         col_count: usize,
     ) -> Result<Vec<Vec<Option<String>>>, WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -781,6 +821,8 @@ impl SqliteConn {
         col_count: usize,
         blob_cols: &[usize],
     ) -> Result<Vec<Vec<(Option<String>, Option<Vec<u8>>)>>, WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -870,6 +912,8 @@ impl SqliteConn {
         sql: &str,
         text_params: &[(i32, &str)],
     ) -> Result<Option<Vec<u8>>, WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let c_sql = CString::new(sql).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
 
@@ -926,6 +970,8 @@ impl SqliteConn {
 
     /// Check if a row exists (returns true if query returns at least one row).
     pub fn exists(&self, sql: &str, params: &[(i32, &str)]) -> Result<bool, WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
         let rows = self.query_text(sql, params, 1)?;
         Ok(!rows.is_empty())
     }
@@ -949,7 +995,11 @@ impl Drop for SqliteConn {
     fn drop(&mut self) {
         if !self.db.is_null() {
             unsafe {
-                sqlite3_close(self.db);
+                if sqlite3_close(self.db) == SQLITE_OK {
+                    OPEN_DATABASES.with(|paths| {
+                        paths.borrow_mut().remove(&self.db_path);
+                    });
+                }
             }
         }
     }

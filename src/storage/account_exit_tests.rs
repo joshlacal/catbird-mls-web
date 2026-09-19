@@ -7,6 +7,7 @@ const OLD: &str = "1111111111111111111111111111111111111111111111111111111111111
 const NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
 async fn fixture() -> WasmStorageBackend {
+    SqliteConn::initialize_opfs().await.unwrap();
     let conn = Rc::new(
         SqliteConn::open(
             &format!("exit-{}.db", uuid::Uuid::new_v4()),

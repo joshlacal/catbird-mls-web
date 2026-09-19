@@ -316,49 +316,50 @@ pub fn catbird_mls_prepare_unsigned_request(
         .map_err(|error| js_error(error))
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_prepare_signed_request(
+pub fn catbird_mls_prepare_signed_request(
     operation: String,
     request_json: String,
-) -> Result<JsValue, JsValue> {
-    let signer = SIGNER
-        .with(|slot| slot.borrow().clone())
-        .ok_or_else(|| js_error("signed preparation requires signer authority"))?;
-    let operation = parse_operation(&operation).map_err(js_error)?;
-    let binding = CleanChatSigningContext {
-        actor_did: signer.actor_did.clone(),
-        device_id: signer.device_id.clone(),
-        auth_generation: signer.auth_generation,
-    };
-    // STRICT projection + binding validation FIRST — no signature is produced
-    // until the approved Rust projection fully validates the payload.
-    let projection =
-        prepare_signed_body(&binding, operation, request_json.as_bytes()).map_err(js_error)?;
-    // The retained signer's public key must match the body keyId (native
-    // `verify_authority` parity).
-    if derive_key_id(&signer.public_key) != projection.key_id {
-        return Err(js_error(
-            "signer public key does not match the signed body keyId",
-        ));
-    }
-    let input = Uint8Array::from(projection.transcript.as_slice());
-    let returned = signer
-        .callback
-        .call1(&JsValue::UNDEFINED, &input)
-        .map_err(|_| js_error("browser signer callback failed"))?;
-    let returned = JsFuture::from(Promise::resolve(&returned))
-        .await
-        .map_err(|_| js_error("browser signer promise rejected"))?;
-    let signature = Uint8Array::new(&returned).to_vec();
-    if signature.len() != 64 {
-        return Err(js_error("browser signer must return exactly 64 bytes"));
-    }
-    // Verify the returned signature against the retained public key (native
-    // `verify_authority` parity — fail closed on a bad signer callback).
-    verify_signature(&signer.public_key, &projection.transcript, &signature)?;
-    let prepared = finish_signed_request(projection, signature).map_err(js_error)?;
-    serde_wasm_bindgen::to_value(&BrowserPreparedRequest::from(prepared))
-        .map_err(|error| js_error(error))
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let signer = SIGNER
+            .with(|slot| slot.borrow().clone())
+            .ok_or_else(|| js_error("signed preparation requires signer authority"))?;
+        let operation = parse_operation(&operation).map_err(js_error)?;
+        let binding = CleanChatSigningContext {
+            actor_did: signer.actor_did.clone(),
+            device_id: signer.device_id.clone(),
+            auth_generation: signer.auth_generation,
+        };
+        // STRICT projection + binding validation FIRST — no signature is produced
+        // until the approved Rust projection fully validates the payload.
+        let projection =
+            prepare_signed_body(&binding, operation, request_json.as_bytes()).map_err(js_error)?;
+        // The retained signer's public key must match the body keyId (native
+        // `verify_authority` parity).
+        if derive_key_id(&signer.public_key) != projection.key_id {
+            return Err(js_error(
+                "signer public key does not match the signed body keyId",
+            ));
+        }
+        let input = Uint8Array::from(projection.transcript.as_slice());
+        let returned = signer
+            .callback
+            .call1(&JsValue::UNDEFINED, &input)
+            .map_err(|_| js_error("browser signer callback failed"))?;
+        let returned = JsFuture::from(Promise::resolve(&returned))
+            .await
+            .map_err(|_| js_error("browser signer promise rejected"))?;
+        let signature = Uint8Array::new(&returned).to_vec();
+        if signature.len() != 64 {
+            return Err(js_error("browser signer must return exactly 64 bytes"));
+        }
+        // Verify the returned signature against the retained public key (native
+        // `verify_authority` parity — fail closed on a bad signer callback).
+        verify_signature(&signer.public_key, &projection.transcript, &signature)?;
+        let prepared = finish_signed_request(projection, signature).map_err(js_error)?;
+        serde_wasm_bindgen::to_value(&BrowserPreparedRequest::from(prepared))
+            .map_err(|error| js_error(error))
+    })
 }
 
 fn verify_signature(public_key: &[u8], transcript: &[u8], signature: &[u8]) -> Result<(), JsValue> {

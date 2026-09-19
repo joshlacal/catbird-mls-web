@@ -31,7 +31,9 @@
 
 mod api_client;
 mod browser_enrollment;
+mod browser_exports;
 mod browser_inventory;
+mod browser_session;
 mod browser_subscription;
 mod browser_transport;
 mod credentials;
@@ -662,154 +664,163 @@ fn proxy_client(proxy_did: &str) -> reqwest::Client {
 /// Defaults:
 /// - `storagePrefix`: `"catbird_mls"` (localStorage keys)
 /// - `dbPrefix`: `"catbird-mls"` (IndexedDB / SQLite names)
-#[wasm_bindgen]
-pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
-    let cfg: InitConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| js_err!("Invalid config: {}", e))?;
+pub fn catbird_mls_init(config: JsValue) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    catbird_mls_stop_background_tasks();
+    crate::browser_session::advance();
+    crate::browser_session::run(async move {
+        let cfg: InitConfig =
+            serde_wasm_bindgen::from_value(config).map_err(|e| js_err!("Invalid config: {}", e))?;
 
-    let api_client = Arc::new(WasmApiClient::with_proxy(
-        cfg.base_url.clone(),
-        cfg.proxy_did.clone(),
-    ));
+        let api_client = Arc::new(WasmApiClient::with_proxy(
+            cfg.base_url.clone(),
+            cfg.proxy_did.clone(),
+        ));
 
-    // The host releases the key from its protected persistent vault. Missing
-    // custody fails before opening a database or creating any MLS identity.
-    let db_key = cfg
-        .mls_db_key
-        .clone()
-        .filter(|key| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| js_err!("Protected database key is required"))?;
+        // The host releases the key from its protected persistent vault. Missing
+        // custody fails before opening a database or creating any MLS identity.
+        let db_key = cfg
+            .mls_db_key
+            .clone()
+            .filter(|key| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| js_err!("Protected database key is required"))?;
 
-    // Open ONE shared encrypted SQLite database for OpenMLS state,
-    // conversations/messages, and credentials. Previously each used a separate
-    // IndexedDB — credentials leaked signing keys and MLS DID in plaintext, and
-    // conversation storage had no encryption at the IDB layer.
-    sqlite_conn::SqliteConn::initialize_opfs()
-        .await
-        .map_err(|error| js_err!("Persistent encrypted storage unavailable: {}", error))?;
-    let sqlite_db_name = format!("{}-app.db", cfg.db_prefix);
-    let shared_conn = match sqlite_conn::SqliteConn::open(&sqlite_db_name, &db_key) {
-        Ok(conn) => Rc::new(conn),
-        Err(e) => {
-            web_sys::console::warn_1(&js_err!(
-                "catbird-mls-web: SQLite unavailable ({}). \
+        // Open ONE shared encrypted SQLite database for OpenMLS state,
+        // conversations/messages, and credentials. Previously each used a separate
+        // IndexedDB — credentials leaked signing keys and MLS DID in plaintext, and
+        // conversation storage had no encryption at the IDB layer.
+        sqlite_conn::SqliteConn::initialize_opfs()
+            .await
+            .map_err(|error| js_err!("Persistent encrypted storage unavailable: {}", error))?;
+        let sqlite_db_name = format!("{}-app.db", cfg.db_prefix);
+        let shared_conn = match sqlite_conn::SqliteConn::open(&sqlite_db_name, &db_key) {
+            Ok(conn) => Rc::new(conn),
+            Err(e) => {
+                web_sys::console::warn_1(&js_err!(
+                    "catbird-mls-web: SQLite unavailable ({}). \
                  All persistent storage commands will return errors. \
                  Ensure catbird_mls_init() runs inside a Worker.",
-                e
-            ));
-            return Err(js_err!("Failed to open SQLite database: {}", e));
-        }
-    };
+                    e
+                ));
+                return Err(js_err!("Failed to open SQLite database: {}", e));
+            }
+        };
 
-    // Create all schemas on the shared connection. Each component owns its own
-    // tables; ensure_schema is idempotent (CREATE TABLE IF NOT EXISTS).
-    mls_storage::WasmSqliteStorage::ensure_schema(&shared_conn)
-        .map_err(|e| js_err!("Failed to create OpenMLS schema: {}", e))?;
-    WasmStorageBackend::ensure_schema(&shared_conn)
-        .map_err(|e| js_err!("Failed to create storage schema: {}", e))?;
-    SqliteCredentialStore::ensure_schema(&shared_conn)
-        .map_err(|e| js_err!("Failed to create credential schema: {}", e))?;
+        // Create all schemas on the shared connection. Each component owns its own
+        // tables; ensure_schema is idempotent (CREATE TABLE IF NOT EXISTS).
+        mls_storage::WasmSqliteStorage::ensure_schema(&shared_conn)
+            .map_err(|e| js_err!("Failed to create OpenMLS schema: {}", e))?;
+        WasmStorageBackend::ensure_schema(&shared_conn)
+            .map_err(|e| js_err!("Failed to create storage schema: {}", e))?;
+        SqliteCredentialStore::ensure_schema(&shared_conn)
+            .map_err(|e| js_err!("Failed to create credential schema: {}", e))?;
 
-    let storage = WasmStorageBackend::new(Rc::clone(&shared_conn));
-    let credentials = SqliteCredentialStore::new(Rc::clone(&shared_conn));
+        let storage = WasmStorageBackend::new(Rc::clone(&shared_conn));
+        let credentials = SqliteCredentialStore::new(Rc::clone(&shared_conn));
 
-    let mls_context = Some(Arc::new(
-        WasmMLSContext::open_with_conn(Rc::clone(&shared_conn))
-            .map_err(|e| js_err!("Protected MLS custody validation failed: {e}"))?,
-    ));
+        let mls_context = Some(Arc::new(
+            WasmMLSContext::open_with_conn(Rc::clone(&shared_conn))
+                .map_err(|e| js_err!("Protected MLS custody validation failed: {e}"))?,
+        ));
 
-    // Reload persisted MLS groups into the in-memory cache so they survive
-    // page refreshes. Group IDs in the `group_states` SQLite table are the
-    // server-canonical hex strings; we also accept URL-safe base64 no-pad
-    // for backward compat.
-    if let Some(ref ctx) = mls_context {
-        match storage.list_group_ids() {
-            Ok(ids) => {
-                let mut loaded = 0u32;
-                for id_str in &ids {
-                    let Some(gid_bytes) = decode_group_coordinate(id_str) else {
-                        web_sys::console::warn_1(
-                            &format!("catbird-mls-web: invalid group_id in storage: {}", id_str)
-                                .into(),
-                        );
-                        continue;
-                    };
-                    match ctx.ensure_group_loaded(&gid_bytes) {
-                        Ok(true) => loaded += 1,
-                        Ok(false) => {
+        // Reload persisted MLS groups into the in-memory cache so they survive
+        // page refreshes. Group IDs in the `group_states` SQLite table are the
+        // server-canonical hex strings; we also accept URL-safe base64 no-pad
+        // for backward compat.
+        if let Some(ref ctx) = mls_context {
+            match storage.list_group_ids() {
+                Ok(ids) => {
+                    let mut loaded = 0u32;
+                    for id_str in &ids {
+                        let Some(gid_bytes) = decode_group_coordinate(id_str) else {
                             web_sys::console::warn_1(
                                 &format!(
+                                    "catbird-mls-web: invalid group_id in storage: {}",
+                                    id_str
+                                )
+                                .into(),
+                            );
+                            continue;
+                        };
+                        match ctx.ensure_group_loaded(&gid_bytes) {
+                            Ok(true) => loaded += 1,
+                            Ok(false) => {
+                                web_sys::console::warn_1(
+                                    &format!(
                                 "catbird-mls-web: group {} in SQLite but not in OpenMLS storage",
                                 id_str
                             )
-                                .into(),
-                            );
-                        }
-                        Err(e) => {
-                            web_sys::console::warn_1(
-                                &format!("catbird-mls-web: failed to load group {}: {}", id_str, e)
                                     .into(),
-                            );
+                                );
+                            }
+                            Err(e) => {
+                                web_sys::console::warn_1(
+                                    &format!(
+                                        "catbird-mls-web: failed to load group {}: {}",
+                                        id_str, e
+                                    )
+                                    .into(),
+                                );
+                            }
                         }
                     }
+                    web_sys::console::log_1(
+                        &format!(
+                            "catbird-mls-web: reloaded {}/{} MLS groups from storage",
+                            loaded,
+                            ids.len()
+                        )
+                        .into(),
+                    );
                 }
-                web_sys::console::log_1(
-                    &format!(
-                        "catbird-mls-web: reloaded {}/{} MLS groups from storage",
-                        loaded,
-                        ids.len()
-                    )
-                    .into(),
-                );
-            }
-            Err(e) => {
-                web_sys::console::warn_1(
-                    &format!(
-                        "catbird-mls-web: failed to enumerate persisted groups: {}",
-                        e
-                    )
-                    .into(),
-                );
+                Err(e) => {
+                    web_sys::console::warn_1(
+                        &format!(
+                            "catbird-mls-web: failed to enumerate persisted groups: {}",
+                            e
+                        )
+                        .into(),
+                    );
+                }
             }
         }
-    }
 
-    let storage = Arc::new(storage);
-    let credentials = Arc::new(credentials);
-    let request_engine = if let Some(ctx) = mls_context.as_ref() {
-        credentials
-            .attach_runtime(Arc::clone(ctx), Arc::clone(&api_client))
-            .map_err(|e| js_err!("{e}"))?;
-        Some(Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
-            Arc::clone(ctx),
-            Arc::clone(&storage),
-            Arc::clone(&api_client),
-            Arc::clone(&credentials),
-            Default::default(),
-        )))
-    } else {
-        None
-    };
-    let state = AppState {
-        base_url: cfg.base_url,
-        storage_prefix: cfg.storage_prefix,
-        db_prefix: cfg.db_prefix,
-        proxy_did: cfg.proxy_did,
-        api_client,
-        storage,
-        credentials,
-        user_did: None,
-        auth_token: None,
-        mls_context,
-        request_engine,
-        request_ready: false,
-    };
+        let storage = Arc::new(storage);
+        let credentials = Arc::new(credentials);
+        let request_engine = if let Some(ctx) = mls_context.as_ref() {
+            credentials
+                .attach_runtime(Arc::clone(ctx), Arc::clone(&api_client))
+                .map_err(|e| js_err!("{e}"))?;
+            Some(Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+                Arc::clone(ctx),
+                Arc::clone(&storage),
+                Arc::clone(&api_client),
+                Arc::clone(&credentials),
+                Default::default(),
+            )))
+        } else {
+            None
+        };
+        let state = AppState {
+            base_url: cfg.base_url,
+            storage_prefix: cfg.storage_prefix,
+            db_prefix: cfg.db_prefix,
+            proxy_did: cfg.proxy_did,
+            api_client,
+            storage,
+            credentials,
+            user_did: None,
+            auth_token: None,
+            mls_context,
+            request_engine,
+            request_ready: false,
+        };
 
-    STATE.with(|s| {
-        *s.borrow_mut() = Some(state);
-    });
+        STATE.with(|s| {
+            *s.borrow_mut() = Some(state);
+        });
 
-    Ok(())
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -830,6 +841,8 @@ pub fn catbird_mls_ping() -> String {
 /// Persists the session to localStorage for future restores.
 #[wasm_bindgen]
 pub fn catbird_mls_set_auth(did: String, token: String) -> Result<(), JsValue> {
+    catbird_mls_stop_background_tasks();
+    crate::browser_session::advance();
     with_state_mut(|state| {
         state
             .mls_context
@@ -838,6 +851,15 @@ pub fn catbird_mls_set_auth(did: String, token: String) -> Result<(), JsValue> {
             .bind_request_owner(&did)
             .map_err(|e| js_err!("{e}"))?;
         state.request_ready = false;
+        state.request_engine = state.mls_context.as_ref().map(|ctx| {
+            Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+                Arc::clone(ctx),
+                Arc::clone(&state.storage),
+                Arc::clone(&state.api_client),
+                Arc::clone(&state.credentials),
+                Default::default(),
+            ))
+        });
         state.api_client.set_auth(did.clone(), token.clone());
         save_session(&state.storage_prefix, &did, &token)?;
         state.storage.set_active_user_did(Some(did.clone()));
@@ -850,8 +872,11 @@ pub fn catbird_mls_set_auth(did: String, token: String) -> Result<(), JsValue> {
 /// Clear auth credentials and session storage.
 #[wasm_bindgen]
 pub fn catbird_mls_clear_auth() -> Result<(), JsValue> {
+    catbird_mls_stop_background_tasks();
+    crate::browser_session::advance();
     with_state_mut(|state| {
         state.request_ready = false;
+        state.request_engine = None;
         state.api_client.clear_auth();
         clear_session(&state.storage_prefix);
         state.storage.set_active_user_did(None);
@@ -889,9 +914,8 @@ pub fn catbird_mls_try_restore_session() -> Result<bool, JsValue> {
 /// available on the server.
 ///
 /// Returns a JSON object with `status`, `deviceId`, `mlsDid`, `keyPackagesPublished`.
-#[wasm_bindgen]
-pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
-    request_runtime::setup().await
+pub fn catbird_mls_setup() -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move { request_runtime::setup().await })
 }
 
 // ---------------------------------------------------------------------------
@@ -904,9 +928,9 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
 /// new ones up to a target of 10.
 ///
 /// Returns a JSON object with `available` (before) and `published` counts.
-#[wasm_bindgen]
-pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
-    request_runtime::replenish().await
+pub fn catbird_mls_replenish_key_packages(
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move { request_runtime::replenish().await })
 }
 
 // ---------------------------------------------------------------------------
@@ -920,16 +944,19 @@ pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
 /// commit.
 ///
 /// Returns a JSON object with `status` and `epoch`.
-#[wasm_bindgen]
-pub async fn catbird_mls_join_group(convo_id: String) -> Result<JsValue, JsValue> {
-    canonical_uuid_string(&convo_id, "conversation ID").map_err(|e| js_err!("{e}"))?;
-    let (owner, runtime) = request_runtime::current_engine()?;
-    let epoch = runtime
-        .join_or_rejoin(&convo_id)
-        .await
-        .map_err(|e| js_err!("{e}"))?;
-    request_runtime::current(&owner, &runtime)?;
-    to_js(&serde_json::json!({"status":"joined", "epoch":epoch}))
+pub fn catbird_mls_join_group(
+    convo_id: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        canonical_uuid_string(&convo_id, "conversation ID").map_err(|e| js_err!("{e}"))?;
+        let (owner, runtime) = request_runtime::current_engine()?;
+        let epoch = runtime
+            .join_or_rejoin(&convo_id)
+            .await
+            .map_err(|e| js_err!("{e}"))?;
+        request_runtime::current(&owner, &runtime)?;
+        to_js(&serde_json::json!({"status":"joined", "epoch":epoch}))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,136 +1131,142 @@ fn validate_existing_direct_view(
     Ok(())
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_list_conversations() -> Result<JsValue, JsValue> {
-    let (owner, runtime) = request_runtime::current_engine()?;
-    request_runtime::synchronize(&owner, &runtime, true).await?;
-    let views = runtime
-        .conversations()
-        .lock()
-        .await
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    let storage = with_state(|s| Ok(s.storage.clone()))?;
-    let requests = runtime
-        .list_direct_request_views()
-        .await
-        .map_err(|e| js_err!("{}", e))?;
-    request_runtime::current(&owner, &runtime)?;
-    let mut conversations = Vec::new();
-    for view in views {
-        if matches!(
-            storage
-                .get_conversation_state(&view.conversation_id)
-                .await
-                .map_err(|e| js_err!("{}", e))?,
-            Some(
-                catbird_mls::orchestrator::types::ConversationState::Closed
-                    | catbird_mls::orchestrator::types::ConversationState::DeviceRemoved
-            )
-        ) {
-            continue;
-        }
-        // Request rows live in the request workspace until consent is verified.
-        // A missing local request projection never authorizes normal chat UI.
-        if view
-            .canonical_state
-            .as_ref()
-            .is_some_and(|s| s.direct_request.is_some())
-            && !requests.iter().any(|r| {
-                r.conversation_id == view.conversation_id
-                    && r.consent == catbird_mls::orchestrator::RequestConsent::Accepted
-            })
-        {
-            continue;
-        }
-        let group_id = decode_group_coordinate(&view.group_id)
-            .map(hex::encode)
-            .ok_or_else(|| js_err!("Invalid protected group coordinate"))?;
-        let members = view
-            .members
-            .iter()
-            .map(|m| m.did.clone())
+pub fn catbird_mls_list_conversations(
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let (owner, runtime) = request_runtime::current_engine()?;
+        request_runtime::synchronize(&owner, &runtime, true).await?;
+        let views = runtime
+            .conversations()
+            .lock()
+            .await
+            .values()
+            .cloned()
             .collect::<Vec<_>>();
-        let title = storage
-            .get_metadata_text(&group_id)
-            .map_err(|e| js_err!("{}", e))?
-            .and_then(|(title, _)| title)
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| members.join(", "));
-        let kind = storage
-            .conversation_kind(&owner, &view.conversation_id)
-            .map_err(|e| js_err!("{}", e))?
-            .unwrap_or_else(|| {
-                if conversation_is_group(&view.members) {
-                    "group"
-                } else {
-                    "direct"
-                }
-                .into()
+        let storage = with_state(|s| Ok(s.storage.clone()))?;
+        let requests = runtime
+            .list_direct_request_views()
+            .await
+            .map_err(|e| js_err!("{}", e))?;
+        request_runtime::current(&owner, &runtime)?;
+        let mut conversations = Vec::new();
+        for view in views {
+            if matches!(
+                storage
+                    .get_conversation_state(&view.conversation_id)
+                    .await
+                    .map_err(|e| js_err!("{}", e))?,
+                Some(
+                    catbird_mls::orchestrator::types::ConversationState::Closed
+                        | catbird_mls::orchestrator::types::ConversationState::DeviceRemoved
+                )
+            ) {
+                continue;
+            }
+            // Request rows live in the request workspace until consent is verified.
+            // A missing local request projection never authorizes normal chat UI.
+            if view
+                .canonical_state
+                .as_ref()
+                .is_some_and(|s| s.direct_request.is_some())
+                && !requests.iter().any(|r| {
+                    r.conversation_id == view.conversation_id
+                        && r.consent == catbird_mls::orchestrator::RequestConsent::Accepted
+                })
+            {
+                continue;
+            }
+            let group_id = decode_group_coordinate(&view.group_id)
+                .map(hex::encode)
+                .ok_or_else(|| js_err!("Invalid protected group coordinate"))?;
+            let members = view
+                .members
+                .iter()
+                .map(|m| m.did.clone())
+                .collect::<Vec<_>>();
+            let title = storage
+                .get_metadata_text(&group_id)
+                .map_err(|e| js_err!("{}", e))?
+                .and_then(|(title, _)| title)
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| members.join(", "));
+            let kind = storage
+                .conversation_kind(&owner, &view.conversation_id)
+                .map_err(|e| js_err!("{}", e))?
+                .unwrap_or_else(|| {
+                    if conversation_is_group(&view.members) {
+                        "group"
+                    } else {
+                        "direct"
+                    }
+                    .into()
+                });
+            conversations.push(Conversation {
+                id: view.conversation_id,
+                group_id,
+                display_name: title,
+                members,
+                member_views: Some(view.members),
+                is_group: kind == "group",
+                conversation_kind: kind,
+                last_message: None,
+                last_message_at: None,
+                unread_count: 0,
             });
-        conversations.push(Conversation {
-            id: view.conversation_id,
-            group_id,
-            display_name: title,
-            members,
-            member_views: Some(view.members),
-            is_group: kind == "group",
-            conversation_kind: kind,
-            last_message: None,
-            last_message_at: None,
-            unread_count: 0,
-        });
-    }
-    request_runtime::current(&owner, &runtime)?;
-    to_js(&conversations)
-}
-
-#[wasm_bindgen]
-pub async fn catbird_mls_create_conversation(
-    name: String,
-    member_dids: Array,
-) -> Result<JsValue, JsValue> {
-    let members = array_to_strings(&member_dids);
-    if members.len() == 1 {
-        return Err(js_err!(
-            "Direct conversations require a local draft and an encrypted first message"
-        ));
-    }
-    let (owner, runtime) = request_runtime::current_engine()?;
-    let view = runtime
-        .create_group(&name, Some(&members), None)
-        .await
-        .map_err(|e| js_err!("{e}"))?;
-    request_runtime::current(&owner, &runtime)?;
-    to_js(&Conversation {
-        id: view.conversation_id,
-        group_id: view.group_id,
-        display_name: name,
-        members: view.members.iter().map(|m| m.did.clone()).collect(),
-        member_views: Some(view.members),
-        conversation_kind: "group".into(),
-        last_message: None,
-        last_message_at: None,
-        unread_count: 0,
-        is_group: true,
+        }
+        request_runtime::current(&owner, &runtime)?;
+        to_js(&conversations)
     })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_subscribe(
+pub fn catbird_mls_create_conversation(
+    name: String,
+    member_dids: Array,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let members = array_to_strings(&member_dids);
+        if members.len() == 1 {
+            return Err(js_err!(
+                "Direct conversations require a local draft and an encrypted first message"
+            ));
+        }
+        let (owner, runtime) = request_runtime::current_engine()?;
+        let view = runtime
+            .create_group(&name, Some(&members), None)
+            .await
+            .map_err(|e| js_err!("{e}"))?;
+        request_runtime::current(&owner, &runtime)?;
+        to_js(&Conversation {
+            id: view.conversation_id,
+            group_id: view.group_id,
+            display_name: name,
+            members: view.members.iter().map(|m| m.did.clone()).collect(),
+            member_views: Some(view.members),
+            conversation_kind: "group".into(),
+            last_message: None,
+            last_message_at: None,
+            unread_count: 0,
+            is_group: true,
+        })
+    })
+}
+
+pub fn catbird_mls_subscribe(
     convo_id: String,
     on_message: js_sys::Function,
     on_event: js_sys::Function,
     on_status: js_sys::Function,
-) -> Result<browser_subscription::CanonicalSubscription, JsValue> {
-    browser_subscription::connect(convo_id, on_message, on_event, on_status).await
+) -> impl std::future::Future<Output = Result<browser_subscription::CanonicalSubscription, JsValue>>
+{
+    crate::browser_session::run(async move {
+        browser_subscription::connect(convo_id, on_message, on_event, on_status).await
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_unsubscribe(_convo_id: String) -> Result<(), JsValue> {
-    Ok(())
+pub fn catbird_mls_unsubscribe(
+    _convo_id: String,
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move { Ok(()) })
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,20 +1289,20 @@ async fn send_payload_message_internal(
     to_js(&ui_message_from_orchestrator(message))
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_send_message(
+pub fn catbird_mls_send_message(
     convo_id: String,
     content: String,
-) -> Result<JsValue, JsValue> {
-    send_payload_message_internal(
-        convo_id,
-        catbird_mls::orchestrator::types::MLSMessagePayload::text(&content),
-    )
-    .await
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        send_payload_message_internal(
+            convo_id,
+            catbird_mls::orchestrator::types::MLSMessagePayload::text(&content),
+        )
+        .await
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_send_image(
+pub fn catbird_mls_send_image(
     convo_id: String,
     content: String,
     data: Vec<u8>,
@@ -1277,122 +1310,131 @@ pub async fn catbird_mls_send_image(
     width: u32,
     height: u32,
     alt_text: Option<String>,
-) -> Result<JsValue, JsValue> {
-    request_runtime::require_ordinary_access(&convo_id).await?;
-    if !content_type.starts_with("image/") {
-        return Err(js_err!("Unsupported image content type: {}", content_type));
-    }
-    if data.len() > 10 * 1024 * 1024 {
-        return Err(js_err!("Image too large (max 10MB)"));
-    }
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        request_runtime::require_ordinary_access(&convo_id).await?;
+        if !content_type.starts_with("image/") {
+            return Err(js_err!("Unsupported image content type: {}", content_type));
+        }
+        if data.len() > 10 * 1024 * 1024 {
+            return Err(js_err!("Image too large (max 10MB)"));
+        }
 
-    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
-    let encrypted = encrypt_blob(&data).map_err(|e| js_err!("encrypt_blob failed: {}", e))?;
-    let (blob_id, _uploaded_size) = api_client
-        .upload_blob(&encrypted.ciphertext)
+        let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
+        let encrypted = encrypt_blob(&data).map_err(|e| js_err!("encrypt_blob failed: {}", e))?;
+        let (blob_id, _uploaded_size) = api_client
+            .upload_blob(&encrypted.ciphertext)
+            .await
+            .map_err(|e| js_err!("upload_blob failed: {:?}", e))?;
+
+        let embed = catbird_mls::orchestrator::types::MLSEmbedData::image(
+            catbird_mls::orchestrator::types::MLSImageEmbed {
+                blob_id,
+                key: encrypted.key,
+                iv: encrypted.iv,
+                sha256: encrypted.sha256,
+                content_type,
+                size: data.len(),
+                width,
+                height,
+                alt_text,
+                blurhash: None,
+            },
+        )
+        .map_err(|e| js_err!("Failed to encode image embed: {:?}", e))?;
+
+        send_payload_message_internal(
+            convo_id,
+            catbird_mls::orchestrator::types::MLSMessagePayload::text_with_embed(&content, embed),
+        )
         .await
-        .map_err(|e| js_err!("upload_blob failed: {:?}", e))?;
-
-    let embed = catbird_mls::orchestrator::types::MLSEmbedData::image(
-        catbird_mls::orchestrator::types::MLSImageEmbed {
-            blob_id,
-            key: encrypted.key,
-            iv: encrypted.iv,
-            sha256: encrypted.sha256,
-            content_type,
-            size: data.len(),
-            width,
-            height,
-            alt_text,
-            blurhash: None,
-        },
-    )
-    .map_err(|e| js_err!("Failed to encode image embed: {:?}", e))?;
-
-    send_payload_message_internal(
-        convo_id,
-        catbird_mls::orchestrator::types::MLSMessagePayload::text_with_embed(&content, embed),
-    )
-    .await
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_get_image_attachment(
+pub fn catbird_mls_get_image_attachment(
+    convo_id: String,
     blob_id: String,
     key_b64: String,
     iv_b64: String,
     sha256: String,
     content_type: String,
-) -> Result<String, JsValue> {
-    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
-    let key = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| js_err!("Invalid image key: {:?}", e))?;
-    let iv = base64::engine::general_purpose::STANDARD
-        .decode(iv_b64)
-        .map_err(|e| js_err!("Invalid image IV: {:?}", e))?;
-    let ciphertext = api_client
-        .get_blob(&blob_id)
-        .await
-        .map_err(|e| js_err!("get_blob failed: {:?}", e))?;
-    let plaintext = decrypt_blob(&ciphertext, &key, &iv, &sha256)
-        .map_err(|e| js_err!("decrypt_blob failed: {}", e))?;
+) -> impl std::future::Future<Output = Result<String, JsValue>> {
+    crate::browser_session::run(async move {
+        request_runtime::require_ordinary_access(&convo_id).await?;
+        let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(key_b64)
+            .map_err(|e| js_err!("Invalid image key: {:?}", e))?;
+        let iv = base64::engine::general_purpose::STANDARD
+            .decode(iv_b64)
+            .map_err(|e| js_err!("Invalid image IV: {:?}", e))?;
+        let ciphertext = api_client
+            .get_blob(&blob_id)
+            .await
+            .map_err(|e| js_err!("get_blob failed: {:?}", e))?;
+        let plaintext = decrypt_blob(&ciphertext, &key, &iv, &sha256)
+            .map_err(|e| js_err!("decrypt_blob failed: {}", e))?;
 
-    Ok(format!(
-        "data:{};base64,{}",
-        content_type,
-        base64::engine::general_purpose::STANDARD.encode(plaintext)
-    ))
+        Ok(format!(
+            "data:{};base64,{}",
+            content_type,
+            base64::engine::general_purpose::STANDARD.encode(plaintext)
+        ))
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_messages(
+pub fn catbird_mls_messages(
     convo_id: String,
     before: Option<String>,
-) -> Result<JsValue, JsValue> {
-    let (resolved_convo_id, _group_id) = resolve_conversation_identity(&convo_id)?;
-    let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let (resolved_convo_id, _group_id) = resolve_conversation_identity(&convo_id)?;
+        let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
 
-    let stored = storage
-        .get_messages_before_cursor(&resolved_convo_id, 50, before.as_deref())
-        .await
-        .map_err(|e| js_err!("get_messages failed: {:?}", e))?;
+        let stored = storage
+            .get_messages_before_cursor(&resolved_convo_id, 50, before.as_deref())
+            .await
+            .map_err(|e| js_err!("get_messages failed: {:?}", e))?;
 
-    let messages: Vec<Message> = stored
-        .into_iter()
-        .filter(|m| m.has_displayable_body())
-        .map(|mut message| {
-            // Legacy rows may still carry the group id. Normalize the UI/API
-            // projection to the stable conversation identity.
-            message.conversation_id = resolved_convo_id.clone();
-            ui_message_from_orchestrator(message)
-        })
-        .collect();
-
-    to_js(&messages)
-}
-
-#[wasm_bindgen]
-pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue, JsValue> {
-    let (resolved, _) = resolve_conversation_identity(&convo_id)?;
-    let (owner, runtime) = request_runtime::current_engine()?;
-    let previous = SYNC_CURSORS.with(|m| m.borrow().get(&resolved).cloned());
-    let (messages, cursor) = runtime
-        .fetch_messages(&resolved, previous.as_deref(), 50, None, None, None)
-        .await
-        .map_err(|e| js_err!("{e}"))?;
-    request_runtime::current(&owner, &runtime)?;
-    // The shared engine rejects a failed control/application before this cursor advances.
-    if let Some(cursor) = cursor {
-        SYNC_CURSORS.with(|m| m.borrow_mut().insert(resolved, cursor));
-    }
-    to_js(
-        &messages
+        let messages: Vec<Message> = stored
             .into_iter()
             .filter(|m| m.has_displayable_body())
-            .map(ui_message_from_orchestrator)
-            .collect::<Vec<_>>(),
-    )
+            .map(|mut message| {
+                // Legacy rows may still carry the group id. Normalize the UI/API
+                // projection to the stable conversation identity.
+                message.conversation_id = resolved_convo_id.clone();
+                ui_message_from_orchestrator(message)
+            })
+            .collect();
+
+        to_js(&messages)
+    })
+}
+
+pub fn catbird_mls_fetch_new_messages(
+    convo_id: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let (resolved, _) = resolve_conversation_identity(&convo_id)?;
+        let (owner, runtime) = request_runtime::current_engine()?;
+        let previous = SYNC_CURSORS.with(|m| m.borrow().get(&resolved).cloned());
+        let (messages, cursor) = runtime
+            .fetch_messages(&resolved, previous.as_deref(), 50, None, None, None)
+            .await
+            .map_err(|e| js_err!("{e}"))?;
+        request_runtime::current(&owner, &runtime)?;
+        // The shared engine rejects a failed control/application before this cursor advances.
+        if let Some(cursor) = cursor {
+            SYNC_CURSORS.with(|m| m.borrow_mut().insert(resolved, cursor));
+        }
+        to_js(
+            &messages
+                .into_iter()
+                .filter(|m| m.has_displayable_body())
+                .map(ui_message_from_orchestrator)
+                .collect::<Vec<_>>(),
+        )
+    })
 }
 
 /// Build the shared MLS reaction envelope. Reactions are application
@@ -1412,73 +1454,80 @@ fn reaction_payload_for_wire(
     Ok(catbird_mls::orchestrator::types::MLSMessagePayload::reaction(message_id, emoji, action))
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_send_reaction(
+pub fn catbird_mls_send_reaction(
     conversation_id: String,
     message_id: String,
     emoji: String,
     action: String,
-) -> Result<(), JsValue> {
-    let (resolved_convo_id, _) = resolve_conversation_identity(&conversation_id)?;
-    let payload = reaction_payload_for_wire(&message_id, &emoji, &action)
-        .map_err(|error| js_err!("send reaction failed: {}", error))?;
-    // The shared send path encrypts the complete reaction envelope with the
-    // current MLS group, submits the stable conversation route, and persists
-    // the resulting message. Historical-alias message IDs remain untouched
-    // inside the encrypted payload for cross-reset targeting.
-    send_payload_message_internal(resolved_convo_id, payload).await?;
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        let (resolved_convo_id, _) = resolve_conversation_identity(&conversation_id)?;
+        let payload = reaction_payload_for_wire(&message_id, &emoji, &action)
+            .map_err(|error| js_err!("send reaction failed: {}", error))?;
+        // The shared send path encrypts the complete reaction envelope with the
+        // current MLS group, submits the stable conversation route, and persists
+        // the resulting message. Historical-alias message IDs remain untouched
+        // inside the encrypted payload for cross-reset targeting.
+        send_payload_message_internal(resolved_convo_id, payload).await?;
 
-    Ok(())
+        Ok(())
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_update_cursor(
+pub fn catbird_mls_update_cursor(
     _conversation_id: String,
     _cursor: String,
-) -> Result<(), JsValue> {
-    Err(js_err!("legacy mlsChat updateCursor is disabled; subscription cursors are managed via subscribeEvents"))
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        Err(js_err!("legacy mlsChat updateCursor is disabled; subscription cursors are managed via subscribeEvents"))
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Member commands
 // ---------------------------------------------------------------------------
 
-#[wasm_bindgen]
-pub async fn catbird_mls_get_members(conversation_id: String) -> Result<JsValue, JsValue> {
-    use catbird_mls::orchestrator::storage::MLSStorageBackend;
+pub fn catbird_mls_get_members(
+    conversation_id: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        use catbird_mls::orchestrator::storage::MLSStorageBackend;
 
-    let (resolved_convo_id, _group_id) = resolve_conversation_identity(&conversation_id)?;
-    let (storage, user_did) = with_state(|s| {
-        let did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.storage), did))
-    })?;
+        let (resolved_convo_id, _group_id) = resolve_conversation_identity(&conversation_id)?;
+        let (storage, user_did) = with_state(|s| {
+            let did = s
+                .user_did
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))?;
+            Ok((Arc::clone(&s.storage), did))
+        })?;
 
-    let convo = storage
-        .get_conversation(&user_did, &resolved_convo_id)
-        .await
-        .map_err(|e| js_err!("get_group_members storage error: {:?}", e))?;
+        let convo = storage
+            .get_conversation(&user_did, &resolved_convo_id)
+            .await
+            .map_err(|e| js_err!("get_group_members storage error: {:?}", e))?;
 
-    let members: Vec<GroupMember> = match convo {
-        Some(c) => c
-            .members
-            .into_iter()
-            .map(|m| GroupMember {
-                did: m.did.clone(),
-                handle: String::new(),
-                display_name: None,
-                role: match m.role {
-                    catbird_mls::orchestrator::types::MemberRole::Admin => "admin".to_string(),
-                    catbird_mls::orchestrator::types::MemberRole::Member => "member".to_string(),
-                },
-            })
-            .collect(),
-        None => vec![],
-    };
+        let members: Vec<GroupMember> = match convo {
+            Some(c) => c
+                .members
+                .into_iter()
+                .map(|m| GroupMember {
+                    did: m.did.clone(),
+                    handle: String::new(),
+                    display_name: None,
+                    role: match m.role {
+                        catbird_mls::orchestrator::types::MemberRole::Admin => "admin".to_string(),
+                        catbird_mls::orchestrator::types::MemberRole::Member => {
+                            "member".to_string()
+                        }
+                    },
+                })
+                .collect(),
+            None => vec![],
+        };
 
-    to_js(&members)
+        to_js(&members)
+    })
 }
 
 /// Add one or more members to an existing group in a single MLS commit.
@@ -1489,94 +1538,103 @@ pub async fn catbird_mls_get_members(conversation_id: String) -> Result<JsValue,
 /// 3. Merge the pending commit locally (one epoch advance regardless of member count).
 /// 4. Send the commit + welcome to the server via `commitGroupChange`.
 /// 5. Update the cached server epoch.
-#[wasm_bindgen]
-pub async fn catbird_mls_add_group_members(
+pub fn catbird_mls_add_group_members(
     conversation_id: String,
     member_dids: Array,
-) -> Result<(), JsValue> {
-    let (cid, _) = resolve_conversation_identity(&conversation_id)?;
-    request_runtime::require_ordinary_access(&cid).await?;
-    let (owner, runtime) = request_runtime::current_engine()?;
-    runtime
-        .add_members(&cid, &array_to_strings(&member_dids))
-        .await
-        .map_err(|e| js_err!("{e}"))?;
-    request_runtime::current(&owner, &runtime)
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        let (cid, _) = resolve_conversation_identity(&conversation_id)?;
+        request_runtime::require_ordinary_access(&cid).await?;
+        let (owner, runtime) = request_runtime::current_engine()?;
+        runtime
+            .add_members(&cid, &array_to_strings(&member_dids))
+            .await
+            .map_err(|e| js_err!("{e}"))?;
+        request_runtime::current(&owner, &runtime)
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_add_participants(
+pub fn catbird_mls_add_participants(
     conversation_id: String,
     target_did: String,
-) -> Result<(), JsValue> {
-    let arr = Array::new();
-    arr.push(&JsValue::from_str(&target_did));
-    catbird_mls_add_group_members(conversation_id, arr).await
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        let arr = Array::new();
+        arr.push(&JsValue::from_str(&target_did));
+        catbird_mls_add_group_members(conversation_id, arr).await
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_demote_member(
+pub fn catbird_mls_demote_member(
     _conversation_id: String,
     _target_did: String,
-) -> Result<(), JsValue> {
-    Err(js_err!(
-        "demoteAdmin is a signed policy transition and is not wired in WASM"
-    ))
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        Err(js_err!(
+            "demoteAdmin is a signed policy transition and is not wired in WASM"
+        ))
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_remove_participants(
+pub fn catbird_mls_remove_participants(
     conversation_id: String,
     target_did: String,
-) -> Result<(), JsValue> {
-    let (cid, _) = resolve_conversation_identity(&conversation_id)?;
-    request_runtime::require_ordinary_access(&cid).await?;
-    let (owner, runtime) = request_runtime::current_engine()?;
-    runtime
-        .remove_members(&cid, &[target_did])
-        .await
-        .map_err(|e| js_err!("{e}"))?;
-    request_runtime::current(&owner, &runtime)
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        let (cid, _) = resolve_conversation_identity(&conversation_id)?;
+        request_runtime::require_ordinary_access(&cid).await?;
+        let (owner, runtime) = request_runtime::current_engine()?;
+        runtime
+            .remove_members(&cid, &[target_did])
+            .await
+            .map_err(|e| js_err!("{e}"))?;
+        request_runtime::current(&owner, &runtime)
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_leave_conversation(conversation_id: String) -> Result<(), JsValue> {
-    let (cid, _) = resolve_conversation_identity(&conversation_id)?;
-    request_runtime::require_ordinary_access(&cid).await?;
-    let (owner, runtime) = request_runtime::current_engine()?;
-    runtime
-        .leave_group(&cid)
-        .await
-        .map_err(|e| js_err!("{e}"))?;
-    request_runtime::current(&owner, &runtime)
+pub fn catbird_mls_leave_conversation(
+    conversation_id: String,
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        let (cid, _) = resolve_conversation_identity(&conversation_id)?;
+        request_runtime::require_ordinary_access(&cid).await?;
+        let (owner, runtime) = request_runtime::current_engine()?;
+        runtime
+            .leave_group(&cid)
+            .await
+            .map_err(|e| js_err!("{e}"))?;
+        request_runtime::current(&owner, &runtime)
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Typing indicator
 // ---------------------------------------------------------------------------
 
-#[wasm_bindgen]
-pub async fn catbird_mls_send_typing(
+pub fn catbird_mls_send_typing(
     _conversation_id: String,
     _is_typing: bool,
-) -> Result<(), JsValue> {
-    Err(js_err!(
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        Err(js_err!(
         "Typing is temporarily unavailable: canonical signed typing transport is not wired in WASM"
     ))
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Promote / Group metadata
 // ---------------------------------------------------------------------------
 
-#[wasm_bindgen]
-pub async fn catbird_mls_promote_member(
+pub fn catbird_mls_promote_member(
     _conversation_id: String,
     _target_did: String,
-) -> Result<(), JsValue> {
-    Err(js_err!(
-        "promoteAdmin is a signed policy transition and is not wired in WASM"
-    ))
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        Err(js_err!(
+            "promoteAdmin is a signed policy transition and is not wired in WASM"
+        ))
+    })
 }
 
 /// Read MLS group metadata (title/description/avatar) from local decrypted
@@ -1636,194 +1694,195 @@ pub fn catbird_mls_get_group_metadata(conversation_id: String) -> Result<JsValue
 /// Returns a JS object with `commitBytes` (base64), `ciphertext` (base64),
 /// `reference` (the `MetadataReference` JSON), and `metadataVersion`.
 /// The ciphertext echo is informational — uploading happens internally.
-#[wasm_bindgen]
-pub async fn catbird_mls_update_group_metadata(
+pub fn catbird_mls_update_group_metadata(
     conversation_id: String,
     title: Option<String>,
     description: Option<String>,
     avatar_blob_locator: Option<String>,
     avatar_content_type: Option<String>,
     avatar_bytes: Option<Vec<u8>>,
-) -> Result<JsValue, JsValue> {
-    use catbird_mls::metadata;
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        use catbird_mls::metadata;
 
-    let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&conversation_id)?;
-    request_runtime::require_ordinary_access(&resolved_convo_id).await?;
-    let (api_client, storage, user_did) = with_state(|s| {
-        let user_did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
-    })?;
+        let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&conversation_id)?;
+        request_runtime::require_ordinary_access(&resolved_convo_id).await?;
+        let (api_client, storage, user_did) = with_state(|s| {
+            let user_did = s
+                .user_did
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))?;
+            Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
+        })?;
 
-    let group_id_bytes = decode_group_coordinate(&group_id_hex)
-        .ok_or_else(|| js_err!("Invalid conversation/group ID: {}", group_id_hex))?;
+        let group_id_bytes = decode_group_coordinate(&group_id_hex)
+            .ok_or_else(|| js_err!("Invalid conversation/group ID: {}", group_id_hex))?;
 
-    // 1. Stage the GroupContextExtensions commit locally.
-    let commit_bytes = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.update_group_metadata(group_id_bytes.clone())
-            .map_err(|e| js_err!("update_group_metadata stage failed: {:?}", e))
-    })?;
+        // 1. Stage the GroupContextExtensions commit locally.
+        let commit_bytes = with_state(|s| {
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.update_group_metadata(group_id_bytes.clone())
+                .map_err(|e| js_err!("update_group_metadata stage failed: {:?}", e))
+        })?;
 
-    // 2. Send commit to server (action = "updateMetadata").
-    let (success, new_epoch) = match api_client
-        .commit_update_metadata(&resolved_convo_id, &commit_bytes)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // Server rejected — clear pending so the group isn't stuck.
+        // 2. Send commit to server (action = "updateMetadata").
+        let (success, new_epoch) = match api_client
+            .commit_update_metadata(&resolved_convo_id, &commit_bytes)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Server rejected — clear pending so the group isn't stuck.
+                let _ = with_state(|s| {
+                    if let Some(ctx) = s.mls_context.as_ref() {
+                        let _ = ctx.clear_pending_commit(group_id_bytes.clone());
+                    }
+                    Ok(())
+                });
+                return Err(js_err!(
+                    "commit_update_metadata server call failed: {:?}",
+                    e
+                ));
+            }
+        };
+        if !success {
             let _ = with_state(|s| {
                 if let Some(ctx) = s.mls_context.as_ref() {
                     let _ = ctx.clear_pending_commit(group_id_bytes.clone());
                 }
                 Ok(())
             });
-            return Err(js_err!(
-                "commit_update_metadata server call failed: {:?}",
-                e
-            ));
+            return Err(js_err!("Server rejected updateMetadata commit"));
         }
-    };
-    if !success {
-        let _ = with_state(|s| {
-            if let Some(ctx) = s.mls_context.as_ref() {
-                let _ = ctx.clear_pending_commit(group_id_bytes.clone());
-            }
-            Ok(())
-        });
-        return Err(js_err!("Server rejected updateMetadata commit"));
-    }
 
-    // 3. Merge pending commit locally (epoch advances).
-    let local_epoch = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.merge_pending_commit(group_id_bytes.clone())
-            .map_err(|e| js_err!("merge_pending_commit failed: {:?}", e))
-    })?;
-
-    // 4. Cache server epoch.
-    if new_epoch > 0 {
-        SERVER_EPOCHS.with(|m| m.borrow_mut().insert(resolved_convo_id.clone(), new_epoch));
-    }
-
-    // 5. Read post-merge MetadataReference + derive metadata key from new
-    //    epoch's exporter secret.
-    let (metadata_key_vec, epoch_used, reference) = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.current_metadata_info(group_id_bytes.clone())
-            .map_err(|e| js_err!("current_metadata_info failed: {:?}", e))?
-            .ok_or_else(|| js_err!("MetadataReference missing after metadata commit merge"))
-    })?;
-    let reference = reference
-        .ok_or_else(|| js_err!("MetadataReference missing in AppDataDictionary post-merge"))?;
-    let metadata_version = reference.metadata_version;
-    let blob_locator = reference.blob_locator.clone();
-
-    let mut metadata_key = [0u8; 32];
-    if metadata_key_vec.len() != 32 {
-        return Err(js_err!(
-            "Derived metadata key has wrong length: {} (expected 32)",
-            metadata_key_vec.len()
-        ));
-    }
-    metadata_key.copy_from_slice(&metadata_key_vec);
-
-    // 6. Build GroupMetadataV1 payload + encrypt.
-    let payload = metadata::GroupMetadataV1 {
-        version: 1,
-        title: title.clone().unwrap_or_default(),
-        description: description.clone().unwrap_or_default(),
-        avatar_blob_locator: avatar_blob_locator.clone(),
-        avatar_content_type: avatar_content_type.clone(),
-    };
-
-    let ciphertext = metadata::encrypt_metadata_blob(
-        &metadata_key,
-        &group_id_bytes,
-        epoch_used,
-        metadata_version,
-        &payload,
-    )
-    .map_err(|e| js_err!("encrypt_metadata_blob failed: {:?}", e))?;
-
-    // 7. Upload metadata blob.
-    let (_confirmed_locator, _size) = api_client
-        .put_group_metadata_blob(
-            &blob_locator,
-            &group_id_hex,
-            &ciphertext,
-            Some(metadata_version),
-            None,
-        )
-        .await
-        .map_err(|e| {
-            // Non-fatal: commit already merged. Surface as error so JS knows
-            // the title/description are temporarily unavailable to peers,
-            // but the group is otherwise healthy. Mirrors iOS warning path.
-            js_err!("put_group_metadata_blob failed: {:?}", e)
+        // 3. Merge pending commit locally (epoch advances).
+        let local_epoch = with_state(|s| {
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.merge_pending_commit(group_id_bytes.clone())
+                .map_err(|e| js_err!("merge_pending_commit failed: {:?}", e))
         })?;
 
-    // 8. Optional avatar encrypt + upload.
-    if let (Some(av_locator), Some(av_bytes)) =
-        (avatar_blob_locator.as_deref(), avatar_bytes.as_deref())
-    {
-        let av_ct = metadata::encrypt_avatar_blob(
+        // 4. Cache server epoch.
+        if new_epoch > 0 {
+            SERVER_EPOCHS.with(|m| m.borrow_mut().insert(resolved_convo_id.clone(), new_epoch));
+        }
+
+        // 5. Read post-merge MetadataReference + derive metadata key from new
+        //    epoch's exporter secret.
+        let (metadata_key_vec, epoch_used, reference) = with_state(|s| {
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.current_metadata_info(group_id_bytes.clone())
+                .map_err(|e| js_err!("current_metadata_info failed: {:?}", e))?
+                .ok_or_else(|| js_err!("MetadataReference missing after metadata commit merge"))
+        })?;
+        let reference = reference
+            .ok_or_else(|| js_err!("MetadataReference missing in AppDataDictionary post-merge"))?;
+        let metadata_version = reference.metadata_version;
+        let blob_locator = reference.blob_locator.clone();
+
+        let mut metadata_key = [0u8; 32];
+        if metadata_key_vec.len() != 32 {
+            return Err(js_err!(
+                "Derived metadata key has wrong length: {} (expected 32)",
+                metadata_key_vec.len()
+            ));
+        }
+        metadata_key.copy_from_slice(&metadata_key_vec);
+
+        // 6. Build GroupMetadataV1 payload + encrypt.
+        let payload = metadata::GroupMetadataV1 {
+            version: 1,
+            title: title.clone().unwrap_or_default(),
+            description: description.clone().unwrap_or_default(),
+            avatar_blob_locator: avatar_blob_locator.clone(),
+            avatar_content_type: avatar_content_type.clone(),
+        };
+
+        let ciphertext = metadata::encrypt_metadata_blob(
             &metadata_key,
             &group_id_bytes,
             epoch_used,
             metadata_version,
-            av_bytes,
+            &payload,
         )
-        .map_err(|e| js_err!("encrypt_avatar_blob failed: {:?}", e))?;
-        let _ = api_client
+        .map_err(|e| js_err!("encrypt_metadata_blob failed: {:?}", e))?;
+
+        // 7. Upload metadata blob.
+        let (_confirmed_locator, _size) = api_client
             .put_group_metadata_blob(
-                av_locator,
+                &blob_locator,
                 &group_id_hex,
-                &av_ct,
+                &ciphertext,
                 Some(metadata_version),
-                Some("avatar"),
+                None,
             )
             .await
-            .map_err(|e| js_err!("put_group_metadata_blob (avatar) failed: {:?}", e))?;
-    }
+            .map_err(|e| {
+                // Non-fatal: commit already merged. Surface as error so JS knows
+                // the title/description are temporarily unavailable to peers,
+                // but the group is otherwise healthy. Mirrors iOS warning path.
+                js_err!("put_group_metadata_blob failed: {:?}", e)
+            })?;
 
-    // 9. Persist the decrypted state locally so the conversation list /
-    //    header render the new title/description without a re-fetch.
-    storage
-        .upsert_metadata(
-            &group_id_hex,
-            Some(&payload.title),
-            Some(&payload.description),
-            metadata_version as i64,
-            avatar_blob_locator.as_deref(),
-            avatar_content_type.as_deref(),
-            avatar_bytes.as_deref(),
-        )
-        .map_err(|e| js_err!("persist group metadata failed: {}", e))?;
+        // 8. Optional avatar encrypt + upload.
+        if let (Some(av_locator), Some(av_bytes)) =
+            (avatar_blob_locator.as_deref(), avatar_bytes.as_deref())
+        {
+            let av_ct = metadata::encrypt_avatar_blob(
+                &metadata_key,
+                &group_id_bytes,
+                epoch_used,
+                metadata_version,
+                av_bytes,
+            )
+            .map_err(|e| js_err!("encrypt_avatar_blob failed: {:?}", e))?;
+            let _ = api_client
+                .put_group_metadata_blob(
+                    av_locator,
+                    &group_id_hex,
+                    &av_ct,
+                    Some(metadata_version),
+                    Some("avatar"),
+                )
+                .await
+                .map_err(|e| js_err!("put_group_metadata_blob (avatar) failed: {:?}", e))?;
+        }
 
-    // 10. Echo result back to JS.
-    let reference_json = serde_json::to_value(&reference)
-        .map_err(|e| js_err!("serialize MetadataReference: {}", e))?;
-    let _ = local_epoch; // currently unused beyond the merge guarantee
-    to_js(&serde_json::json!({
-        "commitBytes": base64::engine::general_purpose::STANDARD.encode(&commit_bytes),
-        "ciphertext": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
-        "reference": reference_json,
-        "metadataVersion": metadata_version,
-        "epoch": epoch_used,
-    }))
+        // 9. Persist the decrypted state locally so the conversation list /
+        //    header render the new title/description without a re-fetch.
+        storage
+            .upsert_metadata(
+                &group_id_hex,
+                Some(&payload.title),
+                Some(&payload.description),
+                metadata_version as i64,
+                avatar_blob_locator.as_deref(),
+                avatar_content_type.as_deref(),
+                avatar_bytes.as_deref(),
+            )
+            .map_err(|e| js_err!("persist group metadata failed: {}", e))?;
+
+        // 10. Echo result back to JS.
+        let reference_json = serde_json::to_value(&reference)
+            .map_err(|e| js_err!("serialize MetadataReference: {}", e))?;
+        let _ = local_epoch; // currently unused beyond the merge guarantee
+        to_js(&serde_json::json!({
+            "commitBytes": base64::engine::general_purpose::STANDARD.encode(&commit_bytes),
+            "ciphertext": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+            "reference": reference_json,
+            "metadataVersion": metadata_version,
+            "epoch": epoch_used,
+        }))
+    })
 }
 
 /// Bootstrap (decrypt and persist locally) the current group metadata after
@@ -1839,137 +1898,140 @@ pub async fn catbird_mls_update_group_metadata(
 ///
 /// Returns `null` if the group has no `MetadataReference` yet (e.g. just
 /// after a fresh group creation that hasn't run an `updateMetadata` commit).
-#[wasm_bindgen]
-pub async fn wasm_bootstrap_group_metadata(group_id_hex: String) -> Result<JsValue, JsValue> {
-    use catbird_mls::metadata;
-    let (stable_id, _) = resolve_conversation_identity(&group_id_hex)?;
-    request_runtime::require_ordinary_access(&stable_id).await?;
+pub fn wasm_bootstrap_group_metadata(
+    group_id_hex: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        use catbird_mls::metadata;
+        let (stable_id, _) = resolve_conversation_identity(&group_id_hex)?;
+        request_runtime::require_ordinary_access(&stable_id).await?;
 
-    let (api_client, storage, user_did) = with_state(|s| {
-        let user_did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
-    })?;
+        let (api_client, storage, user_did) = with_state(|s| {
+            let user_did = s
+                .user_did
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))?;
+            Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
+        })?;
 
-    let group_id_bytes = decode_group_coordinate(&group_id_hex)
-        .ok_or_else(|| js_err!("Invalid group_id_hex: {}", group_id_hex))?;
-    let group_id_hex_norm = hex::encode(&group_id_bytes);
+        let group_id_bytes = decode_group_coordinate(&group_id_hex)
+            .ok_or_else(|| js_err!("Invalid group_id_hex: {}", group_id_hex))?;
+        let group_id_hex_norm = hex::encode(&group_id_bytes);
 
-    let info = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.current_metadata_info(group_id_bytes.clone())
-            .map_err(|e| js_err!("current_metadata_info failed: {:?}", e))
-    })?;
+        let info = with_state(|s| {
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.current_metadata_info(group_id_bytes.clone())
+                .map_err(|e| js_err!("current_metadata_info failed: {:?}", e))
+        })?;
 
-    let (metadata_key_vec, epoch, reference) = match info {
-        Some(t) => t,
-        None => return Ok(JsValue::NULL),
-    };
-    let reference = match reference {
-        Some(r) => r,
-        None => return Ok(JsValue::NULL),
-    };
-    let metadata_version = reference.metadata_version;
+        let (metadata_key_vec, epoch, reference) = match info {
+            Some(t) => t,
+            None => return Ok(JsValue::NULL),
+        };
+        let reference = match reference {
+            Some(r) => r,
+            None => return Ok(JsValue::NULL),
+        };
+        let metadata_version = reference.metadata_version;
 
-    let mut metadata_key = [0u8; 32];
-    if metadata_key_vec.len() != 32 {
-        return Err(js_err!(
-            "Derived metadata key has wrong length: {} (expected 32)",
-            metadata_key_vec.len()
-        ));
-    }
-    metadata_key.copy_from_slice(&metadata_key_vec);
+        let mut metadata_key = [0u8; 32];
+        if metadata_key_vec.len() != 32 {
+            return Err(js_err!(
+                "Derived metadata key has wrong length: {} (expected 32)",
+                metadata_key_vec.len()
+            ));
+        }
+        metadata_key.copy_from_slice(&metadata_key_vec);
 
-    // Fetch encrypted blob from server.
-    let ciphertext = api_client
-        .get_group_metadata_blob(
-            &reference.blob_locator,
-            &group_id_hex_norm,
-            Some(metadata_version),
-            None,
+        // Fetch encrypted blob from server.
+        let ciphertext = api_client
+            .get_group_metadata_blob(
+                &reference.blob_locator,
+                &group_id_hex_norm,
+                Some(metadata_version),
+                None,
+            )
+            .await
+            .map_err(|e| js_err!("get_group_metadata_blob failed: {:?}", e))?;
+
+        // Decrypt.
+        let payload = metadata::decrypt_metadata_blob(
+            &metadata_key,
+            &group_id_bytes,
+            epoch,
+            metadata_version,
+            &ciphertext,
         )
-        .await
-        .map_err(|e| js_err!("get_group_metadata_blob failed: {:?}", e))?;
+        .map_err(|e| js_err!("decrypt_metadata_blob failed: {:?}", e))?;
 
-    // Decrypt.
-    let payload = metadata::decrypt_metadata_blob(
-        &metadata_key,
-        &group_id_bytes,
-        epoch,
-        metadata_version,
-        &ciphertext,
-    )
-    .map_err(|e| js_err!("decrypt_metadata_blob failed: {:?}", e))?;
-
-    // Optionally fetch + decrypt avatar.
-    let mut avatar_bytes: Option<Vec<u8>> = None;
-    if let Some(ref av_locator) = payload.avatar_blob_locator {
-        if !av_locator.is_empty() {
-            match api_client
-                .get_group_metadata_blob(
-                    av_locator,
-                    &group_id_hex_norm,
-                    Some(metadata_version),
-                    Some("avatar"),
-                )
-                .await
-            {
-                Ok(av_ct) => match metadata::decrypt_avatar_blob(
-                    &metadata_key,
-                    &group_id_bytes,
-                    epoch,
-                    metadata_version,
-                    &av_ct,
-                ) {
-                    Ok(av_bytes) => avatar_bytes = Some(av_bytes),
+        // Optionally fetch + decrypt avatar.
+        let mut avatar_bytes: Option<Vec<u8>> = None;
+        if let Some(ref av_locator) = payload.avatar_blob_locator {
+            if !av_locator.is_empty() {
+                match api_client
+                    .get_group_metadata_blob(
+                        av_locator,
+                        &group_id_hex_norm,
+                        Some(metadata_version),
+                        Some("avatar"),
+                    )
+                    .await
+                {
+                    Ok(av_ct) => match metadata::decrypt_avatar_blob(
+                        &metadata_key,
+                        &group_id_bytes,
+                        epoch,
+                        metadata_version,
+                        &av_ct,
+                    ) {
+                        Ok(av_bytes) => avatar_bytes = Some(av_bytes),
+                        Err(e) => {
+                            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                                "[bootstrap] avatar decrypt failed: {:?}",
+                                e
+                            )));
+                        }
+                    },
                     Err(e) => {
                         web_sys::console::warn_1(&JsValue::from_str(&format!(
-                            "[bootstrap] avatar decrypt failed: {:?}",
+                            "[bootstrap] avatar fetch failed: {:?}",
                             e
                         )));
                     }
-                },
-                Err(e) => {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[bootstrap] avatar fetch failed: {:?}",
-                        e
-                    )));
                 }
             }
         }
-    }
 
-    // Persist locally.
-    storage
-        .upsert_metadata(
-            &group_id_hex_norm,
-            Some(&payload.title),
-            Some(&payload.description),
-            metadata_version as i64,
-            payload.avatar_blob_locator.as_deref(),
-            payload.avatar_content_type.as_deref(),
-            avatar_bytes.as_deref(),
-        )
-        .map_err(|e| js_err!("persist group metadata failed: {}", e))?;
+        // Persist locally.
+        storage
+            .upsert_metadata(
+                &group_id_hex_norm,
+                Some(&payload.title),
+                Some(&payload.description),
+                metadata_version as i64,
+                payload.avatar_blob_locator.as_deref(),
+                payload.avatar_content_type.as_deref(),
+                avatar_bytes.as_deref(),
+            )
+            .map_err(|e| js_err!("persist group metadata failed: {}", e))?;
 
-    // Build JS object.
-    let avatar_b64 = avatar_bytes
-        .as_ref()
-        .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
-    to_js(&serde_json::json!({
-        "title": payload.title,
-        "description": payload.description,
-        "avatarBlobLocator": payload.avatar_blob_locator,
-        "avatarContentType": payload.avatar_content_type,
-        "avatarBytesBase64": avatar_b64,
-        "metadataVersion": metadata_version,
-        "epoch": epoch,
-    }))
+        // Build JS object.
+        let avatar_b64 = avatar_bytes
+            .as_ref()
+            .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
+        to_js(&serde_json::json!({
+            "title": payload.title,
+            "description": payload.description,
+            "avatarBlobLocator": payload.avatar_blob_locator,
+            "avatarContentType": payload.avatar_content_type,
+            "avatarBytesBase64": avatar_b64,
+            "metadataVersion": metadata_version,
+            "epoch": epoch,
+        }))
+    })
 }
 
 /// Re-publish encrypted metadata after a group reset (`bootstrap_reset_group`
@@ -1985,365 +2047,375 @@ pub async fn wasm_bootstrap_group_metadata(group_id_hex: String) -> Result<JsVal
 ///
 /// `reset_generation` is currently informational — the server's
 /// `putGroupMetadataBlob` accepts it as an optional query param.
-#[wasm_bindgen]
-pub async fn wasm_republish_metadata_after_reset(
+pub fn wasm_republish_metadata_after_reset(
     new_group_id_hex: String,
     reset_generation: Option<u64>,
-) -> Result<JsValue, JsValue> {
-    use catbird_mls::metadata;
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        use catbird_mls::metadata;
 
-    let (api_client, storage, user_did) = with_state(|s| {
-        let user_did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
-    })?;
+        let (api_client, storage, user_did) = with_state(|s| {
+            let user_did = s
+                .user_did
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))?;
+            Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
+        })?;
 
-    let group_id_bytes = decode_group_coordinate(&new_group_id_hex)
-        .ok_or_else(|| js_err!("Invalid new_group_id_hex: {}", new_group_id_hex))?;
-    let group_id_hex_norm = hex::encode(&group_id_bytes);
+        let group_id_bytes = decode_group_coordinate(&new_group_id_hex)
+            .ok_or_else(|| js_err!("Invalid new_group_id_hex: {}", new_group_id_hex))?;
+        let group_id_hex_norm = hex::encode(&group_id_bytes);
 
-    // 1. Resolve the target through the durable stable/alias map, then read
-    // metadata from the stable projection. Reset keeps historical group rows
-    // for crypto/AAD but metadata belongs to the stable application row.
-    let stable_conversation_id = storage
-        .resolve_conversation_mapping(&user_did, &group_id_hex_norm)
-        .map_err(|e| js_err!("metadata identity lookup failed: {}", e))?
-        .map(|(conversation_id, _)| conversation_id)
-        .ok_or_else(|| js_err!("metadata group {} has no stable mapping", group_id_hex_norm))?;
-    let (title_opt, desc_opt, avatar, _stored_metadata_version) = storage
-        .get_metadata_for_conversation(&user_did, &stable_conversation_id)
-        .map_err(|e| js_err!("get stable metadata: {}", e))?;
+        // 1. Resolve the target through the durable stable/alias map, then read
+        // metadata from the stable projection. Reset keeps historical group rows
+        // for crypto/AAD but metadata belongs to the stable application row.
+        let stable_conversation_id = storage
+            .resolve_conversation_mapping(&user_did, &group_id_hex_norm)
+            .map_err(|e| js_err!("metadata identity lookup failed: {}", e))?
+            .map(|(conversation_id, _)| conversation_id)
+            .ok_or_else(|| js_err!("metadata group {} has no stable mapping", group_id_hex_norm))?;
+        let (title_opt, desc_opt, avatar, _stored_metadata_version) = storage
+            .get_metadata_for_conversation(&user_did, &stable_conversation_id)
+            .map_err(|e| js_err!("get stable metadata: {}", e))?;
 
-    let title = title_opt.unwrap_or_default();
-    let description = desc_opt.unwrap_or_default();
+        let title = title_opt.unwrap_or_default();
+        let description = desc_opt.unwrap_or_default();
 
-    if title.is_empty() && description.is_empty() && avatar.is_none() {
-        // Nothing to republish — no-op for first-time creators.
-        return Ok(JsValue::NULL);
-    }
+        if title.is_empty() && description.is_empty() && avatar.is_none() {
+            // Nothing to republish — no-op for first-time creators.
+            return Ok(JsValue::NULL);
+        }
 
-    // 2. Stage an updateMetadata commit on the new group so we have a fresh
-    //    MetadataReference (locator + version=1) to upload against.
-    let commit_bytes = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.update_group_metadata(group_id_bytes.clone())
-            .map_err(|e| js_err!("update_group_metadata stage failed: {:?}", e))
-    })?;
+        // 2. Stage an updateMetadata commit on the new group so we have a fresh
+        //    MetadataReference (locator + version=1) to upload against.
+        let commit_bytes = with_state(|s| {
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.update_group_metadata(group_id_bytes.clone())
+                .map_err(|e| js_err!("update_group_metadata stage failed: {:?}", e))
+        })?;
 
-    let (success, new_epoch) = api_client
-        .commit_update_metadata(&stable_conversation_id, &commit_bytes)
-        .await
-        .map_err(|e| {
+        let (success, new_epoch) = api_client
+            .commit_update_metadata(&stable_conversation_id, &commit_bytes)
+            .await
+            .map_err(|e| {
+                let _ = with_state(|s| {
+                    if let Some(ctx) = s.mls_context.as_ref() {
+                        let _ = ctx.clear_pending_commit(group_id_bytes.clone());
+                    }
+                    Ok(())
+                });
+                js_err!("commit_update_metadata (reset republish) failed: {:?}", e)
+            })?;
+        if !success {
             let _ = with_state(|s| {
                 if let Some(ctx) = s.mls_context.as_ref() {
                     let _ = ctx.clear_pending_commit(group_id_bytes.clone());
                 }
                 Ok(())
             });
-            js_err!("commit_update_metadata (reset republish) failed: {:?}", e)
-        })?;
-    if !success {
+            return Err(js_err!("Server rejected reset-republish updateMetadata"));
+        }
+
         let _ = with_state(|s| {
-            if let Some(ctx) = s.mls_context.as_ref() {
-                let _ = ctx.clear_pending_commit(group_id_bytes.clone());
-            }
-            Ok(())
-        });
-        return Err(js_err!("Server rejected reset-republish updateMetadata"));
-    }
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.merge_pending_commit(group_id_bytes.clone())
+                .map_err(|e| js_err!("merge_pending_commit failed: {:?}", e))
+        })?;
+        let _ = new_epoch;
 
-    let _ = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.merge_pending_commit(group_id_bytes.clone())
-            .map_err(|e| js_err!("merge_pending_commit failed: {:?}", e))
-    })?;
-    let _ = new_epoch;
+        // 3. Read post-merge MetadataReference + derive new metadata key.
+        let (metadata_key_vec, epoch_used, reference) = with_state(|s| {
+            let ctx = s
+                .mls_context
+                .as_ref()
+                .ok_or_else(|| js_err!("MLS context not initialized"))?;
+            ctx.current_metadata_info(group_id_bytes.clone())
+                .map_err(|e| js_err!("current_metadata_info failed: {:?}", e))?
+                .ok_or_else(|| js_err!("MetadataReference missing after reset-republish merge"))
+        })?;
+        let reference = reference
+            .ok_or_else(|| js_err!("MetadataReference missing in AppDataDictionary post-merge"))?;
+        let metadata_version = reference.metadata_version;
+        let mut metadata_key = [0u8; 32];
+        if metadata_key_vec.len() != 32 {
+            return Err(js_err!("metadata key wrong length"));
+        }
+        metadata_key.copy_from_slice(&metadata_key_vec);
 
-    // 3. Read post-merge MetadataReference + derive new metadata key.
-    let (metadata_key_vec, epoch_used, reference) = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.current_metadata_info(group_id_bytes.clone())
-            .map_err(|e| js_err!("current_metadata_info failed: {:?}", e))?
-            .ok_or_else(|| js_err!("MetadataReference missing after reset-republish merge"))
-    })?;
-    let reference = reference
-        .ok_or_else(|| js_err!("MetadataReference missing in AppDataDictionary post-merge"))?;
-    let metadata_version = reference.metadata_version;
-    let mut metadata_key = [0u8; 32];
-    if metadata_key_vec.len() != 32 {
-        return Err(js_err!("metadata key wrong length"));
-    }
-    metadata_key.copy_from_slice(&metadata_key_vec);
+        let avatar_bytes = avatar.as_ref().map(|(b, _ct)| b.clone());
+        let avatar_content_type = avatar.as_ref().and_then(|(_, ct)| ct.clone());
+        let avatar_blob_locator = if avatar_bytes.is_some() {
+            Some(uuid::Uuid::new_v4().to_string().to_lowercase())
+        } else {
+            None
+        };
 
-    let avatar_bytes = avatar.as_ref().map(|(b, _ct)| b.clone());
-    let avatar_content_type = avatar.as_ref().and_then(|(_, ct)| ct.clone());
-    let avatar_blob_locator = if avatar_bytes.is_some() {
-        Some(uuid::Uuid::new_v4().to_string().to_lowercase())
-    } else {
-        None
-    };
+        let payload = metadata::GroupMetadataV1 {
+            version: 1,
+            title: title.clone(),
+            description: description.clone(),
+            avatar_blob_locator: avatar_blob_locator.clone(),
+            avatar_content_type: avatar_content_type.clone(),
+        };
 
-    let payload = metadata::GroupMetadataV1 {
-        version: 1,
-        title: title.clone(),
-        description: description.clone(),
-        avatar_blob_locator: avatar_blob_locator.clone(),
-        avatar_content_type: avatar_content_type.clone(),
-    };
-
-    // 4. Encrypt + upload metadata blob (under fresh epoch's key).
-    let metadata_ct = metadata::encrypt_metadata_blob(
-        &metadata_key,
-        &group_id_bytes,
-        epoch_used,
-        metadata_version,
-        &payload,
-    )
-    .map_err(|e| js_err!("encrypt_metadata_blob (reset): {:?}", e))?;
-    let _ = api_client
-        .put_group_metadata_blob(
-            &reference.blob_locator,
-            &group_id_hex_norm,
-            &metadata_ct,
-            Some(metadata_version),
-            None,
-        )
-        .await
-        .map_err(|e| js_err!("put_group_metadata_blob (reset metadata): {:?}", e))?;
-
-    // 5. Re-encrypt + upload avatar blob if we have one.
-    if let (Some(av_bytes), Some(av_locator)) =
-        (avatar_bytes.as_deref(), avatar_blob_locator.as_deref())
-    {
-        let av_ct = metadata::encrypt_avatar_blob(
+        // 4. Encrypt + upload metadata blob (under fresh epoch's key).
+        let metadata_ct = metadata::encrypt_metadata_blob(
             &metadata_key,
             &group_id_bytes,
             epoch_used,
             metadata_version,
-            av_bytes,
+            &payload,
         )
-        .map_err(|e| js_err!("encrypt_avatar_blob (reset): {:?}", e))?;
+        .map_err(|e| js_err!("encrypt_metadata_blob (reset): {:?}", e))?;
         let _ = api_client
             .put_group_metadata_blob(
-                av_locator,
+                &reference.blob_locator,
                 &group_id_hex_norm,
-                &av_ct,
+                &metadata_ct,
                 Some(metadata_version),
-                Some("avatar"),
+                None,
             )
             .await
-            .map_err(|e| js_err!("put_group_metadata_blob (reset avatar): {:?}", e))?;
-    }
+            .map_err(|e| js_err!("put_group_metadata_blob (reset metadata): {:?}", e))?;
 
-    // 6. Persist the (possibly-new-locator) avatar metadata so subsequent
-    //    bootstraps round-trip cleanly.
-    storage
-        .upsert_metadata(
-            &group_id_hex_norm,
-            Some(&title),
-            Some(&description),
-            metadata_version as i64,
-            avatar_blob_locator.as_deref(),
-            avatar_content_type.as_deref(),
-            avatar_bytes.as_deref(),
-        )
-        .map_err(|e| js_err!("persist reset metadata failed: {}", e))?;
+        // 5. Re-encrypt + upload avatar blob if we have one.
+        if let (Some(av_bytes), Some(av_locator)) =
+            (avatar_bytes.as_deref(), avatar_blob_locator.as_deref())
+        {
+            let av_ct = metadata::encrypt_avatar_blob(
+                &metadata_key,
+                &group_id_bytes,
+                epoch_used,
+                metadata_version,
+                av_bytes,
+            )
+            .map_err(|e| js_err!("encrypt_avatar_blob (reset): {:?}", e))?;
+            let _ = api_client
+                .put_group_metadata_blob(
+                    av_locator,
+                    &group_id_hex_norm,
+                    &av_ct,
+                    Some(metadata_version),
+                    Some("avatar"),
+                )
+                .await
+                .map_err(|e| js_err!("put_group_metadata_blob (reset avatar): {:?}", e))?;
+        }
 
-    let _ = reset_generation;
-    to_js(&serde_json::json!({
-        "title": title,
-        "description": description,
-        "avatarBlobLocator": avatar_blob_locator,
-        "metadataVersion": metadata_version,
-        "epoch": epoch_used,
-    }))
+        // 6. Persist the (possibly-new-locator) avatar metadata so subsequent
+        //    bootstraps round-trip cleanly.
+        storage
+            .upsert_metadata(
+                &group_id_hex_norm,
+                Some(&title),
+                Some(&description),
+                metadata_version as i64,
+                avatar_blob_locator.as_deref(),
+                avatar_content_type.as_deref(),
+                avatar_bytes.as_deref(),
+            )
+            .map_err(|e| js_err!("persist reset metadata failed: {}", e))?;
+
+        let _ = reset_generation;
+        to_js(&serde_json::json!({
+            "title": title,
+            "description": description,
+            "avatarBlobLocator": avatar_blob_locator,
+            "metadataVersion": metadata_version,
+            "epoch": epoch_used,
+        }))
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Profile commands
 // ---------------------------------------------------------------------------
 
-#[wasm_bindgen]
-pub async fn catbird_mls_get_profiles(dids: Array) -> Result<JsValue, JsValue> {
-    let dids = array_to_strings(&dids);
-    if dids.is_empty() {
-        return to_js(&Vec::<ProfileView>::new());
-    }
-    if dids.len() > MAX_CONVERSATION_ITEMS {
-        return Err(js_err!("profile request exceeded the item ceiling"));
-    }
-
-    let auth_token = with_state(|s| {
-        s.auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))
-    })?;
-
-    let client = reqwest::Client::new();
-    let mut profiles = Vec::with_capacity(dids.len());
-    // app.bsky.actor.getProfiles has a hard 25-actor request limit. Chunking
-    // here also gives callers a deterministic item ceiling per HTTP request.
-    for chunk in dids.chunks(25) {
-        let mut url =
-            reqwest::Url::parse("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles")
-                .map_err(|e| js_err!("URL parse error: {}", e))?;
-        for did in chunk {
-            url.query_pairs_mut().append_pair("actors", did);
+pub fn catbird_mls_get_profiles(
+    dids: Array,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let dids = array_to_strings(&dids);
+        if dids.is_empty() {
+            return to_js(&Vec::<ProfileView>::new());
         }
+        if dids.len() > MAX_CONVERSATION_ITEMS {
+            return Err(js_err!("profile request exceeded the item ceiling"));
+        }
+
+        let auth_token = with_state(|s| {
+            s.auth_token
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))
+        })?;
+
+        let client = reqwest::Client::new();
+        let mut profiles = Vec::with_capacity(dids.len());
+        // app.bsky.actor.getProfiles has a hard 25-actor request limit. Chunking
+        // here also gives callers a deterministic item ceiling per HTTP request.
+        for chunk in dids.chunks(25) {
+            let mut url =
+                reqwest::Url::parse("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles")
+                    .map_err(|e| js_err!("URL parse error: {}", e))?;
+            for did in chunk {
+                url.query_pairs_mut().append_pair("actors", did);
+            }
+
+            let resp = client
+                .get(url)
+                .bearer_auth(&auth_token)
+                .send()
+                .await
+                .map_err(|e| js_err!("Profile fetch failed: {}", e))?;
+
+            if !resp.status().is_success() {
+                return Err(js_err!("Profile fetch failed: {}", resp.status()));
+            }
+
+            let data: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| js_err!("Profile parse failed: {}", e))?;
+
+            if let Some(arr) = data["profiles"].as_array() {
+                if arr.len() > 25 {
+                    return Err(js_err!(
+                        "Profile response exceeded the 25-item page ceiling"
+                    ));
+                }
+                if profiles.len().saturating_add(arr.len()) > MAX_CONVERSATION_ITEMS {
+                    return Err(js_err!("profile results exceeded the item ceiling"));
+                }
+                profiles.extend(arr.iter().map(|p| ProfileView {
+                    did: p["did"].as_str().unwrap_or("").to_string(),
+                    handle: p["handle"].as_str().unwrap_or("").to_string(),
+                    display_name: p["displayName"].as_str().map(str::to_string),
+                    avatar: p["avatar"].as_str().map(str::to_string),
+                }));
+            }
+        }
+
+        to_js(&profiles)
+    })
+}
+
+pub fn catbird_mls_search_users(
+    query: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        if query.trim().is_empty() {
+            return to_js(&Vec::<SearchResult>::new());
+        }
+
+        let auth_token = with_state(|s| {
+            s.auth_token
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))
+        })?;
+
+        let client = reqwest::Client::new();
+        let url = reqwest::Url::parse_with_params(
+            "https://public.api.bsky.app/xrpc/app.bsky.actor.searchActorsTypeahead",
+            &[("q", query.as_str()), ("limit", "10")],
+        )
+        .map_err(|e| js_err!("URL parse error: {}", e))?;
 
         let resp = client
             .get(url)
             .bearer_auth(&auth_token)
             .send()
             .await
-            .map_err(|e| js_err!("Profile fetch failed: {}", e))?;
+            .map_err(|e| js_err!("Search failed: {}", e))?;
 
         if !resp.status().is_success() {
-            return Err(js_err!("Profile fetch failed: {}", resp.status()));
+            return Err(js_err!("Search failed: {}", resp.status()));
         }
 
         let data: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| js_err!("Profile parse failed: {}", e))?;
+            .map_err(|e| js_err!("Search parse failed: {}", e))?;
 
-        if let Some(arr) = data["profiles"].as_array() {
-            if arr.len() > 25 {
-                return Err(js_err!(
-                    "Profile response exceeded the 25-item page ceiling"
-                ));
-            }
-            if profiles.len().saturating_add(arr.len()) > MAX_CONVERSATION_ITEMS {
-                return Err(js_err!("profile results exceeded the item ceiling"));
-            }
-            profiles.extend(arr.iter().map(|p| ProfileView {
-                did: p["did"].as_str().unwrap_or("").to_string(),
-                handle: p["handle"].as_str().unwrap_or("").to_string(),
-                display_name: p["displayName"].as_str().map(str::to_string),
-                avatar: p["avatar"].as_str().map(str::to_string),
-            }));
+        let results: Vec<SearchResult> = data["actors"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|a| SearchResult {
+                        did: a["did"].as_str().unwrap_or("").to_string(),
+                        handle: a["handle"].as_str().unwrap_or("").to_string(),
+                        display_name: a["displayName"].as_str().map(str::to_string),
+                        avatar: a["avatar"].as_str().map(str::to_string),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        to_js(&results)
+    })
+}
+
+pub fn catbird_mls_check_opt_in_status(
+    dids: Array,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let dids = array_to_strings(&dids);
+        if dids.is_empty() {
+            return to_js(&Vec::<OptInStatusResult>::new());
         }
-    }
 
-    to_js(&profiles)
-}
+        let (base_url, auth_token, proxy_did) = with_state(|s| {
+            let token = s
+                .auth_token
+                .clone()
+                .ok_or_else(|| js_err!("Not authenticated"))?;
+            Ok((s.base_url.clone(), token, s.proxy_did.clone()))
+        })?;
 
-#[wasm_bindgen]
-pub async fn catbird_mls_search_users(query: String) -> Result<JsValue, JsValue> {
-    if query.trim().is_empty() {
-        return to_js(&Vec::<SearchResult>::new());
-    }
+        let dids_param = dids.join(",");
+        let url = format!(
+            "{}/xrpc/blue.catbird.chat.getDevices?dids={}",
+            base_url, dids_param
+        );
 
-    let auth_token = with_state(|s| {
-        s.auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))
-    })?;
+        let client = proxy_client(&proxy_did);
+        let resp = client
+            .get(&url)
+            .bearer_auth(&auth_token)
+            .send()
+            .await
+            .map_err(|e| js_err!("check_opt_in_status failed: {}", e))?;
 
-    let client = reqwest::Client::new();
-    let url = reqwest::Url::parse_with_params(
-        "https://public.api.bsky.app/xrpc/app.bsky.actor.searchActorsTypeahead",
-        &[("q", query.as_str()), ("limit", "10")],
-    )
-    .map_err(|e| js_err!("URL parse error: {}", e))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(js_err!("check_opt_in_status failed ({}): {}", status, body));
+        }
 
-    let resp = client
-        .get(url)
-        .bearer_auth(&auth_token)
-        .send()
-        .await
-        .map_err(|e| js_err!("Search failed: {}", e))?;
+        let output: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| js_err!("check_opt_in_status parse failed: {}", e))?;
 
-    if !resp.status().is_success() {
-        return Err(js_err!("Search failed: {}", resp.status()));
-    }
+        let statuses: Vec<OptInStatusResult> = output["statuses"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|s| OptInStatusResult {
+                        did: s["did"].as_str().unwrap_or("").to_string(),
+                        opted_in: s["optedIn"].as_bool().unwrap_or(false),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-    let data: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| js_err!("Search parse failed: {}", e))?;
-
-    let results: Vec<SearchResult> = data["actors"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|a| SearchResult {
-                    did: a["did"].as_str().unwrap_or("").to_string(),
-                    handle: a["handle"].as_str().unwrap_or("").to_string(),
-                    display_name: a["displayName"].as_str().map(str::to_string),
-                    avatar: a["avatar"].as_str().map(str::to_string),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    to_js(&results)
-}
-
-#[wasm_bindgen]
-pub async fn catbird_mls_check_opt_in_status(dids: Array) -> Result<JsValue, JsValue> {
-    let dids = array_to_strings(&dids);
-    if dids.is_empty() {
-        return to_js(&Vec::<OptInStatusResult>::new());
-    }
-
-    let (base_url, auth_token, proxy_did) = with_state(|s| {
-        let token = s
-            .auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((s.base_url.clone(), token, s.proxy_did.clone()))
-    })?;
-
-    let dids_param = dids.join(",");
-    let url = format!(
-        "{}/xrpc/blue.catbird.chat.getDevices?dids={}",
-        base_url, dids_param
-    );
-
-    let client = proxy_client(&proxy_did);
-    let resp = client
-        .get(&url)
-        .bearer_auth(&auth_token)
-        .send()
-        .await
-        .map_err(|e| js_err!("check_opt_in_status failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(js_err!("check_opt_in_status failed ({}): {}", status, body));
-    }
-
-    let output: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| js_err!("check_opt_in_status parse failed: {}", e))?;
-
-    let statuses: Vec<OptInStatusResult> = output["statuses"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|s| OptInStatusResult {
-                    did: s["did"].as_str().unwrap_or("").to_string(),
-                    opted_in: s["optedIn"].as_bool().unwrap_or(false),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    to_js(&statuses)
+        to_js(&statuses)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2352,9 +2424,11 @@ pub async fn catbird_mls_check_opt_in_status(dids: Array) -> Result<JsValue, JsV
 
 /// Reconcile the exact authenticated account inventories through shared Rust.
 /// A failed pass retains prior durable progress and pending policy.
-#[wasm_bindgen]
-pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
-    run_deferred_recovery_guarded(MANUAL_PASS_DEADLINE_MS).await
+pub fn catbird_mls_run_deferred_recovery(
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        run_deferred_recovery_guarded(MANUAL_PASS_DEADLINE_MS).await
+    })
 }
 
 /// Un-guarded single deferred-recovery pass — the body of
@@ -2600,7 +2674,7 @@ pub fn catbird_mls_start_background_tasks(interval_ms: u32) -> Result<(), JsValu
 
     let tick_deadline_ms = f64::from(interval_ms) * 2.0;
     let tick_closure = Closure::<dyn FnMut()>::new(move || {
-        wasm_bindgen_futures::spawn_local(background_tasks_tick(tick_deadline_ms));
+        crate::browser_session::spawn(background_tasks_tick(tick_deadline_ms));
     });
     let interval_handle = js_set_interval(&tick_closure, f64::from(interval_ms));
     BACKGROUND_TASKS.with(|t| {
@@ -2612,7 +2686,7 @@ pub fn catbird_mls_start_background_tasks(interval_ms: u32) -> Result<(), JsValu
 
     // First tick now — a convo already in ResetPending shouldn't wait a full
     // interval to start healing.
-    wasm_bindgen_futures::spawn_local(background_tasks_tick(tick_deadline_ms));
+    crate::browser_session::spawn(background_tasks_tick(tick_deadline_ms));
 
     web_sys::console::log_1(&js_err!(
         "[background-tasks] started (deferred-recovery every {}ms)",

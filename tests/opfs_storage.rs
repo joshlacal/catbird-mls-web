@@ -12,6 +12,13 @@ async fn encrypted_transaction_reopens_and_rollback_preserves_previous_state() {
     {
         let conn = SqliteConn::open(&path, &key).unwrap();
         WasmSqliteStorage::ensure_schema(&conn).unwrap();
+        assert!(
+            matches!(
+                SqliteConn::open(&path, &key),
+                Err(WasmSqliteError::Sqlite { code: 5, .. })
+            ),
+            "a second live connection must not take the same OPFS handle"
+        );
         conn.transaction(|| -> Result<(), WasmSqliteError> {
             conn.put(b"crypto", b"prepared")?;
             conn.put(b"journal", b"exact signed bytes")

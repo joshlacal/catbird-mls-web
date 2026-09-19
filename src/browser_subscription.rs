@@ -25,6 +25,7 @@ struct CursorFence {
 }
 struct Consumer {
     runtime: Arc<BrowserOrchestrator>,
+    session_epoch: u64,
     owner: String,
     actor: String,
     generation: i64,
@@ -65,12 +66,17 @@ impl Consumer {
         self.closed.set(true);
         self.queue.borrow_mut().clear();
         let _ = self.ws.close();
-        let _ = self
-            .on_status
-            .call1(&JsValue::NULL, &JsValue::from_str(status));
+        self.status(status);
+    }
+    fn status(&self, status: &str) {
+        if self.session_epoch == crate::browser_session::generation() {
+            if let Ok(value) = to_js(&serde_json::json!({"type":status})) {
+                let _ = self.on_status.call1(&JsValue::NULL, &value);
+            }
+        }
     }
     async fn current(&self) -> Result<(), JsValue> {
-        if self.closed.get() {
+        if self.closed.get() || self.session_epoch != crate::browser_session::generation() {
             return Err(error("Subscription closed"));
         }
         request_runtime::current(&self.owner, &self.runtime)?;
@@ -207,12 +213,12 @@ impl Consumer {
         {
             let _ = self.on_message.call1(&JsValue::NULL, &to_js(&message)?);
         }
-        let event = serde_json::json!({"type":"refresh","data":{"conversationId":payload["conversationId"].as_str(),"source":"canonical"}});
+        let event = serde_json::json!({"type":"fetchNeeded","reason":"canonical","data":{"conversationId":payload["conversationId"].as_str(),"source":"canonical"}});
         let _ = self.on_event.call1(&JsValue::NULL, &to_js(&event)?);
         Ok(())
     }
     fn enqueue(self: &Rc<Self>, raw: String) {
-        if self.closed.get() {
+        if self.closed.get() || self.session_epoch != crate::browser_session::generation() {
             return;
         }
         if raw.len() > 64 * 1024 || self.queue.borrow().len() >= 256 {
@@ -224,7 +230,7 @@ impl Consumer {
             return;
         }
         let consumer = self.clone();
-        wasm_bindgen_futures::spawn_local(async move {
+        crate::browser_session::spawn(async move {
             loop {
                 let item = consumer.queue.borrow_mut().pop_front();
                 let Some(raw) = item else {
@@ -252,7 +258,7 @@ pub struct CanonicalSubscription {
 #[wasm_bindgen]
 impl CanonicalSubscription {
     pub fn close(&self) {
-        self.consumer.stop("disconnected");
+        self.consumer.stop("closed");
     }
     pub fn is_open(&self) -> bool {
         !self.consumer.closed.get() && self.consumer.ws.ready_state() == WebSocket::OPEN
@@ -260,7 +266,7 @@ impl CanonicalSubscription {
 }
 impl Drop for CanonicalSubscription {
     fn drop(&mut self) {
-        self.consumer.stop("disconnected");
+        self.consumer.stop("closed");
         self.consumer.ws.set_onopen(None);
         self.consumer.ws.set_onmessage(None);
         self.consumer.ws.set_onerror(None);
@@ -321,6 +327,7 @@ pub(crate) async fn connect(
     let ws = WebSocket::new(url.as_str())?;
     let consumer = Rc::new(Consumer {
         runtime,
+        session_epoch: crate::browser_session::generation(),
         owner,
         actor,
         generation,
@@ -336,9 +343,7 @@ pub(crate) async fn connect(
     });
     let c = consumer.clone();
     let open = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-        let _ = c
-            .on_status
-            .call1(&JsValue::NULL, &JsValue::from_str("connected"));
+        c.status("connected");
     });
     ws.set_onopen(Some(open.as_ref().unchecked_ref()));
     let c = consumer.clone();
@@ -354,7 +359,7 @@ pub(crate) async fn connect(
     let err = Closure::<dyn FnMut(ErrorEvent)>::new(move |_| c.stop("error"));
     ws.set_onerror(Some(err.as_ref().unchecked_ref()));
     let c = consumer.clone();
-    let close = Closure::<dyn FnMut(CloseEvent)>::new(move |_| c.stop("disconnected"));
+    let close = Closure::<dyn FnMut(CloseEvent)>::new(move |_| c.stop("closed"));
     ws.set_onclose(Some(close.as_ref().unchecked_ref()));
     Ok(CanonicalSubscription {
         consumer,

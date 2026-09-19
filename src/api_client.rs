@@ -90,6 +90,7 @@ impl WasmApiClient {
     }
 
     fn auth_header(&self) -> Result<String> {
+        crate::browser_session::check().map_err(|_| OrchestratorError::NotAuthenticated)?;
         self.auth_token
             .read()
             .unwrap()
@@ -413,7 +414,8 @@ impl WasmApiClient {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl MLSAPIClient for WasmApiClient {
     async fn is_authenticated_as(&self, did: &str) -> bool {
-        self.current_did.read().unwrap().as_deref() == Some(did)
+        crate::browser_session::check().is_ok()
+            && self.current_did.read().unwrap().as_deref() == Some(did)
     }
 
     async fn current_did(&self) -> Option<String> {
@@ -445,6 +447,7 @@ impl MLSAPIClient for WasmApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
+        crate::browser_session::check().map_err(|_| OrchestratorError::NotAuthenticated)?;
         let status = resp.status().as_u16();
         let content_type = resp
             .headers()
@@ -458,6 +461,7 @@ impl MLSAPIClient for WasmApiClient {
             .map_err(|e| OrchestratorError::Api(e.to_string()))?
             .to_vec();
 
+        crate::browser_session::check().map_err(|_| OrchestratorError::NotAuthenticated)?;
         Ok(
             catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                 status,

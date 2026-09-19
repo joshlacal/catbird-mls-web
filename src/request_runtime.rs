@@ -50,6 +50,7 @@ fn engine(owner: &str) -> Result<Arc<BrowserOrchestrator>, JsValue> {
     })
 }
 pub(crate) fn current(owner: &str, engine: &Arc<BrowserOrchestrator>) -> Result<(), JsValue> {
+    crate::browser_session::check().map_err(err)?;
     with_state(|s| {
         if s.user_did.as_deref() == Some(owner)
             && s.request_engine
@@ -176,7 +177,7 @@ pub(crate) async fn setup() -> Result<JsValue, JsValue> {
     })?;
     // Local custody is ready offline. Pool maintenance errors remain visible to
     // the explicit delivery preference command and do not block existing chats.
-    wasm_bindgen_futures::spawn_local(async move {
+    crate::browser_session::spawn(async move {
         if current(&did, &engine).is_ok() {
             if let Err(error) = engine.replenish_direct_request_keys_if_needed().await {
                 tracing::warn!(%error,"Request key maintenance remains pending");
@@ -188,338 +189,370 @@ pub(crate) async fn setup() -> Result<JsValue, JsValue> {
     )
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_start_direct_request(input: JsValue) -> Result<JsValue, JsValue> {
-    let input: DirectRequestInput = serde_wasm_bindgen::from_value(input).map_err(err)?;
-    let did = owner()?;
-    let runtime = engine(&did)?;
-    let out = runtime.start_direct_request(input).await.map_err(err)?;
-    current(&did, &runtime)?;
-    to_js(&out)
+pub fn catbird_mls_start_direct_request(
+    input: JsValue,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let input: DirectRequestInput = serde_wasm_bindgen::from_value(input).map_err(err)?;
+        let did = owner()?;
+        let runtime = engine(&did)?;
+        let out = runtime.start_direct_request(input).await.map_err(err)?;
+        current(&did, &runtime)?;
+        to_js(&out)
+    })
 }
-#[wasm_bindgen]
-pub async fn catbird_mls_resume_direct_request(draft_id: String) -> Result<JsValue, JsValue> {
-    let did = owner()?;
-    let runtime = engine(&did)?;
-    let out = runtime
-        .resume_direct_request(&draft_id)
-        .await
-        .map_err(err)?;
-    current(&did, &runtime)?;
-    to_js(&out)
+pub fn catbird_mls_resume_direct_request(
+    draft_id: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let did = owner()?;
+        let runtime = engine(&did)?;
+        let out = runtime
+            .resume_direct_request(&draft_id)
+            .await
+            .map_err(err)?;
+        current(&did, &runtime)?;
+        to_js(&out)
+    })
 }
-#[wasm_bindgen]
-pub async fn catbird_mls_cancel_direct_request(draft_id: String) -> Result<JsValue, JsValue> {
-    let did = owner()?;
-    let runtime = engine(&did)?;
-    let out = runtime
-        .cancel_direct_request(&draft_id)
-        .await
-        .map_err(err)?;
-    current(&did, &runtime)?;
-    to_js(&out)
+pub fn catbird_mls_cancel_direct_request(
+    draft_id: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let did = owner()?;
+        let runtime = engine(&did)?;
+        let out = runtime
+            .cancel_direct_request(&draft_id)
+            .await
+            .map_err(err)?;
+        current(&did, &runtime)?;
+        to_js(&out)
+    })
 }
-#[wasm_bindgen]
-pub async fn catbird_mls_refresh_request_preview(cid: String) -> Result<JsValue, JsValue> {
-    let did = owner()?;
-    let runtime = engine(&did)?;
-    let out = runtime.refresh_request_preview(&cid).await.map_err(err)?;
-    current(&did, &runtime)?;
-    to_js(&out)
+pub fn catbird_mls_refresh_request_preview(
+    cid: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let did = owner()?;
+        let runtime = engine(&did)?;
+        let out = runtime.refresh_request_preview(&cid).await.map_err(err)?;
+        current(&did, &runtime)?;
+        to_js(&out)
+    })
 }
-#[wasm_bindgen]
-pub async fn catbird_mls_list_direct_request_views() -> Result<JsValue, JsValue> {
-    let did = owner()?;
-    let runtime = engine(&did)?;
-    let out = runtime.list_direct_request_views().await.map_err(err)?;
-    current(&did, &runtime)?;
-    to_js(&out)
+pub fn catbird_mls_list_direct_request_views(
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let did = owner()?;
+        let runtime = engine(&did)?;
+        let out = runtime.list_direct_request_views().await.map_err(err)?;
+        current(&did, &runtime)?;
+        to_js(&out)
+    })
 }
-#[wasm_bindgen]
-pub async fn catbird_mls_get_direct_request_delivery_enabled() -> Result<JsValue, JsValue> {
-    let did = owner()?;
-    let runtime = engine(&did)?;
-    let out = runtime
-        .get_direct_request_delivery_enabled()
-        .await
-        .map_err(err)?;
-    current(&did, &runtime)?;
-    to_js(&out)
+pub fn catbird_mls_get_direct_request_delivery_enabled(
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let did = owner()?;
+        let runtime = engine(&did)?;
+        let out = runtime
+            .get_direct_request_delivery_enabled()
+            .await
+            .map_err(err)?;
+        current(&did, &runtime)?;
+        to_js(&out)
+    })
 }
-#[wasm_bindgen]
-pub async fn catbird_mls_set_direct_request_delivery_enabled(enabled: bool) -> Result<(), JsValue> {
-    let did = owner()?;
-    let runtime = engine(&did)?;
-    runtime
-        .set_direct_request_delivery_enabled(enabled)
-        .await
-        .map_err(err)?;
-    current(&did, &runtime)
+pub fn catbird_mls_set_direct_request_delivery_enabled(
+    enabled: bool,
+) -> impl std::future::Future<Output = Result<(), JsValue>> {
+    crate::browser_session::run(async move {
+        let did = owner()?;
+        let runtime = engine(&did)?;
+        runtime
+            .set_direct_request_delivery_enabled(enabled)
+            .await
+            .map_err(err)?;
+        current(&did, &runtime)
+    })
 }
-#[wasm_bindgen]
-pub async fn catbird_mls_close_direct_request(cid: String) -> Result<JsValue, JsValue> {
-    let did = owner()?;
-    let runtime = engine(&did)?;
-    let out = runtime.close_direct_request(&cid).await.map_err(err)?;
-    current(&did, &runtime)?;
-    to_js(&out)
+pub fn catbird_mls_close_direct_request(
+    cid: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let did = owner()?;
+        let runtime = engine(&did)?;
+        let out = runtime.close_direct_request(&cid).await.map_err(err)?;
+        current(&did, &runtime)?;
+        to_js(&out)
+    })
 }
-#[wasm_bindgen]
-pub async fn catbird_mls_accept_direct_request(cid: String) -> Result<JsValue, JsValue> {
-    let did = owner()?;
-    let runtime = engine(&did)?;
-    let views = runtime.list_direct_request_views().await.map_err(err)?;
-    if !views.iter().any(|v| {
-        v.conversation_id == cid
-            && v.consent == RequestConsent::IncomingPending
-            && v.capabilities.can_accept
-    }) {
-        return Err(err("No verified incoming request available for acceptance"));
-    }
-    runtime.accept_conversation(&cid).await.map_err(err)?;
-    current(&did, &runtime)?;
-    let out = runtime.refresh_request_preview(&cid).await.map_err(err)?;
-    current(&did, &runtime)?;
-    to_js(&out)
+pub fn catbird_mls_accept_direct_request(
+    cid: String,
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let did = owner()?;
+        let runtime = engine(&did)?;
+        let views = runtime.list_direct_request_views().await.map_err(err)?;
+        if !views.iter().any(|v| {
+            v.conversation_id == cid
+                && v.consent == RequestConsent::IncomingPending
+                && v.capabilities.can_accept
+        }) {
+            return Err(err("No verified incoming request available for acceptance"));
+        }
+        runtime.accept_conversation(&cid).await.map_err(err)?;
+        current(&did, &runtime)?;
+        let out = runtime.refresh_request_preview(&cid).await.map_err(err)?;
+        current(&did, &runtime)?;
+        to_js(&out)
+    })
 }
 
-#[wasm_bindgen]
-pub async fn catbird_mls_get_group_invitation_reference(
+pub fn catbird_mls_get_group_invitation_reference(
     cid: String,
     recipient: String,
-) -> Result<JsValue, JsValue> {
-    let (did, runtime) = current_engine()?;
-    let result = runtime
-        .get_group_invitation_reference(&cid, &recipient)
-        .await
-        .map_err(err)?;
-    current(&did, &runtime)?;
-    to_js(&result)
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let (did, runtime) = current_engine()?;
+        let result = runtime
+            .get_group_invitation_reference(&cid, &recipient)
+            .await
+            .map_err(err)?;
+        current(&did, &runtime)?;
+        to_js(&result)
+    })
 }
 
 /// Host presentation commands share the exact draft shape with native Catmos.
-#[wasm_bindgen]
-pub async fn catbird_mls_request_command(
+pub fn catbird_mls_request_command(
     command: String,
     args: JsValue,
-) -> Result<JsValue, JsValue> {
-    let args: serde_json::Value = serde_wasm_bindgen::from_value(args).map_err(err)?;
-    let did = args["ownerDid"]
-        .as_str()
-        .ok_or_else(|| err("Missing request account"))?;
-    let runtime = engine(did)?;
-    let ctx = runtime.mls_context();
-    match command.as_str() {
-        "get_request_workspace" => {
-            let discovery_error = synchronize(did, &runtime, true).await.err().map(|_| {
-                "New requests could not be checked. Saved requests remain available.".to_owned()
-            });
-            let requests = runtime.list_direct_request_views().await.map_err(err)?;
-            let delivery_enabled = runtime
-                .get_direct_request_delivery_enabled()
-                .await
-                .map_err(err)?;
-            let drafts = ctx
-                .request_values("uiDraft")
-                .map_err(err)?
-                .into_iter()
-                .map(|r| serde_json::from_slice(&r).map_err(err))
-                .collect::<Result<Vec<_>, _>>()?;
-            current(did, &runtime)?;
-            to_js(&Workspace {
-                owner_did: did.to_owned(),
-                delivery_enabled,
-                drafts,
-                requests,
-                discovery_error,
-            })
-        }
-        "save_request_draft" => {
-            let input: DirectRequestInput =
-                serde_json::from_value(args["input"].clone()).map_err(err)?;
-            let label = args["recipientLabel"]
-                .as_str()
-                .ok_or_else(|| err("Invalid recipient label"))?;
-            catbird_mls::chat_v2::ids::CanonicalUuid::parse(&input.draft_id).map_err(err)?;
-            catbird_mls::chat_v2::ids::BareDid::parse(&input.recipient_did).map_err(err)?;
-            if input.recipient_did == did || input.text.len() > 16384 || label.len() > 256 {
-                return Err(err("Invalid request draft"));
+) -> impl std::future::Future<Output = Result<JsValue, JsValue>> {
+    crate::browser_session::run(async move {
+        let args: serde_json::Value = serde_wasm_bindgen::from_value(args).map_err(err)?;
+        let did = args["ownerDid"]
+            .as_str()
+            .ok_or_else(|| err("Missing request account"))?;
+        let runtime = engine(did)?;
+        let ctx = runtime.mls_context();
+        match command.as_str() {
+            "get_request_workspace" => {
+                let discovery_error = synchronize(did, &runtime, true).await.err().map(|_| {
+                    "New requests could not be checked. Saved requests remain available.".to_owned()
+                });
+                let requests = runtime.list_direct_request_views().await.map_err(err)?;
+                let delivery_enabled = runtime
+                    .get_direct_request_delivery_enabled()
+                    .await
+                    .map_err(err)?;
+                let drafts = ctx
+                    .request_values("uiDraft")
+                    .map_err(err)?
+                    .into_iter()
+                    .map(|r| serde_json::from_slice(&r).map_err(err))
+                    .collect::<Result<Vec<_>, _>>()?;
+                current(did, &runtime)?;
+                to_js(&Workspace {
+                    owner_did: did.to_owned(),
+                    delivery_enabled,
+                    drafts,
+                    requests,
+                    discovery_error,
+                })
             }
-            let old = ctx.request_value("uiDraft", &input.draft_id).map_err(err)?;
-            if let Some(raw) = &old {
-                let old: RequestDraft = serde_json::from_slice(raw).map_err(err)?;
-                if old.phase != "draft" {
-                    if old.input == input {
-                        return to_js(&old);
+            "save_request_draft" => {
+                let input: DirectRequestInput =
+                    serde_json::from_value(args["input"].clone()).map_err(err)?;
+                let label = args["recipientLabel"]
+                    .as_str()
+                    .ok_or_else(|| err("Invalid recipient label"))?;
+                catbird_mls::chat_v2::ids::CanonicalUuid::parse(&input.draft_id).map_err(err)?;
+                catbird_mls::chat_v2::ids::BareDid::parse(&input.recipient_did).map_err(err)?;
+                if input.recipient_did == did || input.text.len() > 16384 || label.len() > 256 {
+                    return Err(err("Invalid request draft"));
+                }
+                let old = ctx.request_value("uiDraft", &input.draft_id).map_err(err)?;
+                if let Some(raw) = &old {
+                    let old: RequestDraft = serde_json::from_slice(raw).map_err(err)?;
+                    if old.phase != "draft" {
+                        if old.input == input {
+                            return to_js(&old);
+                        }
+                        return Err(err("Attempted request input is immutable"));
                     }
-                    return Err(err("Attempted request input is immutable"));
                 }
+                let value = RequestDraft {
+                    input,
+                    recipient_label: label.into(),
+                    phase: "draft".into(),
+                    outcome: None,
+                    archived: false,
+                    note_delivery: None,
+                };
+                save(ctx, &value, old.as_deref())?;
+                to_js(&value)
             }
-            let value = RequestDraft {
-                input,
-                recipient_label: label.into(),
-                phase: "draft".into(),
-                outcome: None,
-                archived: false,
-                note_delivery: None,
-            };
-            save(ctx, &value, old.as_deref())?;
-            to_js(&value)
-        }
-        "submit_request_draft" | "resume_request_draft" | "cancel_request_draft" => {
-            let id = args["draftId"]
-                .as_str()
-                .ok_or_else(|| err("Missing draft ID"))?;
-            let (old, mut value) = draft(ctx, id)?;
-            if value.archived {
-                return Err(err("Draft is archived"));
-            }
-            if command == "cancel_request_draft" && value.phase == "draft" {
-                value.archived = true;
+            "submit_request_draft" | "resume_request_draft" | "cancel_request_draft" => {
+                let id = args["draftId"]
+                    .as_str()
+                    .ok_or_else(|| err("Missing draft ID"))?;
+                let (old, mut value) = draft(ctx, id)?;
+                if value.archived {
+                    return Err(err("Draft is archived"));
+                }
+                if command == "cancel_request_draft" && value.phase == "draft" {
+                    value.archived = true;
+                    save(ctx, &value, Some(&old))?;
+                    return to_js(&value);
+                }
+                value.phase = "attempted".into();
                 save(ctx, &value, Some(&old))?;
-                return to_js(&value);
-            }
-            value.phase = "attempted".into();
-            save(ctx, &value, Some(&old))?;
-            let attempted = serde_json::to_vec(&value).map_err(err)?;
-            let result = match command.as_str() {
-                "submit_request_draft" => runtime.start_direct_request(value.input.clone()).await,
-                "resume_request_draft" => runtime.resume_direct_request(id).await,
-                _ => runtime.cancel_direct_request(id).await,
-            };
-            current(did, &runtime)?;
-            let outcome=result.map_err(|_|err("Delivery is not confirmed. The exact request is retained; check delivery before creating another."))?;
-            value.phase = if matches!(outcome, DirectRequestOutcome::OutcomeUnknown { .. }) {
-                "checking"
-            } else {
-                "resolved"
-            }
-            .into();
-            value.outcome = Some(outcome);
-            save(ctx, &value, Some(&attempted))?;
-            to_js(&value)
-        }
-        "send_existing_invitation_note" => {
-            let id = args["draftId"]
-                .as_str()
-                .ok_or_else(|| err("Missing draft ID"))?;
-            let (old, mut value) = draft(ctx, id)?;
-            if value.archived || value.note_delivery.is_some() {
-                return Err(err(
-                    "This note was already attempted. Open the conversation to check delivery.",
-                ));
-            }
-            let cid = match &value.outcome {
-                Some(DirectRequestOutcome::ExistingDirect {
-                    conversation_id,
-                    requires_acceptance: false,
-                }) => conversation_id.clone(),
-                _ => {
-                    return Err(err(
-                        "An accepted direct conversation is required; no note was sent",
-                    ))
+                let attempted = serde_json::to_vec(&value).map_err(err)?;
+                let result = match command.as_str() {
+                    "submit_request_draft" => {
+                        runtime.start_direct_request(value.input.clone()).await
+                    }
+                    "resume_request_draft" => {
+                        runtime.start_direct_request(value.input.clone()).await
+                    }
+                    _ => runtime.cancel_direct_request(id).await,
+                };
+                current(did, &runtime)?;
+                let outcome=result.map_err(|_|err("Delivery is not confirmed. The exact request is retained; check delivery before creating another."))?;
+                value.phase = if matches!(outcome, DirectRequestOutcome::OutcomeUnknown { .. }) {
+                    "checking"
+                } else {
+                    "resolved"
                 }
-            };
-            let reference = value
-                .input
-                .invitation
-                .clone()
-                .ok_or_else(|| err("Draft has no group invitation"))?;
-            if reference.recipient_did != value.input.recipient_did {
-                return Err(err("Invitation recipient changed"));
+                .into();
+                value.outcome = Some(outcome);
+                save(ctx, &value, Some(&attempted))?;
+                to_js(&value)
             }
-            require_ordinary_access(&cid).await?;
-            current(did, &runtime)?;
-            let embed = catbird_mls::orchestrator::MLSEmbedData::group_invitation(reference)
-                .map_err(err)?;
-            // The shared send repeats fresh invitation/destination validation.
-            // Retain a durable attempt first; ordinary sends are never retried
-            // with a new message ID after an uncertain delivery.
-            value.note_delivery = Some(NoteDelivery {
-                conversation_id: cid.clone(),
-                message_id: None,
-            });
-            save(ctx, &value, Some(&old))?;
-            let attempted = serde_json::to_vec(&value).map_err(err)?;
-            let sent = runtime
-                .send_message_with_embed(&cid, &value.input.text, embed)
-                .await;
-            current(did, &runtime)?;
-            let message=sent.map_err(|_|err("Invitation note delivery is not confirmed. Your text is retained; open the conversation before composing another note."))?;
-            value.note_delivery.as_mut().unwrap().message_id = Some(message.id);
-            value.archived = true;
-            save(ctx, &value, Some(&attempted))?;
-            to_js(&value)
-        }
-        "get_group_invitation_reference" => {
-            let cid = args["conversationId"]
-                .as_str()
-                .ok_or_else(|| err("Missing conversation"))?;
-            let recipient = args["recipientDid"]
-                .as_str()
-                .ok_or_else(|| err("Missing recipient"))?;
-            let reference = runtime
-                .get_group_invitation_reference(cid, recipient)
+            "send_existing_invitation_note" => {
+                let id = args["draftId"]
+                    .as_str()
+                    .ok_or_else(|| err("Missing draft ID"))?;
+                let (old, mut value) = draft(ctx, id)?;
+                if value.archived || value.note_delivery.is_some() {
+                    return Err(err(
+                        "This note was already attempted. Open the conversation to check delivery.",
+                    ));
+                }
+                let cid = match &value.outcome {
+                    Some(DirectRequestOutcome::ExistingDirect {
+                        conversation_id, ..
+                    }) => conversation_id.clone(),
+                    _ => {
+                        return Err(err(
+                            "An accepted direct conversation is required; no note was sent",
+                        ))
+                    }
+                };
+                let reference = value
+                    .input
+                    .invitation
+                    .clone()
+                    .ok_or_else(|| err("Draft has no group invitation"))?;
+                if reference.recipient_did != value.input.recipient_did {
+                    return Err(err("Invitation recipient changed"));
+                }
+                require_ordinary_access(&cid).await?;
+                current(did, &runtime)?;
+                let embed = catbird_mls::orchestrator::MLSEmbedData::group_invitation(reference)
+                    .map_err(err)?;
+                // The shared send repeats fresh invitation/destination validation.
+                // Retain a durable attempt first; ordinary sends are never retried
+                // with a new message ID after an uncertain delivery.
+                value.note_delivery = Some(NoteDelivery {
+                    conversation_id: cid.clone(),
+                    message_id: None,
+                });
+                save(ctx, &value, Some(&old))?;
+                let attempted = serde_json::to_vec(&value).map_err(err)?;
+                let sent = runtime
+                    .send_message_with_embed(&cid, &value.input.text, embed)
+                    .await;
+                current(did, &runtime)?;
+                let message=sent.map_err(|_|err("Invitation note delivery is not confirmed. Your text is retained; open the conversation before composing another note."))?;
+                value.note_delivery.as_mut().unwrap().message_id = Some(message.id);
+                value.archived = true;
+                save(ctx, &value, Some(&attempted))?;
+                to_js(&value)
+            }
+            "get_group_invitation_reference" => {
+                let cid = args["conversationId"]
+                    .as_str()
+                    .ok_or_else(|| err("Missing conversation"))?;
+                let recipient = args["recipientDid"]
+                    .as_str()
+                    .ok_or_else(|| err("Missing recipient"))?;
+                let reference = runtime
+                    .get_group_invitation_reference(cid, recipient)
+                    .await
+                    .map_err(err)?;
+                current(did, &runtime)?;
+                to_js(&reference)
+            }
+            "refresh_direct_request" => {
+                catbird_mls_refresh_request_preview(
+                    args["conversationId"]
+                        .as_str()
+                        .ok_or_else(|| err("Missing conversation"))?
+                        .into(),
+                )
                 .await
-                .map_err(err)?;
-            current(did, &runtime)?;
-            to_js(&reference)
-        }
-        "refresh_direct_request" => {
-            catbird_mls_refresh_request_preview(
-                args["conversationId"]
+            }
+            "accept_direct_request" => {
+                catbird_mls_accept_direct_request(
+                    args["conversationId"]
+                        .as_str()
+                        .ok_or_else(|| err("Missing conversation"))?
+                        .into(),
+                )
+                .await
+            }
+            "close_direct_request" => {
+                catbird_mls_close_direct_request(
+                    args["conversationId"]
+                        .as_str()
+                        .ok_or_else(|| err("Missing conversation"))?
+                        .into(),
+                )
+                .await
+            }
+            "set_request_delivery_enabled" => {
+                catbird_mls_set_direct_request_delivery_enabled(
+                    args["enabled"]
+                        .as_bool()
+                        .ok_or_else(|| err("Invalid preference"))?,
+                )
+                .await?;
+                Ok(JsValue::UNDEFINED)
+            }
+            "request_sender" => {
+                let cid = args["conversationId"]
                     .as_str()
-                    .ok_or_else(|| err("Missing conversation"))?
-                    .into(),
-            )
-            .await
+                    .ok_or_else(|| err("Missing conversation"))?;
+                let views = runtime.list_direct_request_views().await.map_err(err)?;
+                current(did, &runtime)?;
+                let view = views
+                    .into_iter()
+                    .find(|v| {
+                        v.conversation_id == cid && v.consent == RequestConsent::IncomingPending
+                    })
+                    .ok_or_else(|| err("Verified incoming request unavailable"))?;
+                to_js(
+                    &view
+                        .introduction
+                        .ok_or_else(|| err("Sender proof unavailable"))?
+                        .sender_did,
+                )
+            }
+            _ => Err(err("Unknown request command")),
         }
-        "accept_direct_request" => {
-            catbird_mls_accept_direct_request(
-                args["conversationId"]
-                    .as_str()
-                    .ok_or_else(|| err("Missing conversation"))?
-                    .into(),
-            )
-            .await
-        }
-        "close_direct_request" => {
-            catbird_mls_close_direct_request(
-                args["conversationId"]
-                    .as_str()
-                    .ok_or_else(|| err("Missing conversation"))?
-                    .into(),
-            )
-            .await
-        }
-        "set_request_delivery_enabled" => {
-            catbird_mls_set_direct_request_delivery_enabled(
-                args["enabled"]
-                    .as_bool()
-                    .ok_or_else(|| err("Invalid preference"))?,
-            )
-            .await?;
-            Ok(JsValue::UNDEFINED)
-        }
-        "request_sender" => {
-            let cid = args["conversationId"]
-                .as_str()
-                .ok_or_else(|| err("Missing conversation"))?;
-            let views = runtime.list_direct_request_views().await.map_err(err)?;
-            current(did, &runtime)?;
-            let view = views
-                .into_iter()
-                .find(|v| v.conversation_id == cid && v.consent == RequestConsent::IncomingPending)
-                .ok_or_else(|| err("Verified incoming request unavailable"))?;
-            to_js(
-                &view
-                    .introduction
-                    .ok_or_else(|| err("Sender proof unavailable"))?
-                    .sender_did,
-            )
-        }
-        _ => Err(err("Unknown request command")),
-    }
+    })
 }
 
 #[cfg(all(test, feature = "inventory-worker-tests"))]
@@ -527,14 +560,15 @@ pub(crate) mod tests {
     use super::*;
     use wasm_bindgen_test::*;
     #[wasm_bindgen(inline_js = r#"
- let previousFetch;let preparation=[];let cancellation=[];let queued=new Map();let latest=new Map();let history=[];let allowSend=false;let sentEntry;
+ let previousFetch;let preparation=[];let cancellation=[];let queued=new Map();let latest=new Map();let history=[];let allowSend=false;let sentEntry;let holds=new Map();let arrived=new Map();
  export function installRequestFacadeFixture(doc){
-  previousFetch=globalThis.fetch;preparation=[];cancellation=[];queued=new Map();latest=new Map();history=[];allowSend=false;sentEntry=undefined;
+  previousFetch=globalThis.fetch;preparation=[];cancellation=[];queued=new Map();latest=new Map();history=[];allowSend=false;sentEntry=undefined;holds=new Map();arrived=new Map();
   globalThis.fetch=async(input,options)=>{
    const url=typeof input==='string'?input:input.url;
    const response=(body,status=200)=>{history.push([new URL(url).pathname.split('.').pop(),status]);const r=new Response(JSON.stringify(body),{status,headers:{'content-type':'application/json'}});Object.defineProperty(r,'url',{value:url});return r;};
    const endpoint=new URL(url).pathname.split('.').pop();
    if(typeof input!=='string'){latest.set(endpoint,await input.clone().text());}
+   if(holds.has(endpoint)){const hold=holds.get(endpoint);return await new Promise(resolve=>{hold.release=(body,status)=>resolve(response(JSON.parse(body),status));arrived.get(endpoint)?.();});}
    const pending=queued.get(endpoint);if(pending?.length){const [body,status]=pending.shift();return response(JSON.parse(body),status);}
    if(endpoint==='sendMessage'&&allowSend){const signedRequest=JSON.parse(await input.clone().text()).signedRequest;sentEntry={entryId:crypto.randomUUID(),conversationId:signedRequest.body.prior.conversationId,seq:3,signedRequest,receivedAt:new Date().toISOString()};return response({entry:sentEntry});}
    if(url==='https://chat.catbird.blue/.well-known/did.json')return response(JSON.parse(doc));
@@ -545,6 +579,10 @@ pub(crate) mod tests {
    return response({error:'FixtureOffline'},503);
   };
  }
+ export function observeFacadePromise(promise){promise.catch(()=>{});}
+ export function holdFacade(endpoint){holds.set(endpoint,{});}
+ export function waitFacade(endpoint){return new Promise((resolve,reject)=>{if(holds.get(endpoint)?.release)resolve();else arrived.set(endpoint,resolve);setTimeout(()=>reject(new Error('Missing held '+endpoint+'; history='+JSON.stringify(history))),15000);});}
+ export function releaseFacade(endpoint,body,status){const hold=holds.get(endpoint);holds.delete(endpoint);hold.release(body,status);}
  export function enqueueFacade(endpoint,body,status){if(!queued.has(endpoint))queued.set(endpoint,[]);queued.get(endpoint).push([body,status]);}
  export function lastFacade(endpoint){return latest.get(endpoint)||'';}
  export function enableFacadeSend(){allowSend=true;}
@@ -559,6 +597,10 @@ pub(crate) mod tests {
     extern "C" {
         pub(crate) fn installRequestFacadeFixture(doc: &str);
         fn enqueueFacade(endpoint: &str, body: &str, status: u16);
+        fn holdFacade(endpoint: &str);
+        fn observeFacadePromise(promise: &js_sys::Promise);
+        fn waitFacade(endpoint: &str) -> js_sys::Promise;
+        fn releaseFacade(endpoint: &str, body: &str, status: u16);
         fn lastFacade(endpoint: &str) -> String;
         fn facadeHistory() -> String;
         fn enableFacadeSend();
@@ -575,6 +617,11 @@ pub(crate) mod tests {
             restoreRequestFacadeFixture();
             STATE.with(|s| *s.borrow_mut() = None);
         }
+    }
+    async fn reset_runtime() {
+        crate::browser_session::advance();
+        STATE.with(|s| *s.borrow_mut() = None);
+        crate::sleep_ms(0.0).await;
     }
     pub(crate) async fn initialize(prefix: &str, owner: &str) {
         crate::catbird_mls_init(js_sys::JSON::parse(&serde_json::json!({"baseUrl":"https://facade.invalid","dbPrefix":prefix,"mlsDbKey":"bd".repeat(32)}).to_string()).unwrap()).await.unwrap();
@@ -623,7 +670,7 @@ pub(crate) mod tests {
                 .unwrap())
         })
         .unwrap();
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(&prefix, owner).await;
         let outcome = catbird_mls_resume_direct_request(input.draft_id.clone())
             .await
@@ -655,7 +702,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(cancellationCount(), 1);
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(&prefix, owner).await;
         catbird_mls_resume_direct_request(input.draft_id.clone())
             .await
@@ -677,6 +724,128 @@ pub(crate) mod tests {
         assert!(catbird_mls_resume_direct_request(input.draft_id)
             .await
             .is_err());
+    }
+    #[wasm_bindgen_test]
+    async fn same_account_rebind_cancels_suspended_enrollment_and_request() {
+        use base64::engine::general_purpose::STANDARD_NO_PAD;
+        let authority = p256::ecdsa::SigningKey::from_slice(&[41; 32]).unwrap();
+        let point = authority.verifying_key().to_encoded_point(true);
+        let method =
+            catbird_mls::chat_v2::transcript::direct_request::direct_request_receipt_key_id(
+                point.as_bytes(),
+            )
+            .unwrap();
+        let mut multikey = vec![0x80, 0x24];
+        multikey.extend(point.as_bytes());
+        let doc = serde_json::json!({"id":"did:web:chat.catbird.blue","verificationMethod":[{"id":method,"controller":"did:web:chat.catbird.blue","type":"Multikey","publicKeyMultibase":format!("m{}",STANDARD_NO_PAD.encode(multikey))}]});
+        installRequestFacadeFixture(&doc.to_string());
+        let _restore = Restore;
+        let owner = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let prefix = format!("session-{}", uuid::Uuid::new_v4());
+        crate::catbird_mls_init(js_sys::JSON::parse(&serde_json::json!({"baseUrl":"https://facade.invalid","dbPrefix":prefix,"mlsDbKey":"bd".repeat(32)}).to_string()).unwrap()).await.unwrap();
+        crate::catbird_mls_set_auth(owner.into(), "old-session".into()).unwrap();
+        crate::catbird_mls_set_content_root_key(vec![91; 32]).unwrap();
+        holdFacade("enrollDevice");
+        let old_setup = wasm_bindgen_futures::future_to_promise(crate::catbird_mls_setup());
+        observeFacadePromise(&old_setup);
+        wasm_bindgen_futures::JsFuture::from(waitFacade("enrollDevice"))
+            .await
+            .unwrap();
+        let enrollment = last("enrollDevice");
+        crate::catbird_mls_clear_auth().unwrap();
+        crate::catbird_mls_set_auth(owner.into(), "new-session".into()).unwrap();
+        let b = &enrollment["signedRequest"]["body"];
+        let response = serde_json::json!({"device":{"deviceId":b["deviceId"],"keyId":b["keyId"],"signaturePublicKey":{"$bytes":b["signaturePublicKey"]},"authGeneration":7,"status":"active","availablePackageCount":1,"reservedPackageCount":0,"createdAt":"2026-09-19T12:00:00.000Z","updatedAt":"2026-09-19T12:00:00.000Z"}});
+        releaseFacade("enrollDevice", &response.to_string(), 200);
+        let stale = wasm_bindgen_futures::JsFuture::from(old_setup)
+            .await
+            .unwrap_err();
+        assert!(stale.as_string().unwrap().contains("session changed"));
+        assert!(with_state(|s| Ok(!s.request_ready
+            && s.credentials
+                .enrollment(owner)
+                .unwrap()
+                .unwrap()
+                .auth_generation
+                .is_none()))
+        .unwrap());
+        crate::catbird_mls_setup().await.unwrap();
+        assert_eq!(enrollment, last("enrollDevice"));
+        let input = DirectRequestInput {
+            draft_id: uuid::Uuid::new_v4().to_string(),
+            recipient_did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            text: "Retained attempted host draft".into(),
+            invitation: None,
+        };
+        let (_, engine) = current_engine().unwrap();
+        // Simulate the crash after host attempt CAS and before shared start.
+        let attempted = RequestDraft {
+            input: input.clone(),
+            recipient_label: "Bob".into(),
+            phase: "attempted".into(),
+            outcome: None,
+            archived: false,
+            note_delivery: None,
+        };
+        save(engine.mls_context(), &attempted, None).unwrap();
+        assert!(engine
+            .mls_context()
+            .read_direct_request_intent(&input.draft_id)
+            .unwrap()
+            .is_none());
+        holdFacade("prepareDirectRequest");
+        let args = to_js(&serde_json::json!({"ownerDid":owner,"draftId":input.draft_id})).unwrap();
+        let old_request = wasm_bindgen_futures::future_to_promise(catbird_mls_request_command(
+            "resume_request_draft".into(),
+            args,
+        ));
+        observeFacadePromise(&old_request);
+        wasm_bindgen_futures::JsFuture::from(waitFacade("prepareDirectRequest"))
+            .await
+            .unwrap();
+        let intent = engine
+            .mls_context()
+            .read_direct_request_intent(&input.draft_id)
+            .unwrap()
+            .unwrap();
+        let host = engine
+            .mls_context()
+            .request_value("uiDraft", &input.draft_id)
+            .unwrap()
+            .unwrap();
+        crate::catbird_mls_clear_auth().unwrap();
+        crate::catbird_mls_set_auth(owner.into(), "third-session".into()).unwrap();
+        crate::catbird_mls_setup().await.unwrap();
+        releaseFacade(
+            "prepareDirectRequest",
+            "{\"error\":\"FixtureOffline\"}",
+            503,
+        );
+        let stale = wasm_bindgen_futures::JsFuture::from(old_request)
+            .await
+            .unwrap_err();
+        assert!(stale.as_string().unwrap().contains("session changed"));
+        assert_eq!(
+            engine
+                .mls_context()
+                .read_direct_request_intent(&input.draft_id)
+                .unwrap()
+                .unwrap(),
+            intent
+        );
+        assert_eq!(
+            engine
+                .mls_context()
+                .request_value("uiDraft", &input.draft_id)
+                .unwrap()
+                .unwrap(),
+            host
+        );
+        assert!(engine
+            .mls_context()
+            .list_direct_request_journal()
+            .unwrap()
+            .is_empty());
     }
     pub(crate) fn enqueue(endpoint: &str, body: serde_json::Value) {
         enqueueFacade(endpoint, &body.to_string(), 200);
@@ -732,7 +901,7 @@ pub(crate) mod tests {
             .create_key_package(bid.clone())
             .unwrap();
         let bob_public = package.signature_public_key.clone();
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(&apath, alice).await;
         let input = DirectRequestInput {
             draft_id: uuid::Uuid::new_v4().to_string(),
@@ -813,7 +982,7 @@ pub(crate) mod tests {
         let entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":publication["signedRequest"],"receivedAt":receipt["body"]["receipt"]["recordedAt"]});
         drop(bob_runtime);
         drop(alice_runtime);
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         let bpath = if unaddressed {
             format!("facade-unaddressed-{}", uuid::Uuid::new_v4())
         } else {
@@ -869,6 +1038,23 @@ pub(crate) mod tests {
         Box::pin(exchange_accepted_reply(fixture, &accepted_state)).await;
         close_with_restart(&bpath, bob, cid, p, &accepted_state, 4).await;
     }
+    async fn rebind_while_held(
+        endpoint: &str,
+        owner: &str,
+        operation: impl std::future::Future<Output = Result<JsValue, JsValue>> + 'static,
+    ) -> Result<JsValue, JsValue> {
+        holdFacade(endpoint);
+        let result = wasm_bindgen_futures::future_to_promise(operation);
+        observeFacadePromise(&result);
+        wasm_bindgen_futures::JsFuture::from(waitFacade(endpoint))
+            .await
+            .unwrap();
+        crate::catbird_mls_clear_auth().unwrap();
+        crate::catbird_mls_set_auth(owner.into(), "replacement-session".into()).unwrap();
+        crate::catbird_mls_setup().await.unwrap();
+        releaseFacade(endpoint, "{\"error\":\"FixtureOffline\"}", 503);
+        wasm_bindgen_futures::JsFuture::from(result).await
+    }
     #[derive(Clone, Copy)]
     struct PublishedFixture<'a> {
         apath: &'a str,
@@ -916,7 +1102,7 @@ pub(crate) mod tests {
                 && !view.capabilities.can_emit_receipts
                 && !view.capabilities.can_administer
         );
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(bpath, bob).await;
         let views: Vec<catbird_mls::DirectRequestView> =
             serde_wasm_bindgen::from_value(catbird_mls_list_direct_request_views().await.unwrap())
@@ -937,7 +1123,7 @@ pub(crate) mod tests {
             bob_public,
         )
         .unwrap();
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(bpath, bob).await;
         let accept_entry = json!({"entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":2,"signedRequest":pending_accept["directRequest"],"receivedAt":utc(0)});
         let accepted_receipt = json!({"$type":"blue.catbird.chat.defs#directRequestAcceptanceCommitReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPTANCE-COMMIT\0","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":method,"requestId":accepted["requestId"],"acceptanceDigest":B64.encode(verified_accept.request_digest()),"entryHash":B64.encode(protocol::direct_request_acceptance_entry_hash(&serde_json::to_vec(&accept_entry).unwrap()).unwrap()),"prior":accepted["prior"],"next":accepted["next"],"recordedAt":utc(0)});
@@ -954,7 +1140,7 @@ pub(crate) mod tests {
         assert!(accepted_view.capabilities.can_send);
         assert_eq!(pending_accept, last("acceptConversation"));
         assert_eq!(accepted["prior"]["epoch"], accepted["next"]["epoch"]);
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(bpath, bob).await;
         let views: Vec<catbird_mls::DirectRequestView> =
             serde_wasm_bindgen::from_value(catbird_mls_list_direct_request_views().await.unwrap())
@@ -985,6 +1171,19 @@ pub(crate) mod tests {
         catbird_mls_refresh_request_preview(cid.into())
             .await
             .unwrap();
+        enqueue(
+            "getEntries",
+            json!({"entries":[],"hasMore":false,"nextAfterSeq":0}),
+        );
+        enqueue("getConversationState", json!({"state":accepted_state}));
+        let stale_send = rebind_while_held(
+            "sendMessage",
+            bob,
+            catbird_mls_send_message(cid.into(), "Interrupted prior session send".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(stale_send.as_string().unwrap().contains("session changed"));
         enqueue(
             "getEntries",
             json!({"entries":[],"hasMore":false,"nextAfterSeq":0}),
@@ -1035,7 +1234,7 @@ pub(crate) mod tests {
             <[u8; 32]>::from(Sha256::digest(&own.ciphertext))
         );
         drop(bob_engine);
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(bpath, bob).await;
         let (_, reopened) = current_engine().unwrap();
         assert!(reopened
@@ -1061,7 +1260,7 @@ pub(crate) mod tests {
             )
             .unwrap());
         drop(reopened);
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(apath, alice).await;
         enqueue("getConversationState", json!({"state":accepted_state}));
         enqueue(
@@ -1098,7 +1297,7 @@ pub(crate) mod tests {
         terminal_seq: u64,
     ) {
         use serde_json::json;
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(bpath, bob).await;
         let (_, current) = current_engine().unwrap();
         let no_native = current
@@ -1115,8 +1314,18 @@ pub(crate) mod tests {
             enqueue("getConversationState", json!({"state":accepted_state}));
         }
         enqueue("getConversationState", json!({"state":accepted_state}));
-        let initial_close = catbird_mls_close_direct_request(cid.into()).await;
-        assert!(initial_close.is_err());
+        let initial_close = rebind_while_held(
+            "closeConversation",
+            bob,
+            catbird_mls_close_direct_request(cid.into()),
+        )
+        .await;
+        assert!(initial_close
+            .as_ref()
+            .unwrap_err()
+            .as_string()
+            .unwrap()
+            .contains("session changed"));
         assert!(
             !lastFacade("closeConversation").is_empty(),
             "Expected uncertain close transport: {:?}; history={}",
@@ -1133,7 +1342,7 @@ pub(crate) mod tests {
             lastFacade("closeConversation").as_bytes()
         );
         drop(closing_runtime);
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(bpath, bob).await;
         let tombstone = json!({"$type":"blue.catbird.chat.defs#conversationCloseTombstone","conversationId":cid,"conversationKind":"direct","retired":close_body["retired"],"closedByDid":close_body["actorDid"],"closedByDeviceId":close_body["actorDeviceId"],"terminalSeq":terminal_seq,"closedAt":utc(0)});
         let close_entry = json!({"$type":"blue.catbird.chat.defs#conversationCloseEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":terminal_seq,"signedRequest":close["signedRequest"],"receivedAt":tombstone["closedAt"],"tombstone":tombstone});
@@ -1175,7 +1384,7 @@ pub(crate) mod tests {
             .is_err());
         assert!(closed_runtime.mls_context().list_account_exits().unwrap()[0].local_completion);
         drop(closed_runtime);
-        STATE.with(|s| *s.borrow_mut() = None);
+        reset_runtime().await;
         initialize(bpath, bob).await;
         let closed: catbird_mls::DirectRequestView = serde_wasm_bindgen::from_value(
             catbird_mls_close_direct_request(cid.into()).await.unwrap(),

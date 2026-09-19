@@ -121,10 +121,21 @@ impl Drop for SqliteTransactionGuard<'_> {
 }
 
 impl WasmStorageBackend {
-    fn write_recovery_value(&self,id:&str,value:&str)->Result<()> {
-        let owner=self.active_user_did.borrow().clone().ok_or_else(|| OrchestratorError::Storage("recovery owner unavailable".into()))?;
-        self.conn.exec_with_text_params("INSERT OR REPLACE INTO browser_recovery_v2(owner,id,value) VALUES(?1,?2,?3)",&[(1,&owner),(2,id),(3,value)]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
-        self.conn.ensure_durable().map_err(|e|OrchestratorError::Storage(e.to_string()))
+    fn write_recovery_value(&self, id: &str, value: &str) -> Result<()> {
+        let owner = self
+            .active_user_did
+            .borrow()
+            .clone()
+            .ok_or_else(|| OrchestratorError::Storage("recovery owner unavailable".into()))?;
+        self.conn
+            .exec_with_text_params(
+                "INSERT OR REPLACE INTO browser_recovery_v2(owner,id,value) VALUES(?1,?2,?3)",
+                &[(1, &owner), (2, id), (3, value)],
+            )
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        self.conn
+            .ensure_durable()
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))
     }
 
     /// Create a new storage backend wrapping the shared SQLite connection.
@@ -434,6 +445,9 @@ impl WasmStorageBackend {
         let _ = conn.exec_raw(
             "ALTER TABLE conversations ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0;",
         );
+        // Canonical protocol coordinates are distinct from the host's local
+        // state_version/reset counters. Preserve the verified policy as a whole.
+        let _ = conn.exec_raw("ALTER TABLE conversations ADD COLUMN canonical_state_json TEXT;");
         // Reset high-water coordinates survive completion. The pending
         // columns describe the currently actionable target; these columns
         // describe the greatest accepted generation/target and must never be
@@ -2224,9 +2238,9 @@ impl WasmStorageBackend {
                     && matches!(member.role, MemberRole::Admin)
             })
             .count();
-        if dids.len() != members.len() || admins != 1 {
+        if dids.len() != members.len() || admins == 0 {
             return Err(
-                "conversation roster must have unique DIDs and exactly one admin".to_string(),
+                "conversation roster must have unique DIDs and at least one admin".to_string(),
             );
         }
         Ok(if members.len() == 2 {
@@ -2245,11 +2259,30 @@ impl WasmStorageBackend {
             && uuid.to_string() == value
     }
 
+    fn projection_canonical_state(
+        &self,
+        owner: &str,
+        cid: &str,
+    ) -> std::result::Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, String>
+    {
+        let rows = self.conn.query_text("SELECT canonical_state_json FROM conversations WHERE user_did = ?1 AND conversation_id = ?2", &[(1, owner), (2, cid)], 1).map_err(|e| format!("Canonical policy lookup: {e:?}"))?;
+        rows.first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.as_deref())
+            .map(|raw| {
+                catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+                    raw.as_bytes(),
+                )
+                .map_err(|e| format!("Invalid retained canonical policy: {e}"))
+            })
+            .transpose()
+    }
     fn projection_lifecycle_matches(
         &self,
         user_did: &str,
         conversation_id: &str,
         fence: &ProjectionLifecycleFence,
+        live: bool,
     ) -> std::result::Result<bool, String> {
         let rows = self
             .conn
@@ -2273,20 +2306,22 @@ impl WasmStorageBackend {
             .get(2)
             .and_then(|value| value.as_deref())
             .and_then(|value| value.parse::<i32>().ok());
-        let state_version = row
-            .get(3)
-            .and_then(|value| value.as_deref())
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0);
-
-        // `generation` is intentionally distinct from MLS epoch and from the
-        // reset-generation column. This adapter does not have a separate
-        // projection-generation column, so a caller supplying one must fail
-        // closed rather than treating another coordinate as equivalent.
-        if fence.generation.is_some()
-            || fence
-                .state_version
-                .is_some_and(|expected| expected != state_version)
+        let policy = self.projection_canonical_state(user_did, conversation_id)?;
+        let coordinates = policy.as_ref().map(|p| &p.coordinates);
+        let protocol_matches = match (fence.generation, fence.state_version, coordinates) {
+            (None, None, _) => true,
+            (Some(generation), Some(version), Some(actual)) => {
+                generation == actual.generation
+                    && if live {
+                        version >= actual.state_version
+                    } else {
+                        version == actual.state_version
+                    }
+            }
+            (Some(_), Some(_), None) => live && state != "reset_pending",
+            _ => false,
+        };
+        if !protocol_matches
             || fence
                 .reset_generation
                 .is_some_and(|expected| Some(expected) != reset_generation)
@@ -2300,18 +2335,25 @@ impl WasmStorageBackend {
 
         // Unknown lifecycle coordinates are not enough to authorize a
         // projection while reset authority is pending.
-        if fence.is_unknown() && state == "reset_pending" {
+        if state == "reset_pending"
+            && (fence.reset_generation.is_none()
+                || fence.reset_pending_target_group_id.as_deref() != target)
+        {
             return Ok(false);
         }
         Ok(true)
     }
 
-    fn projection_incarnation(&self, group_id: &str) -> std::result::Result<Option<u64>, String> {
+    fn projection_incarnation(
+        &self,
+        group_id: &str,
+        conversation_id: &str,
+    ) -> std::result::Result<Option<u64>, String> {
         let rows = self
             .conn
             .query_text(
-                "SELECT epoch FROM group_states WHERE group_id = ?1 LIMIT 1",
-                &[(1, group_id)],
+                "SELECT epoch FROM group_states WHERE group_id = ?1 AND conversation_id = ?2 LIMIT 1",
+                &[(1, group_id), (2, conversation_id)],
                 1,
             )
             .map_err(|e| format!("projection incarnation lookup: {:?}", e))?;
@@ -2497,6 +2539,19 @@ impl MLSStorageBackend for WasmStorageBackend {
             epoch
         };
         let members = self.roster_members_sync(&group_id);
+        let canonical_state = self
+            .projection_canonical_state(user_did, conversation_id)
+            .map_err(OrchestratorError::Storage)?;
+        if canonical_state.as_ref().is_some_and(|state| {
+            state.coordinates.conversation_id.as_str() != conversation_id
+                || hex::encode(&state.coordinates.group_id) != group_id
+                || state.coordinates.epoch < 0
+                || state.coordinates.epoch as u64 > epoch
+        }) {
+            return Err(OrchestratorError::Storage(
+                "Canonical policy does not match durable host identity/epoch".into(),
+            ));
+        }
 
         Ok(Some(ConversationView {
             group_id: group_id.clone(),
@@ -2507,7 +2562,7 @@ impl MLSStorageBackend for WasmStorageBackend {
             created_at: None,
             updated_at: None,
             sequencer_did,
-            canonical_state: None,
+            canonical_state,
         }))
     }
 
@@ -2594,6 +2649,7 @@ impl MLSStorageBackend for WasmStorageBackend {
                     || Self::strict_canonical_uuid_v4(&authority.alias_conversation_id)
                     || crate::decode_group_coordinate(&authority.canonical_group_id).is_none()
                     || authority.canonical_group_id != authority.alias_group_id
+                    || authority.alias_incarnation > authority.canonical_incarnation
                     || !alias_ids.insert(authority.alias_conversation_id.clone())
                 {
                     return Err("projection commit has invalid alias authority".to_string());
@@ -2645,6 +2701,47 @@ impl MLSStorageBackend for WasmStorageBackend {
                 });
             }
 
+            if let Some(view) = canonical {
+                catbird_mls::orchestrator::admission::validate_conversation_view(view)
+                    .map_err(|e| e.to_string())?;
+                if let Some(state) = &view.canonical_state {
+                    if !state
+                        .participants
+                        .iter()
+                        .any(|p| p.user_did.as_str() == request.owner_user_did)
+                        || request.canonical_lifecycle.generation
+                            != Some(state.coordinates.generation)
+                        || request.canonical_lifecycle.state_version
+                            != Some(state.coordinates.state_version)
+                    {
+                        return Err("Canonical coordinate fence or audience mismatch".into());
+                    }
+                } else if !request.canonical_lifecycle.is_unknown() {
+                    return Err("Missing canonical policy for lifecycle fence".into());
+                }
+                if let Some(old) =
+                    self.projection_canonical_state(&request.owner_user_did, canonical_id)?
+                {
+                    let next = view
+                        .canonical_state
+                        .as_ref()
+                        .ok_or("Cannot discard canonical policy")?;
+                    let merged =
+                        catbird_mls::orchestrator::admission::merge_protected_conversation_policy(
+                            Some(&old),
+                            next,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if merged.as_ref().is_some_and(|merged| merged != next)
+                        || merged.is_none() && old != *next
+                    {
+                        return Ok(ConversationProjectionCommitOutcome::FenceMismatch {
+                            affected_rows: 0,
+                        });
+                    }
+                }
+            }
+
             // Validate every lifecycle/incarnation fence before the first
             // mutation. Unknown lifecycle coordinates are acceptable for an
             // active row but cannot authorize a RESET_PENDING projection.
@@ -2665,6 +2762,31 @@ impl MLSStorageBackend for WasmStorageBackend {
                         affected_rows: 0,
                     });
                 }
+                if let Some(view) = canonical {
+                    if self
+                        .projection_incarnation(canonical_group, canonical_id)?
+                        .is_some_and(|epoch| epoch > view.epoch)
+                    {
+                        return Ok(ConversationProjectionCommitOutcome::FenceMismatch {
+                            affected_rows: 0,
+                        });
+                    }
+                    let states = self.conn.query_text("SELECT state FROM conversations WHERE user_did = ?1 AND conversation_id = ?2", &[(1, &request.owner_user_did), (2, canonical_id)], 1).map_err(|e| format!("Projection lifecycle read: {e:?}"))?;
+                    if states
+                        .first()
+                        .and_then(|r| r.first())
+                        .and_then(|v| v.as_deref())
+                        .is_some_and(|state| matches!(state, "closed" | "device_removed"))
+                        && view
+                            .canonical_state
+                            .as_ref()
+                            .is_none_or(|state| state.coordinates.lifecycle.as_str() == "active")
+                    {
+                        return Ok(ConversationProjectionCommitOutcome::FenceMismatch {
+                            affected_rows: 0,
+                        });
+                    }
+                }
                 let fence = if request.mode == ConversationProjectionCommitMode::Replay {
                     request
                         .aliases
@@ -2678,6 +2800,7 @@ impl MLSStorageBackend for WasmStorageBackend {
                     &request.owner_user_did,
                     canonical_id,
                     fence,
+                    request.mode == ConversationProjectionCommitMode::Live,
                 )? {
                     return Ok(ConversationProjectionCommitOutcome::FenceMismatch {
                         affected_rows: 0,
@@ -2689,7 +2812,9 @@ impl MLSStorageBackend for WasmStorageBackend {
                         .first()
                         .map(|authority| authority.canonical_incarnation)
                         .unwrap_or(0);
-                    if self.projection_incarnation(canonical_group)?.unwrap_or(0)
+                    if self
+                        .projection_incarnation(canonical_group, canonical_id)?
+                        .unwrap_or(0)
                         != expected_incarnation
                     {
                         return Ok(ConversationProjectionCommitOutcome::FenceMismatch {
@@ -2721,9 +2846,13 @@ impl MLSStorageBackend for WasmStorageBackend {
                             &request.owner_user_did,
                             &authority.alias_conversation_id,
                             &authority.alias_lifecycle,
+                            false,
                         )?
                         || self
-                            .projection_incarnation(&authority.alias_group_id)?
+                            .projection_incarnation(
+                                &authority.alias_group_id,
+                                &authority.alias_conversation_id,
+                            )?
                             .unwrap_or(0)
                             != authority.alias_incarnation
                     {
@@ -2746,13 +2875,27 @@ impl MLSStorageBackend for WasmStorageBackend {
                 // a typed, no-mutation outcome even when the candidate view
                 // is malformed; a unique authorized projection still fails
                 // closed before its first write.
-                let conversation_kind = Self::validate_member_views(&view.members)?;
+                let legacy_kind = Self::validate_member_views(&view.members)?;
+                let conversation_kind = view
+                    .canonical_state
+                    .as_ref()
+                    .map(|state| state.conversation_kind.as_str())
+                    .unwrap_or(legacy_kind);
                 self.upsert_conversation_mapping_in_transaction(
                     &request.owner_user_did,
                     &view.conversation_id,
                     &view.group_id,
                 )?;
                 affected_rows = affected_rows.saturating_add(1);
+                if let Some(state) = &view.canonical_state {
+                    let raw =
+                        catbird_mls::orchestrator::canonical_transport::encode_conversation_state(
+                            state,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let raw = String::from_utf8(raw).map_err(|e| e.to_string())?;
+                    self.conn.exec_with_text_params("UPDATE conversations SET canonical_state_json = ?1 WHERE user_did = ?2 AND conversation_id = ?3", &[(1, &raw), (2, &request.owner_user_did), (3, &view.conversation_id)]).map_err(|e| format!("Canonical policy write: {e:?}"))?;
+                }
 
                 let members_json = serde_json::to_string(
                     &view
@@ -3937,19 +4080,70 @@ impl MLSStorageBackend for WasmStorageBackend {
     }
 
     async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
-        let owner=self.active_user_did.borrow().clone().ok_or_else(|| OrchestratorError::Storage("recovery owner unavailable".into()))?;
-        let rows=self.conn.query_text("SELECT id,value FROM browser_recovery_v2 WHERE owner=?1", &[(1,&owner)],2).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
-        let mut state=PersistedRecoveryState::default();
-        for row in rows { let id=row[0].as_deref().ok_or_else(|| OrchestratorError::Storage("corrupt recovery key".into()))?; let raw=row[1].as_deref().ok_or_else(|| OrchestratorError::Storage("corrupt recovery value".into()))?; if id=="global" {state.last_global_rejoin_attempt_at_ms=Some(serde_json::from_str(raw).map_err(|e|OrchestratorError::Storage(format!("recovery timestamp: {e}")))?);} else {let entry:PersistedRecoveryBackoff=serde_json::from_str(raw).map_err(|e|OrchestratorError::Storage(e.to_string()))?;if entry.conversation_id!=id{return Err(OrchestratorError::Storage("recovery identity mismatch".into()));}state.entries.push(entry);} }
+        let owner = self
+            .active_user_did
+            .borrow()
+            .clone()
+            .ok_or_else(|| OrchestratorError::Storage("recovery owner unavailable".into()))?;
+        let rows = self
+            .conn
+            .query_text(
+                "SELECT id,value FROM browser_recovery_v2 WHERE owner=?1",
+                &[(1, &owner)],
+                2,
+            )
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        let mut state = PersistedRecoveryState::default();
+        for row in rows {
+            let id = row[0]
+                .as_deref()
+                .ok_or_else(|| OrchestratorError::Storage("corrupt recovery key".into()))?;
+            let raw = row[1]
+                .as_deref()
+                .ok_or_else(|| OrchestratorError::Storage("corrupt recovery value".into()))?;
+            if id == "global" {
+                state.last_global_rejoin_attempt_at_ms =
+                    Some(serde_json::from_str(raw).map_err(|e| {
+                        OrchestratorError::Storage(format!("recovery timestamp: {e}"))
+                    })?);
+            } else {
+                let entry: PersistedRecoveryBackoff = serde_json::from_str(raw)
+                    .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+                if entry.conversation_id != id {
+                    return Err(OrchestratorError::Storage(
+                        "recovery identity mismatch".into(),
+                    ));
+                }
+                state.entries.push(entry);
+            }
+        }
         Ok(state)
     }
-    async fn set_recovery_backoff(&self, entry: &PersistedRecoveryBackoff) -> Result<()> { self.write_recovery_value(&entry.conversation_id,&serde_json::to_string(entry).map_err(|e|OrchestratorError::Storage(e.to_string()))?) }
-    async fn clear_recovery_backoff(&self, id: &str) -> Result<()> {
-        let owner=self.active_user_did.borrow().clone().ok_or_else(|| OrchestratorError::Storage("recovery owner unavailable".into()))?;
-        self.conn.exec_with_text_params("DELETE FROM browser_recovery_v2 WHERE owner=?1 AND id=?2",&[(1,&owner),(2,id)]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
-        self.conn.ensure_durable().map_err(|e|OrchestratorError::Storage(e.to_string()))
+    async fn set_recovery_backoff(&self, entry: &PersistedRecoveryBackoff) -> Result<()> {
+        self.write_recovery_value(
+            &entry.conversation_id,
+            &serde_json::to_string(entry).map_err(|e| OrchestratorError::Storage(e.to_string()))?,
+        )
     }
-    async fn set_last_global_rejoin_attempt_at(&self, at_ms:i64)->Result<()> {self.write_recovery_value("global",&at_ms.to_string())}
+    async fn clear_recovery_backoff(&self, id: &str) -> Result<()> {
+        let owner = self
+            .active_user_did
+            .borrow()
+            .clone()
+            .ok_or_else(|| OrchestratorError::Storage("recovery owner unavailable".into()))?;
+        self.conn
+            .exec_with_text_params(
+                "DELETE FROM browser_recovery_v2 WHERE owner=?1 AND id=?2",
+                &[(1, &owner), (2, id)],
+            )
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        self.conn
+            .ensure_durable()
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))
+    }
+    async fn set_last_global_rejoin_attempt_at(&self, at_ms: i64) -> Result<()> {
+        self.write_recovery_value("global", &at_ms.to_string())
+    }
 
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
@@ -4099,7 +4293,10 @@ mod tests {
 
     const TEST_DB_KEY: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 
-    fn new_storage() -> WasmStorageBackend {
+    async fn new_storage() -> WasmStorageBackend {
+        SqliteConn::initialize_opfs()
+            .await
+            .expect("initialize protected Worker OPFS");
         let db_path = format!("catbird-mls-web-test-{}.db", uuid::Uuid::new_v4());
         let conn = SqliteConn::open(&db_path, TEST_DB_KEY).expect("open sqlite");
         WasmStorageBackend::ensure_schema(&conn).expect("ensure schema");
@@ -4108,7 +4305,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn conversation_sequencer_did_round_trips() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:alice";
         let conversation_id = "conv-sequencer";
         let group_id = conversation_id;
@@ -4149,7 +4346,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn conversation_storage_preserves_stable_id_and_current_group_id() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:alice";
         let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let group_id = "00112233445566778899aabbccddeeff";
@@ -4257,7 +4454,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn conversation_storage_keeps_pre_reset_history_by_stable_identity() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:history";
         let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let old_group_id = "00112233445566778899aabbccddeeff";
@@ -4323,7 +4520,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn group_reset_preserves_old_group_state_and_projection_columns() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:atomic";
         let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let old_group_id = "00112233445566778899aabbccddeeff";
@@ -4375,7 +4572,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn completed_reset_reads_history_from_old_and_new_crypto_aliases() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:reset-history";
         let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let old_group_id = "00112233445566778899aabbccddeeff";
@@ -4502,7 +4699,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn history_cursor_is_composite_and_stable_across_reset_aliases() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:history-cursor";
         let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let old_group_id = "00112233445566778899aabbccddeeff";
@@ -4576,7 +4773,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn completed_reset_keeps_a_high_water_generation_and_rejects_replays() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:reset-high-water";
         let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let old_group_id = "00112233445566778899aabbccddeeff";
@@ -4634,7 +4831,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn reset_completion_retains_pending_authority_when_roster_is_missing() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:roster-failure";
         let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let old_group_id = "00112233445566778899aabbccddeeff";
@@ -4669,7 +4866,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn conflicting_duplicate_message_preserves_the_original_fingerprint() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:message-fingerprint";
         let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let group_id = "00112233445566778899aabbccddeeff";
@@ -4709,8 +4906,8 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn conflicting_cleanup_intent_preserves_the_original_owner_fingerprint() {
-        let storage = new_storage();
+    async fn conflicting_cleanup_intent_preserves_the_original_owner_fingerprint() {
+        let storage = new_storage().await;
         let user_did = "did:plc:cleanup-owner";
         let group_id = "00112233445566778899aabbccddeeff";
         storage
@@ -4737,7 +4934,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn projection_rollback_preserves_mapping_state_and_alias_owner() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:rollback";
         let first = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let second = "018f3f6a-7b2c-4d91-8a5e-0f123456789b";
@@ -4793,7 +4990,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn stale_list_projection_cannot_clear_or_regress_reset_authority() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:cas";
         let conversation_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let old_group_id = "00112233445566778899aabbccddeeff";
@@ -4862,7 +5059,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn projection_commit_retire_is_atomic_and_preserves_alias_history() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:projection-cas";
         let stable_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let group_id = "00112233445566778899aabbccddeeff";
@@ -4953,8 +5150,213 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    async fn canonical_policy_projection_keeps_protocol_fences_separate_and_monotonic() {
+        let storage = new_storage().await;
+        let policy = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+            include_bytes!(
+                "../../catbird-mls/tests/fixtures/swift_pending_conversation_state.json"
+            ),
+        )
+        .unwrap();
+        let owner = policy.participants[0].user_did.as_str();
+        let cid = policy.coordinates.conversation_id.as_str();
+        let group = hex::encode(&policy.coordinates.group_id);
+        storage
+            .ensure_conversation_exists(owner, cid, &group)
+            .await
+            .unwrap();
+        storage
+            .conn
+            .exec_raw("UPDATE conversations SET state_version=900")
+            .unwrap();
+        let mut view = ConversationView {
+            conversation_id: cid.into(),
+            group_id: group.clone(),
+            epoch: policy.coordinates.epoch as u64,
+            members: policy
+                .participants
+                .iter()
+                .map(|p| MemberView {
+                    did: p.user_did.as_str().into(),
+                    role: if p.role.as_str() == "admin" {
+                        MemberRole::Admin
+                    } else {
+                        MemberRole::Member
+                    },
+                })
+                .collect(),
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+            canonical_state: Some(policy.clone()),
+        };
+        let request = ConversationProjectionCommitRequest::live(owner, view.clone(), Vec::new());
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&request)
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::AlreadyAbsent { .. }
+        ));
+        assert_eq!(
+            storage
+                .get_conversation(owner, cid)
+                .await
+                .unwrap()
+                .unwrap()
+                .canonical_state,
+            Some(policy.clone())
+        );
+        assert_eq!(
+            storage
+                .conn
+                .query_text(
+                    "SELECT conversation_kind FROM conversations WHERE conversation_id=?1",
+                    &[(1, cid)],
+                    1
+                )
+                .unwrap()[0][0]
+                .as_deref(),
+            Some("group")
+        );
+        let mut wrong = request.clone();
+        wrong.canonical_lifecycle.generation = Some(7);
+        assert!(storage
+            .commit_conversation_projection(&wrong)
+            .await
+            .is_err());
+        view.canonical_state
+            .as_mut()
+            .unwrap()
+            .coordinates
+            .state_version += 1;
+        let next = ConversationProjectionCommitRequest::live(owner, view.clone(), Vec::new());
+        assert!(matches!(
+            storage.commit_conversation_projection(&next).await.unwrap(),
+            ConversationProjectionCommitOutcome::AlreadyAbsent { .. }
+        ));
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&request)
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { .. }
+        ));
+        storage
+            .set_conversation_state(cid, ConversationState::Closed)
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.commit_conversation_projection(&next).await.unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { .. }
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    async fn projection_catchup_preserves_observed_alias_epoch_for_atomic_retirement() {
+        SqliteConn::initialize_opfs().await.unwrap();
+        let storage = new_storage().await;
+        let owner = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let cid = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
+        let group = "00112233445566778899aabbccddeeff";
+        storage
+            .ensure_conversation_exists(owner, group, group)
+            .await
+            .unwrap();
+        storage
+            .set_group_state(&GroupState {
+                group_id: group.into(),
+                conversation_id: group.into(),
+                epoch: 7,
+                members: vec![owner.into()],
+            })
+            .await
+            .unwrap();
+        let alias = storage
+            .get_conversation(owner, group)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(alias.epoch, 7);
+        let canonical = ConversationView {
+            conversation_id: cid.into(),
+            epoch: 8,
+            members: vec![MemberView {
+                did: owner.into(),
+                role: MemberRole::Admin,
+            }],
+            ..alias.clone()
+        };
+        let authority = AliasRetirementAuthority::from_views(owner, &canonical, &alias).unwrap();
+        let mut stale = authority.clone();
+        stale.alias_incarnation = 8;
+        let mismatch = storage
+            .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                owner,
+                canonical.clone(),
+                vec![stale],
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            mismatch,
+            ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
+        ));
+        assert_eq!(
+            storage
+                .get_conversation(owner, group)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            7
+        );
+        assert!(storage
+            .get_conversation(owner, cid)
+            .await
+            .unwrap()
+            .is_none());
+        let applied = storage
+            .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                owner,
+                canonical,
+                vec![authority.clone()],
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            applied,
+            ConversationProjectionCommitOutcome::Retired { .. }
+                | ConversationProjectionCommitOutcome::AlreadyAbsent { .. }
+        ));
+        assert!(storage
+            .get_conversation(owner, group)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage
+                .get_conversation(owner, cid)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            8
+        );
+        let replay = storage
+            .commit_conversation_projection(&ConversationProjectionCommitRequest::replay(authority))
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay,
+            ConversationProjectionCommitOutcome::AlreadyAbsent { .. }
+        ));
+    }
+
+    #[wasm_bindgen_test]
     async fn projection_replay_without_canonical_proof_fails_closed() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:projection-replay";
         let group_id = "ffeeddccbbaa99887766554433221100";
         storage
@@ -4996,7 +5398,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn stale_post_reset_list_cannot_rewind_historical_group_alias() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:projection-stale-list";
         let stable_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let old_group = "00112233445566778899aabbccddeeff";
@@ -5047,7 +5449,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn reset_target_adoption_advances_state_version_for_stale_winner() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:projection-adopt";
         let stable_id = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let old_group = "00112233445566778899aabbccddeeff";
@@ -5087,7 +5489,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn projection_commit_reports_ambiguous_canonical_group_without_mutation() {
-        let storage = new_storage();
+        let storage = new_storage().await;
         let user_did = "did:plc:projection-ambiguous";
         let first = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
         let second = "018f3f6a-7b2c-4d91-8a5e-0f123456789b";

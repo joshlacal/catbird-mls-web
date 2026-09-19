@@ -113,7 +113,6 @@ async fn invalid_identity_import_preserves_enrolled_signer_after_reopen() {
 #[wasm_bindgen_test]
 async fn external_join_cannot_overwrite_request_candidate_after_reopen() {
     use sha2::Digest;
-    use tls_codec::{Deserialize as _, Serialize as _};
     SqliteConn::initialize_opfs().await.unwrap();
     let path = format!("candidate-{}.db", uuid::Uuid::new_v4());
     let key = "ab".repeat(32);
@@ -159,7 +158,7 @@ async fn external_join_cannot_overwrite_request_candidate_after_reopen() {
         },
     };
     let record = MlsCryptoContext::prepare_direct_request_bootstrap(&context, &input).unwrap();
-    assert!(!MlsCryptoContext::supports_direct_request_bootstrap(
+    assert!(MlsCryptoContext::supports_direct_request_bootstrap(
         &context
     ));
     let before = conn

@@ -52,23 +52,35 @@ impl WasmApiClient {
     }
 
     pub fn set_auth(&self, did: String, token: String) {
-        if self.current_did.read().unwrap().as_deref()!=Some(&did){*self.actor_device.write().unwrap()=None;}
+        if self.current_did.read().unwrap().as_deref() != Some(&did) {
+            *self.actor_device.write().unwrap() = None;
+        }
         *self.auth_token.write().unwrap() = Some(token);
         *self.current_did.write().unwrap() = Some(did);
     }
 
     pub fn clear_auth(&self) {
-        *self.actor_device.write().unwrap()=None;
+        *self.actor_device.write().unwrap() = None;
         *self.auth_token.write().unwrap() = None;
         *self.current_did.write().unwrap() = None;
     }
 
-    pub(crate) fn bind_actor(&self,owner:&str,device:&str)->Result<()> {
-        if self.current_did.read().unwrap().as_deref()!=Some(owner){return Err(OrchestratorError::NotAuthenticated);}
-        catbird_mls::chat_v2::ids::CanonicalUuid::parse(device).map_err(|e|OrchestratorError::Api(e.to_string()))?;
-        *self.actor_device.write().unwrap()=Some(device.to_owned());Ok(())
+    pub(crate) fn bind_actor(&self, owner: &str, device: &str) -> Result<()> {
+        if self.current_did.read().unwrap().as_deref() != Some(owner) {
+            return Err(OrchestratorError::NotAuthenticated);
+        }
+        catbird_mls::chat_v2::ids::CanonicalUuid::parse(device)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        *self.actor_device.write().unwrap() = Some(device.to_owned());
+        Ok(())
     }
-    pub(crate) fn actor_device(&self)->Result<String>{self.actor_device.read().unwrap().clone().ok_or_else(||OrchestratorError::Api("Enrolled actor device is unavailable".into()))}
+    pub(crate) fn actor_device(&self) -> Result<String> {
+        self.actor_device
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| OrchestratorError::Api("Enrolled actor device is unavailable".into()))
+    }
     pub fn get_auth_token(&self) -> Option<String> {
         self.auth_token.read().unwrap().clone()
     }
@@ -461,7 +473,12 @@ impl MLSAPIClient for WasmApiClient {
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
         let token = self.auth_header()?;
-        let mut query = vec![("actorDeviceId",self.actor_device()?),("limit", limit.to_string()),("supportedProtocolVersions","1".into()),("supportedProtocolVersions","2".into())];
+        let mut query = vec![
+            ("actorDeviceId", self.actor_device()?),
+            ("limit", limit.to_string()),
+            ("supportedProtocolVersions", "1".into()),
+            ("supportedProtocolVersions", "2".into()),
+        ];
         if let Some(c) = cursor {
             query.push(("pageCursor", c.to_string()));
         }
@@ -483,12 +500,24 @@ impl MLSAPIClient for WasmApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
-        let output = catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
-            .map_err(|error| OrchestratorError::Api(format!("Canonical getConversations decode: {error}")))?;
+        let output =
+            catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
+                .map_err(|error| {
+                OrchestratorError::Api(format!("Canonical getConversations decode: {error}"))
+            })?;
 
-        if output.has_more != output.next_page_cursor.is_some() {return Err(OrchestratorError::Api("Conversation pagination is incomplete".into()));}
-        let wire:serde_json::Value=serde_json::from_slice(&body).map_err(|e|OrchestratorError::Api(e.to_string()))?;
-        if wire["inventoryScope"]["supportedProtocolVersions"]!=serde_json::json!(["1","2"]){return Err(OrchestratorError::Api("Conversation protocol scope mismatch".into()));}
+        if output.has_more != output.next_page_cursor.is_some() {
+            return Err(OrchestratorError::Api(
+                "Conversation pagination is incomplete".into(),
+            ));
+        }
+        let wire: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        if wire["inventoryScope"]["supportedProtocolVersions"] != serde_json::json!(["1", "2"]) {
+            return Err(OrchestratorError::Api(
+                "Conversation protocol scope mismatch".into(),
+            ));
+        }
         let mut conversations = Vec::new();
         for item in output.items {
             if let blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(
@@ -515,7 +544,13 @@ impl MLSAPIClient for WasmApiClient {
         _to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
         let token = self.auth_header()?;
-        let after_seq = cursor.map(|v| v.parse::<u64>().map_err(|_|OrchestratorError::Api("Invalid entry cursor".into()))).transpose()?.unwrap_or(0);
+        let after_seq = cursor
+            .map(|v| {
+                v.parse::<u64>()
+                    .map_err(|_| OrchestratorError::Api("Invalid entry cursor".into()))
+            })
+            .transpose()?
+            .unwrap_or(0);
         let query = vec![
             ("actorDeviceId", self.actor_device()?),
             ("conversationId", convo_id.to_string()),
@@ -537,21 +572,42 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        if body.len()>16*1024*1024 { return Err(OrchestratorError::Api("Entry page exceeds bound".into())); }
-        catbird_mls::chat_v2::transcript::decode_strict_json(&body).map_err(|e|OrchestratorError::Api(e.to_string()))?;
-        let output:serde_json::Value=serde_json::from_slice(&body).map_err(|e|OrchestratorError::Api(e.to_string()))?;
-        let entries=output["entries"].as_array().filter(|e|e.len()<=limit as usize).ok_or_else(||OrchestratorError::Api("Invalid entries page".into()))?;
-        let mut envelopes=Vec::new();let mut greatest=after_seq;
-        for entry in entries {
-            let seq=entry["seq"].as_u64().filter(|n|*n>greatest && *n<=9_007_199_254_740_991).ok_or_else(||OrchestratorError::Api("Nonmonotonic entry sequence".into()))?;
-            if entry["conversationId"]!=convo_id{return Err(OrchestratorError::Api("Foreign conversation entry".into()));}
-            crate::strict_projection::validate_read_shape("conversationEntry",&serde_json::to_vec(entry).map_err(|e|OrchestratorError::Api(e.to_string()))?).map_err(|e|OrchestratorError::Api(e.to_string()))?;
-            if let Some(envelope)=IncomingEnvelope::from_canonical_entry(entry,convo_id)?{envelopes.push(envelope);}
-            greatest=seq;
+        if body.len() > 16 * 1024 * 1024 {
+            return Err(OrchestratorError::Api("Entry page exceeds bound".into()));
         }
-        if output["nextAfterSeq"].as_u64()!=Some(greatest){return Err(OrchestratorError::Api("Entry continuation mismatch".into()));}
-        let next_cursor=(greatest>after_seq).then(||greatest.to_string());
-        Ok((envelopes,next_cursor))
+        catbird_mls::chat_v2::transcript::decode_strict_json(&body)
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let output: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let entries = output["entries"]
+            .as_array()
+            .filter(|e| e.len() <= limit as usize)
+            .ok_or_else(|| OrchestratorError::Api("Invalid entries page".into()))?;
+        let mut envelopes = Vec::new();
+        let mut greatest = after_seq;
+        for entry in entries {
+            let seq = entry["seq"]
+                .as_u64()
+                .filter(|n| *n > greatest && *n <= 9_007_199_254_740_991)
+                .ok_or_else(|| OrchestratorError::Api("Nonmonotonic entry sequence".into()))?;
+            if entry["conversationId"] != convo_id {
+                return Err(OrchestratorError::Api("Foreign conversation entry".into()));
+            }
+            crate::strict_projection::validate_read_shape(
+                "conversationEntry",
+                &serde_json::to_vec(entry).map_err(|e| OrchestratorError::Api(e.to_string()))?,
+            )
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+            if let Some(envelope) = IncomingEnvelope::from_canonical_entry(entry, convo_id)? {
+                envelopes.push(envelope);
+            }
+            greatest = seq;
+        }
+        if output["nextAfterSeq"].as_u64() != Some(greatest) {
+            return Err(OrchestratorError::Api("Entry continuation mismatch".into()));
+        }
+        let next_cursor = (greatest > after_seq).then(|| greatest.to_string());
+        Ok((envelopes, next_cursor))
     }
 
     async fn get_key_packages(
@@ -568,11 +624,22 @@ impl MLSAPIClient for WasmApiClient {
     }
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
-        let actor=self.actor_device()?;
-        let device=self.list_devices(&actor).await?.into_iter().find(|d|d.device_id==actor && d.status.as_deref()==Some("enabled"))
-            .ok_or_else(||OrchestratorError::Api("Current enrolled device is unavailable".into()))?;
-        let available=device.available_package_count.ok_or_else(||OrchestratorError::Api("Missing device package inventory".into()))?;
-        Ok(KeyPackageStats{available,total:available.saturating_add(device.reserved_package_count.unwrap_or(0))})
+        let actor = self.actor_device()?;
+        let device = self
+            .list_devices(&actor)
+            .await?
+            .into_iter()
+            .find(|d| d.device_id == actor && d.status.as_deref() == Some("enabled"))
+            .ok_or_else(|| {
+                OrchestratorError::Api("Current enrolled device is unavailable".into())
+            })?;
+        let available = device
+            .available_package_count
+            .ok_or_else(|| OrchestratorError::Api("Missing device package inventory".into()))?;
+        Ok(KeyPackageStats {
+            available,
+            total: available.saturating_add(device.reserved_package_count.unwrap_or(0)),
+        })
     }
 
     async fn sync_key_packages(
@@ -587,29 +654,77 @@ impl MLSAPIClient for WasmApiClient {
     }
 
     async fn list_devices(&self, actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
-        let token=self.auth_header()?;
-        let current_did=self.current_did().await.ok_or(OrchestratorError::NotAuthenticated)?;
-        let mut items=Vec::new();let mut cursor=None;let mut seen=std::collections::HashSet::new();let mut seen_cursors=std::collections::HashSet::new();
+        let token = self.auth_header()?;
+        let current_did = self
+            .current_did()
+            .await
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        let mut items = Vec::new();
+        let mut cursor = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut seen_cursors = std::collections::HashSet::new();
         for _ in 0..100 {
-            let mut query=vec![("actorDeviceId",actor_device_id.to_owned()),("limit","100".into())];
-            if let Some(c)=cursor.take(){query.push(("pageCursor",c));}
-            let resp=self.client.get(self.xrpc_url("blue.catbird.chat.getOwnDevices")).bearer_auth(&token).query(&query).send().await.map_err(|e|OrchestratorError::Api(e.to_string()))?;
-            if !resp.status().is_success(){return Err(self.handle_error(resp).await);}
-            let body=resp.bytes().await.map_err(|e|OrchestratorError::Api(e.to_string()))?;
-            let output:blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>=serde_json::from_slice(&body).map_err(|e|OrchestratorError::Api(format!("getOwnDevices parse: {e}")))?;
-            for d in output.items {
-                let device_id=d.device.device_id.to_string();
-                if !seen.insert(device_id.clone()){return Err(OrchestratorError::Api("Repeated own-device entry".into()));}
-                items.push(DeviceInfo {mls_did:format!("{current_did}#{device_id}"),device_uuid:device_id.clone(),device_id,created_at:None,key_id:Some(d.device.key_id.to_string()),signature_public_key:Some(d.device.signature_public_key.to_vec()),auth_generation:Some(d.device.auth_generation),status:Some(d.device.status.to_string()),available_package_count:Some(d.device.available_package_count.max(0) as u32),reserved_package_count:Some(d.device.reserved_package_count.max(0) as u32)});
+            let mut query = vec![
+                ("actorDeviceId", actor_device_id.to_owned()),
+                ("limit", "100".into()),
+            ];
+            if let Some(c) = cursor.take() {
+                query.push(("pageCursor", c));
             }
-            if !self.is_authenticated_as(&current_did).await{return Err(OrchestratorError::NotAuthenticated);}
-            match (output.has_more,output.next_page_cursor) {
-                (false,None)=>return Ok(items),
-                (true,Some(c)) if seen_cursors.insert(c.to_string())=>cursor=Some(c.to_string()),
-                _=>return Err(OrchestratorError::Api("Own-device inventory cursor is inconsistent".into()))
+            let resp = self
+                .client
+                .get(self.xrpc_url("blue.catbird.chat.getOwnDevices"))
+                .bearer_auth(&token)
+                .query(&query)
+                .send()
+                .await
+                .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+            if !resp.status().is_success() {
+                return Err(self.handle_error(resp).await);
+            }
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+            let output: blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String> =
+                serde_json::from_slice(&body)
+                    .map_err(|e| OrchestratorError::Api(format!("getOwnDevices parse: {e}")))?;
+            for d in output.items {
+                let device_id = d.device.device_id.to_string();
+                if !seen.insert(device_id.clone()) {
+                    return Err(OrchestratorError::Api("Repeated own-device entry".into()));
+                }
+                items.push(DeviceInfo {
+                    mls_did: format!("{current_did}#{device_id}"),
+                    device_uuid: device_id.clone(),
+                    device_id,
+                    created_at: None,
+                    key_id: Some(d.device.key_id.to_string()),
+                    signature_public_key: Some(d.device.signature_public_key.to_vec()),
+                    auth_generation: Some(d.device.auth_generation),
+                    status: Some(d.device.status.to_string()),
+                    available_package_count: Some(d.device.available_package_count.max(0) as u32),
+                    reserved_package_count: Some(d.device.reserved_package_count.max(0) as u32),
+                });
+            }
+            if !self.is_authenticated_as(&current_did).await {
+                return Err(OrchestratorError::NotAuthenticated);
+            }
+            match (output.has_more, output.next_page_cursor) {
+                (false, None) => return Ok(items),
+                (true, Some(c)) if seen_cursors.insert(c.to_string()) => {
+                    cursor = Some(c.to_string())
+                }
+                _ => {
+                    return Err(OrchestratorError::Api(
+                        "Own-device inventory cursor is inconsistent".into(),
+                    ))
+                }
             }
         }
-        Err(OrchestratorError::Api("Own-device inventory page bound exceeded".into()))
+        Err(OrchestratorError::Api(
+            "Own-device inventory page bound exceeded".into(),
+        ))
     }
 
     async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
@@ -684,10 +799,18 @@ fn canonical_conversation_view(
         group_id: hex::encode(state.coordinates.group_id.as_ref()),
         conversation_id: state.coordinates.conversation_id.to_string(),
         epoch: state.coordinates.epoch as u64,
-        members: state.participants.iter().map(|participant| MemberView {
-            did: participant.user_did.to_string(),
-            role: if participant.role == "admin" { MemberRole::Admin } else { MemberRole::Member },
-        }).collect(),
+        members: state
+            .participants
+            .iter()
+            .map(|participant| MemberView {
+                did: participant.user_did.to_string(),
+                role: if participant.role == "admin" {
+                    MemberRole::Admin
+                } else {
+                    MemberRole::Member
+                },
+            })
+            .collect(),
         metadata: None,
         created_at: None,
         updated_at: None,
@@ -709,7 +832,9 @@ mod tests {
 #[cfg(test)]
 mod canonical_admission_projection_tests {
     use super::*;
-    use catbird_mls::orchestrator::canonical_transport::{decode_conversation_state, encode_conversation_state, decode_conversations_inventory};
+    use catbird_mls::orchestrator::canonical_transport::{
+        decode_conversation_state, decode_conversations_inventory, encode_conversation_state,
+    };
 
     fn inventory(wire: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -719,10 +844,12 @@ mod canonical_admission_projection_tests {
         })).unwrap()
     }
 
-
     #[test]
     fn canonical_pending_and_accepted_leafless_views_keep_exact_snapshot() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         for (status, version) in [("pending", 41), ("active", 42)] {
             let mut wire = fixture.clone();
             wire["participants"][1]["status"] = serde_json::json!(status);
@@ -739,13 +866,23 @@ mod canonical_admission_projection_tests {
             let view = canonical_conversation_view(&state);
             assert_eq!(view.canonical_state.as_ref(), Some(&state));
             assert_eq!(view.epoch, state.coordinates.epoch as u64);
-            assert_eq!(view.group_id, hex::encode(state.coordinates.group_id.as_ref()));
-            let persisted: ConversationView = serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
+            assert_eq!(
+                view.group_id,
+                hex::encode(state.coordinates.group_id.as_ref())
+            );
+            let persisted: ConversationView =
+                serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
             let retained = persisted.canonical_state.unwrap();
-            assert_eq!(decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(), state);
+            assert_eq!(
+                decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(),
+                state
+            );
             assert_eq!(retained.participants[1].status, status);
             assert_eq!(retained.participants[1].leaf_count, 0);
-            assert_eq!(retained.participants[1].invitation_provenance, state.participants[1].invitation_provenance);
+            assert_eq!(
+                retained.participants[1].invitation_provenance,
+                state.participants[1].invitation_provenance
+            );
             assert!(view.created_at.is_none());
             assert!(view.metadata.is_none());
         }
@@ -753,11 +890,18 @@ mod canonical_admission_projection_tests {
 
     #[test]
     fn legacy_view_is_unknown_and_malformed_canonical_state_is_rejected() {
-        let mut wire: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let mut wire: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         let state = decode_conversation_state(wire.to_string().as_bytes()).unwrap();
         let view = canonical_conversation_view(&state);
         let mut old_view = serde_json::to_value(view).unwrap();
-        assert!(old_view.as_object_mut().unwrap().remove("canonicalState").is_some());
+        assert!(old_view
+            .as_object_mut()
+            .unwrap()
+            .remove("canonicalState")
+            .is_some());
         let legacy: ConversationView = serde_json::from_value(old_view).unwrap();
         assert!(legacy.canonical_state.is_none());
         wire["participants"][1]["status"] = serde_json::json!("unknown");

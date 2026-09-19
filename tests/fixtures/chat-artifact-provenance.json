@@ -1,0 +1,25 @@
+{
+  "coreRevision": "88032af292c82a36563f8fb998611baceacd5865",
+  "artifacts": [
+    {
+      "target": "src/generated/blue.catbird.chat.defs.json",
+      "source": "src/orchestrator/generated/blue.catbird.chat.defs.json",
+      "sha256": "b2a7fc544826a7864ba8e79b2c366cb3a25e15deb9f1fed13f0e060d800e4c11"
+    },
+    {
+      "target": "tests/fixtures/mls_chat_signing_domain_vectors.json",
+      "source": "src/orchestrator/generated/mls_chat_signing_domain_vectors.json",
+      "sha256": "b8cefccccf76622f98b73fa617a27ed7a6ba40729c350639f3e43f56de2521b8"
+    },
+    {
+      "target": "tests/fixtures/mls_chat_contract_vectors.json",
+      "source": "src/orchestrator/generated/mls_chat_contract_vectors.json",
+      "sha256": "67e00b09051b2a19e642b5a39017265d6ff64d549671bd2d0e2c73b8c8bfc205"
+    },
+    {
+      "target": "tests/fixtures/mls_chat_control_fingerprint_source.json",
+      "source": "src/orchestrator/generated/mls_chat_control_fingerprint_source.json",
+      "sha256": "9f33f318fb7492caaa0b6668f2f69a093051bbeae35f3991bc868b5b66c61d49"
+    }
+  ]
+}

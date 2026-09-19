@@ -28,7 +28,9 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_libcrux_crypto::CryptoProvider as LibcruxCrypto;
 use openmls_traits::OpenMlsProvider;
 
-use catbird_mls::orchestrator::mls_provider::{IncomingCommitMergeOutcome, MlsCryptoContext};
+use catbird_mls::orchestrator::mls_provider::{
+    IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome,
+};
 use catbird_mls::{
     AddMembersResult, CredentialData, DecryptResult, EncryptResult, ExternalCommitResult,
     GroupConfig, GroupCreationResult, KeyPackageData, KeyPackageResult, MLSError, WelcomeResult,
@@ -117,6 +119,7 @@ pub struct WasmMLSContext {
 }
 
 mod direct_requests;
+mod own_echo;
 
 impl WasmMLSContext {
     /// Open (or create) the MLS SQLite database as a standalone database.
@@ -584,7 +587,9 @@ impl WasmMLSContext {
     }
 
     pub(crate) fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
-        if self.retire_request_group(&group_id)? { return Ok(()); }
+        if self.retire_request_group(&group_id)? {
+            return Ok(());
+        }
         if !self.ensure_group_loaded(&group_id)? {
             return Ok(());
         }
@@ -1248,11 +1253,86 @@ impl WasmMLSContext {
         })
     }
 
+    pub(crate) fn encrypt_canonical_message(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+        expected_epoch: u64,
+    ) -> Result<EncryptResult, MLSError> {
+        if aad.is_empty() || aad.len() > 64 * 1024 {
+            return Err(MLSError::invalid_input(
+                "Canonical application AAD is missing or exceeds its bound",
+            ));
+        }
+        self.require_published_group(&group_id)?;
+        // The transaction owns ratchet advancement. Publish a fresh cache entry
+        // only after its ciphertext and ratchet are durably committed.
+        self.groups.borrow_mut().remove(&group_id);
+        let conn = self.provider.storage().conn();
+        let (group, ciphertext) = conn.transaction(|| -> Result<_, MLSError> {
+            let mut group =
+                MlsGroup::load(self.provider.storage(), &GroupId::from_slice(&group_id))
+                    .map_err(|_| MLSError::StorageFailed)?
+                    .ok_or_else(|| MLSError::group_not_found("Canonical message group missing"))?;
+            if group.epoch().as_u64() != expected_epoch {
+                return Err(MLSError::invalid_input(
+                    "MLS epoch changed before application encryption",
+                ));
+            }
+            let leaf = group
+                .own_leaf()
+                .ok_or_else(|| MLSError::invalid_input("Group has no own leaf"))?;
+            let signer = self.signer_from_identity(
+                leaf.credential().serialized_content().to_vec(),
+                leaf.signature_key().as_slice().to_vec(),
+            )?;
+            group.set_aad(aad);
+            let result = group
+                .create_message(&self.provider, signer.as_ref(), &plaintext)
+                .map_err(|_| MLSError::EncryptionFailed)
+                .and_then(|message| {
+                    message
+                        .tls_serialize_detached()
+                        .map_err(|_| MLSError::SerializationError)
+                });
+            group.set_aad(Vec::new());
+            Ok((group, result?))
+        })?;
+        conn.ensure_durable()?;
+        self.groups.borrow_mut().insert(group_id, group);
+        Ok(EncryptResult {
+            padded_size: u32::try_from(ciphertext.len())
+                .map_err(|_| MLSError::SerializationError)?,
+            ciphertext,
+        })
+    }
+
     pub(crate) fn decrypt_message(
         &self,
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
+        match self.decrypt_classified(group_id, ciphertext)? {
+            MlsDecryptOutcome::Message(message)
+                if message.content_type == catbird_mls::DecryptContentType::Commit =>
+            {
+                Err(MLSError::invalid_input(
+                    "received a commit message (not application data)",
+                ))
+            }
+            MlsDecryptOutcome::Message(message) => Ok(message),
+            MlsDecryptOutcome::OwnPrivateMessage { .. } | MlsDecryptOutcome::OwnPendingCommit => {
+                Err(MLSError::DecryptionFailed)
+            }
+        }
+    }
+    fn decrypt_classified(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<MlsDecryptOutcome, MLSError> {
+        use sha2::{Digest, Sha256};
         let raw = strip_padding(&ciphertext);
 
         let (msg_in, _) = MlsMessageIn::tls_deserialize_bytes(raw)
@@ -1295,6 +1375,19 @@ impl WasmMLSContext {
             processed
         };
         let epoch = processed.epoch().as_u64();
+        match processed.content() {
+            ProcessedMessageContent::OwnPrivateMessage => {
+                return Ok(MlsDecryptOutcome::OwnPrivateMessage {
+                    epoch,
+                    aad_sha256: Sha256::digest(processed.aad()).into(),
+                    ciphertext_sha256: Sha256::digest(&ciphertext).into(),
+                })
+            }
+            ProcessedMessageContent::OwnPendingCommit => {
+                return Ok(MlsDecryptOutcome::OwnPendingCommit)
+            }
+            _ => {}
+        }
 
         // Extract credential data before consuming `processed`.
         let sender_credential = {
@@ -1306,14 +1399,16 @@ impl WasmMLSContext {
         };
 
         match processed.into_content() {
-            ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(DecryptResult {
-                plaintext: app_msg.into_bytes(),
-                epoch,
-                sequence_number: 0,
-                sender_credential,
-                content_type: catbird_mls::DecryptContentType::Application,
-                proposal_ref: None,
-            }),
+            ProcessedMessageContent::ApplicationMessage(app_msg) => {
+                Ok(MlsDecryptOutcome::Message(DecryptResult {
+                    plaintext: app_msg.into_bytes(),
+                    epoch,
+                    sequence_number: 0,
+                    sender_credential,
+                    content_type: catbird_mls::DecryptContentType::Application,
+                    proposal_ref: None,
+                }))
+            }
 
             ProcessedMessageContent::StagedCommitMessage(commit) => {
                 // Task #56: stage the incoming commit instead of auto-merging.
@@ -1331,9 +1426,14 @@ impl WasmMLSContext {
                     .borrow_mut()
                     .insert((group_id.clone(), target_epoch), *commit);
 
-                Err(MLSError::invalid_input(
-                    "received a commit message (not application data)",
-                ))
+                Ok(MlsDecryptOutcome::Message(DecryptResult {
+                    plaintext: Vec::new(),
+                    epoch: target_epoch,
+                    sequence_number: 0,
+                    sender_credential,
+                    content_type: catbird_mls::DecryptContentType::Commit,
+                    proposal_ref: None,
+                }))
             }
 
             // These outcomes do not carry authenticated plaintext. The
@@ -1501,10 +1601,70 @@ mod compatibility_tests;
 // The adapter implements the shared interface; request lifecycle remains in Rust.
 impl MlsCryptoContext for WasmMLSContext {
     // Protected provider capability; product activation remains a separate host gate.
-    fn get_conversation_policy(&self,owner:&str,cid:&str)->Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>,MLSError>{self.protected_policy(owner,cid)}
-    fn put_conversation_policy(&self,owner:&str,state:&catbird_atproto::blue_catbird::chat::ConversationState)->Result<bool,MLSError>{self.protect_policy(owner,state)}
-    fn get_conversation_departure(&self,owner:&str,cid:&str)->Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>,MLSError>{self.protected_departure(owner,cid)}
-    fn put_conversation_departure(&self,owner:&str,state:&catbird_atproto::blue_catbird::chat::ConversationCoordinates)->Result<bool,MLSError>{self.protect_departure(owner,state)}
+    fn get_conversation_policy(
+        &self,
+        owner: &str,
+        cid: &str,
+    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
+        self.protected_policy(owner, cid)
+    }
+    fn put_conversation_policy(
+        &self,
+        owner: &str,
+        state: &catbird_atproto::blue_catbird::chat::ConversationState,
+    ) -> Result<bool, MLSError> {
+        self.protect_policy(owner, state)
+    }
+    fn get_conversation_departure(
+        &self,
+        owner: &str,
+        cid: &str,
+    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError>
+    {
+        self.protected_departure(owner, cid)
+    }
+    fn put_conversation_departure(
+        &self,
+        owner: &str,
+        state: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+    ) -> Result<bool, MLSError> {
+        self.protect_departure(owner, state)
+    }
+    fn list_account_exits(
+        &self,
+    ) -> Result<Vec<catbird_mls::orchestrator::account_exit::AccountExitRecord>, MLSError> {
+        self.protected_account_exits()
+    }
+    fn put_account_exit(
+        &self,
+        record: &catbird_mls::orchestrator::account_exit::AccountExitRecord,
+    ) -> Result<(), MLSError> {
+        self.protect_account_exit(record)
+    }
+    fn decrypt_message_outcome(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<MlsDecryptOutcome, MLSError> {
+        self.decrypt_classified(group_id, ciphertext)
+    }
+    fn store_own_echo_proof(
+        &self,
+        proof: &catbird_mls::orchestrator::mls_provider::OwnEchoProof,
+    ) -> Result<(), MLSError> {
+        self.protect_own_echo(proof)
+    }
+    fn has_own_echo_proof(
+        &self,
+        cid: &str,
+        gid: &[u8],
+        entry: &str,
+        epoch: u64,
+        aad: &[u8; 32],
+        ciphertext: &[u8; 32],
+    ) -> Result<bool, MLSError> {
+        self.protected_own_echo(cid, gid, entry, epoch, aad, ciphertext)
+    }
     fn supports_direct_request_bootstrap(&self) -> bool {
         true
     }
@@ -1518,22 +1678,100 @@ impl MlsCryptoContext for WasmMLSContext {
         WasmMLSContext::list_direct_request_journal(self)
     }
 
-    fn process_direct_request_welcome(&self, input: &catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestWelcomeInput) -> Result<WelcomeResult, MLSError> { self.import_request_welcome(input) }
-    fn decrypt_direct_request_introduction(&self, input: &catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestWelcomeInput) -> Result<catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestIntroductionResult, MLSError> { self.decrypt_request_intro(input) }
-    fn read_direct_request_key_publication(&self, device: &str) -> Result<Option<Vec<u8>>, MLSError> { self.request_value("keys", device) }
-    fn prepare_direct_request_key_publication(&self, input: &catbird_mls::orchestrator::direct_request_keys::DirectRequestKeyPublicationInput, expected: Option<&[u8]>) -> Result<Option<Vec<u8>>, MLSError> { self.prepare_request_keys(input, expected) }
-    fn acknowledge_direct_request_key_publication(&self, device: &str, expected: &[u8], next: &[u8]) -> Result<bool, MLSError> { self.acknowledge_request_keys(device, expected, next) }
-    fn commit_closed_direct_request_projection(&self, cid: &str, expected: &[u8], next: &[u8]) -> Result<bool, MLSError> { self.close_request_projection(cid, expected, next) }
-    fn persist_direct_request_publish(&self, id: &str, bytes: &[u8]) -> Result<(), MLSError> { self.persist_request_publish(id, bytes) }
-    fn confirm_published_bootstrap(&self, id: &str, receipt: &[u8], key: &[u8]) -> Result<DirectRequestJournal, MLSError> { self.resolve_request_journal(id, receipt, key, true) }
-    fn abandon_rejected_bootstrap(&self, id: &str, receipt: &[u8], key: &[u8]) -> Result<DirectRequestJournal, MLSError> { self.resolve_request_journal(id, receipt, key, false) }
-    fn mark_direct_request_projected(&self, id: &str) -> Result<(), MLSError> { self.mark_request_projected(id) }
-    fn read_direct_request_intent(&self, id: &str) -> Result<Option<Vec<u8>>, MLSError> { self.request_value("intent", id) }
-    fn compare_exchange_direct_request_intent(&self, id: &str, old: Option<&[u8]>, next: &[u8]) -> Result<bool, MLSError> { self.request_value_cas("intent", id, old, next) }
-    fn list_direct_request_intents(&self) -> Result<Vec<Vec<u8>>, MLSError> { self.request_values("intent") }
-    fn read_direct_request_projection(&self, id: &str) -> Result<Option<Vec<u8>>, MLSError> { self.request_value("projection", id) }
-    fn compare_exchange_direct_request_projection(&self, id: &str, old: Option<&[u8]>, next: &[u8]) -> Result<bool, MLSError> { self.request_value_cas("projection", id, old, next) }
-    fn list_direct_request_projections(&self) -> Result<Vec<Vec<u8>>, MLSError> { self.request_values("projection") }
+    fn process_direct_request_welcome(
+        &self,
+        input: &catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestWelcomeInput,
+    ) -> Result<WelcomeResult, MLSError> {
+        self.import_request_welcome(input)
+    }
+    fn decrypt_direct_request_introduction(
+        &self,
+        input: &catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestWelcomeInput,
+    ) -> Result<
+        catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestIntroductionResult,
+        MLSError,
+    > {
+        self.decrypt_request_intro(input)
+    }
+    fn read_direct_request_key_publication(
+        &self,
+        device: &str,
+    ) -> Result<Option<Vec<u8>>, MLSError> {
+        self.request_value("keys", device)
+    }
+    fn prepare_direct_request_key_publication(
+        &self,
+        input: &catbird_mls::orchestrator::direct_request_keys::DirectRequestKeyPublicationInput,
+        expected: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, MLSError> {
+        self.prepare_request_keys(input, expected)
+    }
+    fn acknowledge_direct_request_key_publication(
+        &self,
+        device: &str,
+        expected: &[u8],
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.acknowledge_request_keys(device, expected, next)
+    }
+    fn commit_closed_direct_request_projection(
+        &self,
+        cid: &str,
+        expected: &[u8],
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.close_request_projection(cid, expected, next)
+    }
+    fn persist_direct_request_publish(&self, id: &str, bytes: &[u8]) -> Result<(), MLSError> {
+        self.persist_request_publish(id, bytes)
+    }
+    fn confirm_published_bootstrap(
+        &self,
+        id: &str,
+        receipt: &[u8],
+        key: &[u8],
+    ) -> Result<DirectRequestJournal, MLSError> {
+        self.resolve_request_journal(id, receipt, key, true)
+    }
+    fn abandon_rejected_bootstrap(
+        &self,
+        id: &str,
+        receipt: &[u8],
+        key: &[u8],
+    ) -> Result<DirectRequestJournal, MLSError> {
+        self.resolve_request_journal(id, receipt, key, false)
+    }
+    fn mark_direct_request_projected(&self, id: &str) -> Result<(), MLSError> {
+        self.mark_request_projected(id)
+    }
+    fn read_direct_request_intent(&self, id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        self.request_value("intent", id)
+    }
+    fn compare_exchange_direct_request_intent(
+        &self,
+        id: &str,
+        old: Option<&[u8]>,
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.request_value_cas("intent", id, old, next)
+    }
+    fn list_direct_request_intents(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        self.request_values("intent")
+    }
+    fn read_direct_request_projection(&self, id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        self.request_value("projection", id)
+    }
+    fn compare_exchange_direct_request_projection(
+        &self,
+        id: &str,
+        old: Option<&[u8]>,
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.request_value_cas("projection", id, old, next)
+    }
+    fn list_direct_request_projections(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        self.request_values("projection")
+    }
 
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError> {
         WasmMLSContext::create_key_package(self, identity)
@@ -1582,6 +1820,15 @@ impl MlsCryptoContext for WasmMLSContext {
         signer_identity: Vec<u8>,
     ) -> Result<Vec<u8>, MLSError> {
         WasmMLSContext::export_group_info(self, group_id, signer_identity)
+    }
+    fn encrypt_message_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+        expected_epoch: u64,
+    ) -> Result<EncryptResult, MLSError> {
+        self.encrypt_canonical_message(group_id, plaintext, aad, expected_epoch)
     }
     fn encrypt_message(
         &self,

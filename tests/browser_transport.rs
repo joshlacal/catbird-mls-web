@@ -14,7 +14,6 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 const SIGNING_DOMAIN_VECTORS: &str = include_str!("fixtures/mls_chat_signing_domain_vectors.json");
 const CONTRACT_VECTORS: &str = include_str!("fixtures/mls_chat_contract_vectors.json");
-const CONTROL_FIXTURE: &str = include_str!("fixtures/mls_chat_control_fingerprint_source.json");
 
 fn fixture_json(source: &str) -> serde_json::Value {
     serde_json::from_str(source).expect("fixture is valid JSON")
@@ -63,7 +62,6 @@ fn signing_domain_operation(body_name: &str) -> &'static str {
     match body_name {
         "deviceEnrollmentBody" => "enrollDevice",
         "keyPackageReplenishmentBody" => "replenishKeyPackages",
-        "deviceAuthenticationRebindBody" => "rebindDeviceAuthentication",
         "deviceRevocationBody" => "revokeDevice",
         "blobUploadPreparationBody" => "prepareBlobUpload",
         "applicationSendBody" => "sendMessage",
@@ -85,29 +83,17 @@ fn signing_domain_binding(
     } else {
         "actorDeviceId"
     };
-    let dpop_jkt = match operation {
-        "enrollDevice" | "replenishKeyPackages" => body["dpopJkt"]
-            .as_str()
-            .expect("signed-domain dpopJkt")
-            .to_owned(),
-        "rebindDeviceAuthentication" => body["newDpopJkt"]
-            .as_str()
-            .expect("signed-domain newDpopJkt")
-            .to_owned(),
-        _ => "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-    };
-    let auth_generation = match operation {
-        "enrollDevice" => None,
-        "rebindDeviceAuthentication" => Some(
-            body["expectedAuthGeneration"]
-                .as_i64()
-                .expect("signed-domain expected auth generation"),
-        ),
-        _ => Some(
+    // The retained bridge argument is not part of the current enrollment or
+    // replenishment transcript. Device authorization uses authGeneration/keyId.
+    let dpop_jkt = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
+    let auth_generation = if operation == "enrollDevice" {
+        None
+    } else {
+        Some(
             body["authGeneration"]
                 .as_i64()
                 .expect("signed-domain auth generation"),
-        ),
+        )
     };
     (
         body["actorDid"].as_str().expect("actor DID").to_owned(),
@@ -305,10 +291,10 @@ async fn strict_projection_rejects_out_of_bounds_before_signing() {
 // ---------------------------------------------------------------------------
 
 #[wasm_bindgen_test]
-async fn signed_wrapper_bytes_match_approved_fixture_all_eleven_domains() {
+async fn signed_wrapper_bytes_match_approved_fixture_all_ten_domains() {
     let fixture = fixture_json(SIGNING_DOMAIN_VECTORS);
     let cases = fixture["cases"].as_array().expect("signing-domain cases");
-    assert_eq!(cases.len(), 11);
+    assert_eq!(cases.len(), 10);
 
     for case in cases {
         let body_name = case["bodyName"].as_str().expect("body name");
@@ -404,74 +390,32 @@ async fn signed_wrapper_bytes_match_approved_blob_fixture() {
 }
 
 // ---------------------------------------------------------------------------
-// RED test (finding 2): rebind binds the stored-key / current-new-JKT fields
-// exactly as the approved Rust rebind vector does.
+// Retired authentication-rebind operations fail before invoking a signer.
 // ---------------------------------------------------------------------------
 
 #[wasm_bindgen_test]
-async fn rebind_binds_stored_key_and_current_new_jkt() {
-    let fixture = fixture_json(SIGNING_DOMAIN_VECTORS);
-    let case = fixture["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|case| case["bodyName"] == "deviceAuthenticationRebindBody")
-        .expect("rebind fixture");
-
-    // Correct binding: newDpopJkt must equal the binding JKT, and
-    // expectedAuthGeneration must equal the binding generation.
-    let (actor_did, device_id, dpop_jkt, auth_generation) =
-        signing_domain_binding(&case["body"], "rebindDeviceAuthentication");
-    install_fixture_signer(
-        case["publicKeyHex"].as_str().unwrap(),
-        case["signatureHex"].as_str().unwrap(),
-        &actor_did,
-        &device_id,
-        &dpop_jkt,
-        auth_generation,
-    );
-
-    let request = serde_json::json!({ "signedRequest": { "body": case["body"] } });
-    let prepared = catbird_mls_web::catbird_mls_prepare_signed_request(
-        "rebindDeviceAuthentication".to_owned(),
-        request.to_string(),
+async fn retired_authentication_rebind_is_rejected_before_signing() {
+    catbird_mls_web::catbird_mls_set_signer_bridge(
+        Function::new_no_args("throw new Error('retired route invoked signer')"),
+        valid_fake_key(),
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "70707070-7070-4070-b070-707070707070".to_owned(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        Uint8Array::new_with_length(32),
+        Some(1),
     )
-    .await
-    .expect("approved rebind fixture prepares with the correct binding");
-    let wire = prepared_body(prepared);
-    assert_eq!(wire["signedRequest"], case["wrapper"]);
-    assert_eq!(
-        hex::encode(serde_json::to_vec(&wire["signedRequest"]).expect("wrapper serializes")),
-        case["wrapperJsonHex"].as_str().expect("wrapper hex")
-    );
-    catbird_mls_web::catbird_mls_clear_signer_bridge();
-
-    // Wrong binding: binding the CURRENT JKT instead of the NEW JKT must fail.
-    let (actor_did, device_id, _, auth_generation) =
-        signing_domain_binding(&case["body"], "rebindDeviceAuthentication");
-    let wrong_dpop_jkt = case["body"]["currentDpopJkt"]
-        .as_str()
-        .expect("currentDpopJkt")
-        .to_owned();
-    install_fixture_signer(
-        case["publicKeyHex"].as_str().unwrap(),
-        case["signatureHex"].as_str().unwrap(),
-        &actor_did,
-        &device_id,
-        &wrong_dpop_jkt,
-        auth_generation,
-    );
-    let request = serde_json::json!({ "signedRequest": { "body": case["body"] } });
+    .unwrap();
     let error = catbird_mls_web::catbird_mls_prepare_signed_request(
         "rebindDeviceAuthentication".to_owned(),
-        request.to_string(),
+        "{}".to_owned(),
     )
     .await
-    .expect_err("rebind with the current JKT as the binding must be rejected");
-    assert!(
-        error.as_string().unwrap_or_default().contains("DPoP JKT"),
-        "wrong rebind JKT binding must fail closed"
-    );
+    .expect_err("retired operation must not prepare");
+    assert!(error
+        .as_string()
+        .unwrap_or_default()
+        .contains("unsupported"));
+    catbird_mls_web::catbird_mls_clear_signer_bridge();
 }
 
 // ---------------------------------------------------------------------------
@@ -480,7 +424,7 @@ async fn rebind_binds_stored_key_and_current_new_jkt() {
 
 #[wasm_bindgen_test]
 fn unsigned_get_rejects_unknown_query_keys() {
-    let request = r#"{"limit":25,"pageCursor":"opaque","bogus":"x"}"#;
+    let request = r#"{"actorDeviceId":"70707070-7070-4070-b070-707070707070","limit":25,"pageCursor":"opaque","bogus":"x"}"#;
     let error = catbird_mls_web::catbird_mls_prepare_unsigned_request(
         "getConversations".to_owned(),
         request.to_owned(),
@@ -497,7 +441,7 @@ fn unsigned_get_rejects_unknown_query_keys() {
 fn unsigned_get_forwards_only_whitelisted_keys() {
     let prepared = catbird_mls_web::catbird_mls_prepare_unsigned_request(
         "getConversations".to_owned(),
-        r#"{"limit":25,"pageCursor":"opaque"}"#.to_owned(),
+        r#"{"actorDeviceId":"70707070-7070-4070-b070-707070707070","limit":25,"pageCursor":"opaque","supportedProtocolVersions":["1","2"]}"#.to_owned(),
     )
     .expect("known query keys prepare");
     let path: String = js_sys::Reflect::get(&prepared, &"path".into())
@@ -506,7 +450,7 @@ fn unsigned_get_forwards_only_whitelisted_keys() {
         .expect("path is a string");
     assert_eq!(
         path,
-        "/xrpc/blue.catbird.chat.getConversations?limit=25&pageCursor=opaque"
+        "/xrpc/blue.catbird.chat.getConversations?actorDeviceId=70707070-7070-4070-b070-707070707070&limit=25&pageCursor=opaque&supportedProtocolVersions=1&supportedProtocolVersions=2"
     );
 }
 

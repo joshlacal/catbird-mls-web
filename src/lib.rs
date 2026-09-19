@@ -30,13 +30,13 @@
 // check without compiling browser-only OPFS SQLite or native Opus support.
 
 mod api_client;
-mod browser_transport;
-mod credentials;
 mod browser_enrollment;
 mod browser_inventory;
 mod browser_subscription;
-mod request_runtime;
+mod browser_transport;
+mod credentials;
 pub mod mls_storage;
+mod request_runtime;
 pub mod sqlite_conn;
 mod storage;
 mod strict_projection;
@@ -58,7 +58,6 @@ use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
 use catbird_mls::orchestrator::api_client::MLSAPIClient;
 use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator::storage::MLSStorageBackend;
-use catbird_mls::MLSError;
 use credentials::SqliteCredentialStore;
 use storage::WasmStorageBackend;
 use wasm_mls_context::WasmMLSContext;
@@ -444,7 +443,15 @@ fn image_attachment_from_message(
 
 fn ui_message_from_orchestrator(message: catbird_mls::orchestrator::types::Message) -> Message {
     let image = image_attachment_from_message(&message);
-    let group_invitation=message.payload().and_then(|p|p.checked_group_invitation().ok().flatten()).filter(|r|r.invited_by_did==catbird_mls::orchestrator::credential_binding::credential_root_did(&message.sender_did));
+    let group_invitation = message
+        .payload()
+        .and_then(|p| p.checked_group_invitation().ok().flatten())
+        .filter(|r| {
+            r.invited_by_did
+                == catbird_mls::orchestrator::credential_binding::credential_root_did(
+                    &message.sender_did,
+                )
+        });
     let message_type = if image.is_some() {
         "image".to_string()
     } else {
@@ -667,14 +674,18 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
 
     // The host releases the key from its protected persistent vault. Missing
     // custody fails before opening a database or creating any MLS identity.
-    let db_key = cfg.mls_db_key.clone().filter(|key|key.len()==64 && key.bytes().all(|b|b.is_ascii_hexdigit()))
-        .ok_or_else(||js_err!("Protected database key is required"))?;
+    let db_key = cfg
+        .mls_db_key
+        .clone()
+        .filter(|key| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| js_err!("Protected database key is required"))?;
 
     // Open ONE shared encrypted SQLite database for OpenMLS state,
     // conversations/messages, and credentials. Previously each used a separate
     // IndexedDB — credentials leaked signing keys and MLS DID in plaintext, and
     // conversation storage had no encryption at the IDB layer.
-    sqlite_conn::SqliteConn::initialize_opfs().await
+    sqlite_conn::SqliteConn::initialize_opfs()
+        .await
         .map_err(|error| js_err!("Persistent encrypted storage unavailable: {}", error))?;
     let sqlite_db_name = format!("{}-app.db", cfg.db_prefix);
     let shared_conn = match sqlite_conn::SqliteConn::open(&sqlite_db_name, &db_key) {
@@ -702,8 +713,10 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
     let storage = WasmStorageBackend::new(Rc::clone(&shared_conn));
     let credentials = SqliteCredentialStore::new(Rc::clone(&shared_conn));
 
-    let mls_context = Some(Arc::new(WasmMLSContext::open_with_conn(Rc::clone(&shared_conn))
-        .map_err(|e|js_err!("Protected MLS custody validation failed: {e}"))?));
+    let mls_context = Some(Arc::new(
+        WasmMLSContext::open_with_conn(Rc::clone(&shared_conn))
+            .map_err(|e| js_err!("Protected MLS custody validation failed: {e}"))?,
+    ));
 
     // Reload persisted MLS groups into the in-memory cache so they survive
     // page refreshes. Group IDs in the `group_states` SQLite table are the
@@ -761,12 +774,22 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
         }
     }
 
-    let storage=Arc::new(storage);
-    let credentials=Arc::new(credentials);
-    let request_engine = if let Some(ctx)=mls_context.as_ref() {
-        credentials.attach_runtime(Arc::clone(ctx), Arc::clone(&api_client)).map_err(|e|js_err!("{e}"))?;
-        Some(Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(Arc::clone(ctx),Arc::clone(&storage),Arc::clone(&api_client),Arc::clone(&credentials),Default::default())))
-    } else {None};
+    let storage = Arc::new(storage);
+    let credentials = Arc::new(credentials);
+    let request_engine = if let Some(ctx) = mls_context.as_ref() {
+        credentials
+            .attach_runtime(Arc::clone(ctx), Arc::clone(&api_client))
+            .map_err(|e| js_err!("{e}"))?;
+        Some(Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+            Arc::clone(ctx),
+            Arc::clone(&storage),
+            Arc::clone(&api_client),
+            Arc::clone(&credentials),
+            Default::default(),
+        )))
+    } else {
+        None
+    };
     let state = AppState {
         base_url: cfg.base_url,
         storage_prefix: cfg.storage_prefix,
@@ -808,7 +831,12 @@ pub fn catbird_mls_ping() -> String {
 #[wasm_bindgen]
 pub fn catbird_mls_set_auth(did: String, token: String) -> Result<(), JsValue> {
     with_state_mut(|state| {
-        state.mls_context.as_ref().ok_or_else(||js_err!("Protected crypto unavailable"))?.bind_request_owner(&did).map_err(|e|js_err!("{e}"))?;
+        state
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("Protected crypto unavailable"))?
+            .bind_request_owner(&did)
+            .map_err(|e| js_err!("{e}"))?;
         state.request_ready = false;
         state.api_client.set_auth(did.clone(), token.clone());
         save_session(&state.storage_prefix, &did, &token)?;
@@ -841,7 +869,10 @@ pub fn catbird_mls_try_restore_session() -> Result<bool, JsValue> {
     let storage_prefix = with_state(|s| Ok(s.storage_prefix.clone()))?;
 
     match load_session(&storage_prefix) {
-        Some((did, token)) => { catbird_mls_set_auth(did, token)?; Ok(true) },
+        Some((did, token)) => {
+            catbird_mls_set_auth(did, token)?;
+            Ok(true)
+        }
         None => Ok(false),
     }
 }
@@ -891,253 +922,14 @@ pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
 /// Returns a JSON object with `status` and `epoch`.
 #[wasm_bindgen]
 pub async fn catbird_mls_join_group(convo_id: String) -> Result<JsValue, JsValue> {
-    let result = try_join_group_internal(&convo_id).await?;
-    to_js(&result)
-}
-
-/// Internal join helper — returns a JSON value, reusable from auto-join paths.
-async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, JsValue> {
-    request_runtime::require_ordinary_access(convo_id).await?;
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-    use catbird_mls::orchestrator::storage::MLSStorageBackend;
-
-    let (resolved_convo_id, _) = resolve_conversation_identity(convo_id)?;
-
-    let (api_client, storage, user_did) = with_state(|s| {
-        let did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), did))
-    })?;
-
-    let identity_bytes = user_did.as_bytes().to_vec();
-
-    // 1. Try Welcome first
-    match api_client.get_welcome(&resolved_convo_id).await {
-        Ok(welcome_bytes) => {
-            let join_result = with_state(|s| {
-                let ctx = s
-                    .mls_context
-                    .as_ref()
-                    .ok_or_else(|| js_err!("MLS context not initialized"))?;
-                ctx.process_welcome(welcome_bytes, identity_bytes.clone(), None)
-                    .map_err(|e| js_err!("process_welcome failed: {:?}", e))
-            });
-
-            match join_result {
-                Ok(jr) => {
-                    // Cache the local MLS epoch so send_message uses it
-                    let welcome_epoch = with_state(|s| {
-                        Ok(s.mls_context
-                            .as_ref()
-                            .and_then(|ctx| ctx.get_epoch(jr.group_id.clone()).ok())
-                            .unwrap_or(0))
-                    })
-                    .unwrap_or(0);
-                    SERVER_EPOCHS.with(|m| {
-                        m.borrow_mut()
-                            .insert(resolved_convo_id.clone(), welcome_epoch)
-                    });
-
-                    // MLS metadata cutover: bootstrap encrypted metadata so
-                    // the conversation list / header render the title +
-                    // description + avatar without waiting for a UI nudge.
-                    // Best-effort — never block the join path on this.
-                    let group_id_hex_for_bootstrap = jr
-                        .group_id
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>();
-                    let members =
-                        match fetch_roster_for_convo(&api_client, &resolved_convo_id).await {
-                            Ok(roster) if !roster.is_empty() => roster,
-                            Ok(_) | Err(_) => storage
-                                .get_group_state(&group_id_hex_for_bootstrap)
-                                .await
-                                .ok()
-                                .flatten()
-                                .map(|state| member_views_from_dids(state.members, &user_did))
-                                .unwrap_or_else(|| {
-                                    member_views_from_dids(vec![user_did.clone()], &user_did)
-                                }),
-                        };
-                    persist_join_projection(
-                        &storage,
-                        &user_did,
-                        &resolved_convo_id,
-                        &group_id_hex_for_bootstrap,
-                        welcome_epoch,
-                        members,
-                    )
-                    .await?;
-                    if let Err(e) = wasm_bootstrap_group_metadata(group_id_hex_for_bootstrap).await
-                    {
-                        web_sys::console::warn_1(&JsValue::from_str(&format!(
-                            "[bootstrap] post-Welcome bootstrap failed (non-fatal): {:?}",
-                            e
-                        )));
-                    }
-
-                    return Ok(serde_json::json!({
-                        "status": "joined_via_welcome",
-                        "groupId": jr.group_id.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-                        "epoch": welcome_epoch,
-                    }));
-                }
-                Err(e) => {
-                    // Welcome was for a different device's key package — fall through
-                    web_sys::console::warn_1(&js_err!(
-                        "catbird-mls-web: process_welcome failed ({:?}), trying external commit",
-                        e
-                    ));
-                }
-            }
-        }
-        Err(_) => {
-            // Welcome not available — fall through to external commit
-        }
-    }
-
-    // 2. External commit fallback
-    let group_info_bytes = api_client
-        .get_group_info(&resolved_convo_id)
+    canonical_uuid_string(&convo_id, "conversation ID").map_err(|e| js_err!("{e}"))?;
+    let (owner, runtime) = request_runtime::current_engine()?;
+    let epoch = runtime
+        .join_or_rejoin(&convo_id)
         .await
-        .map_err(|e| js_err!("get_group_info failed: {:?}", e))?;
-
-    let identity_for_gi = identity_bytes.clone();
-    let ext_commit = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.create_external_commit(group_info_bytes, identity_bytes)
-            .map_err(|e| js_err!("create_external_commit failed: {:?}", e))
-    })?;
-
-    // 3. Send external commit to server
-    let input = serde_json::json!({
-        "action": "externalCommit",
-        "convoId": resolved_convo_id.clone(),
-        "commit": { "$bytes": B64.encode(&ext_commit.commit_data) },
-        "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-    });
-    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation:
-            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
-        method: "POST".to_string(),
-        path: "/xrpc/blue.catbird.chat.submitTransition".to_string(),
-        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
-    };
-    let response = api_client
-        .submit_prepared_request(req)
-        .await
-        .map_err(|e| js_err!("process_external_commit failed: {:?}", e))?;
-    if response.status != 200 {
-        return Err(js_err!(
-            "process_external_commit failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
-    }
-    let output: serde_json::Value =
-        serde_json::from_slice(&response.body).map_err(|e| js_err!("JSON decode: {:?}", e))?;
-    let server_epoch = output.get("newEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
-
-    // 4. Merge pending commit to finalize local state
-    let local_epoch = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.merge_pending_commit(ext_commit.group_id.clone())
-            .map_err(|e| js_err!("merge_pending_commit failed: {:?}", e))
-    })?;
-
-    // Cache server epoch so send_message uses it instead of local MLS epoch
-    SERVER_EPOCHS.with(|m| {
-        m.borrow_mut()
-            .insert(resolved_convo_id.clone(), server_epoch)
-    });
-
-    let group_id_hex = ext_commit
-        .group_id
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>();
-    let members = match fetch_roster_for_convo(&api_client, &resolved_convo_id).await {
-        Ok(roster) if !roster.is_empty() => roster,
-        Ok(_) | Err(_) => storage
-            .get_group_state(&group_id_hex)
-            .await
-            .ok()
-            .flatten()
-            .map(|state| member_views_from_dids(state.members, &user_did))
-            .unwrap_or_else(|| member_views_from_dids(vec![user_did.clone()], &user_did)),
-    };
-    persist_join_projection(
-        &storage,
-        &user_did,
-        &resolved_convo_id,
-        &group_id_hex,
-        server_epoch.max(local_epoch),
-        members,
-    )
-    .await?;
-
-    // Publish updated GroupInfo so other clients can also external-commit join
-    let publish_result = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.export_group_info(ext_commit.group_id.clone(), identity_for_gi)
-            .map_err(|e| js_err!("export_group_info failed: {:?}", e))
-    });
-    match publish_result {
-        Ok(gi_bytes) => {
-            if let Err(e) = api_client
-                .publish_group_info(&resolved_convo_id, &gi_bytes)
-                .await
-            {
-                web_sys::console::warn_1(&js_err!(
-                    "catbird-mls-web: publish_group_info failed after join: {:?}",
-                    e
-                ));
-            }
-        }
-        Err(e) => {
-            web_sys::console::warn_1(&js_err!(
-                "catbird-mls-web: export_group_info failed after join: {:?}",
-                e
-            ));
-        }
-    }
-
-    web_sys::console::log_1(&js_err!(
-        "catbird-mls-web: try_join_group — server_epoch={}, local_epoch={}",
-        server_epoch,
-        local_epoch
-    ));
-    // MLS metadata cutover: bootstrap encrypted metadata after external
-    // commit so the just-joined conversation displays title/description
-    // /avatar immediately. Best-effort — never block the join path.
-    let group_id_hex_for_bootstrap = ext_commit
-        .group_id
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>();
-    if let Err(e) = wasm_bootstrap_group_metadata(group_id_hex_for_bootstrap).await {
-        web_sys::console::warn_1(&JsValue::from_str(&format!(
-            "[bootstrap] post-ExternalCommit bootstrap failed (non-fatal): {:?}",
-            e
-        )));
-    }
-
-    Ok(serde_json::json!({
-        "status": "joined_via_external_commit",
-        "epoch": server_epoch,
-    }))
+        .map_err(|e| js_err!("{e}"))?;
+    request_runtime::current(&owner, &runtime)?;
+    to_js(&serde_json::json!({"status":"joined", "epoch":epoch}))
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,24 +1108,85 @@ fn validate_existing_direct_view(
 pub async fn catbird_mls_list_conversations() -> Result<JsValue, JsValue> {
     let (owner, runtime) = request_runtime::current_engine()?;
     request_runtime::synchronize(&owner, &runtime, true).await?;
-    let views = runtime.conversations().lock().await.values().cloned().collect::<Vec<_>>();
+    let views = runtime
+        .conversations()
+        .lock()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
     let storage = with_state(|s| Ok(s.storage.clone()))?;
-    let requests = runtime.list_direct_request_views().await.map_err(|e| js_err!("{}", e))?;
+    let requests = runtime
+        .list_direct_request_views()
+        .await
+        .map_err(|e| js_err!("{}", e))?;
     request_runtime::current(&owner, &runtime)?;
     let mut conversations = Vec::new();
     for view in views {
-        if matches!(storage.get_conversation_state(&view.conversation_id).await.map_err(|e| js_err!("{}",e))?, Some(catbird_mls::orchestrator::types::ConversationState::Closed | catbird_mls::orchestrator::types::ConversationState::DeviceRemoved)) { continue; }
+        if matches!(
+            storage
+                .get_conversation_state(&view.conversation_id)
+                .await
+                .map_err(|e| js_err!("{}", e))?,
+            Some(
+                catbird_mls::orchestrator::types::ConversationState::Closed
+                    | catbird_mls::orchestrator::types::ConversationState::DeviceRemoved
+            )
+        ) {
+            continue;
+        }
         // Request rows live in the request workspace until consent is verified.
         // A missing local request projection never authorizes normal chat UI.
-        if view.canonical_state.as_ref().is_some_and(|s|s.direct_request.is_some()) &&
-            !requests.iter().any(|r| r.conversation_id==view.conversation_id && r.consent==catbird_mls::orchestrator::RequestConsent::Accepted) { continue; }
-        let group_id=decode_group_coordinate(&view.group_id).map(hex::encode).ok_or_else(||js_err!("Invalid protected group coordinate"))?;
-        let members=view.members.iter().map(|m|m.did.clone()).collect::<Vec<_>>();
-        let title=storage.get_metadata_text(&group_id).map_err(|e|js_err!("{}",e))?.and_then(|(title,_)|title).filter(|t|!t.is_empty()).unwrap_or_else(||members.join(", "));
-        let kind=storage.conversation_kind(&owner,&view.conversation_id).map_err(|e|js_err!("{}",e))?.unwrap_or_else(||if conversation_is_group(&view.members){"group"}else{"direct"}.into());
-        conversations.push(Conversation{id:view.conversation_id,group_id,display_name:title,members,member_views:Some(view.members),is_group:kind=="group",conversation_kind:kind,last_message:None,last_message_at:None,unread_count:0});
+        if view
+            .canonical_state
+            .as_ref()
+            .is_some_and(|s| s.direct_request.is_some())
+            && !requests.iter().any(|r| {
+                r.conversation_id == view.conversation_id
+                    && r.consent == catbird_mls::orchestrator::RequestConsent::Accepted
+            })
+        {
+            continue;
+        }
+        let group_id = decode_group_coordinate(&view.group_id)
+            .map(hex::encode)
+            .ok_or_else(|| js_err!("Invalid protected group coordinate"))?;
+        let members = view
+            .members
+            .iter()
+            .map(|m| m.did.clone())
+            .collect::<Vec<_>>();
+        let title = storage
+            .get_metadata_text(&group_id)
+            .map_err(|e| js_err!("{}", e))?
+            .and_then(|(title, _)| title)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| members.join(", "));
+        let kind = storage
+            .conversation_kind(&owner, &view.conversation_id)
+            .map_err(|e| js_err!("{}", e))?
+            .unwrap_or_else(|| {
+                if conversation_is_group(&view.members) {
+                    "group"
+                } else {
+                    "direct"
+                }
+                .into()
+            });
+        conversations.push(Conversation {
+            id: view.conversation_id,
+            group_id,
+            display_name: title,
+            members,
+            member_views: Some(view.members),
+            is_group: kind == "group",
+            conversation_kind: kind,
+            last_message: None,
+            last_message_at: None,
+            unread_count: 0,
+        });
     }
-    request_runtime::current(&owner,&runtime)?;
+    request_runtime::current(&owner, &runtime)?;
     to_js(&conversations)
 }
 
@@ -1342,403 +1195,40 @@ pub async fn catbird_mls_create_conversation(
     name: String,
     member_dids: Array,
 ) -> Result<JsValue, JsValue> {
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-    use catbird_mls::orchestrator::storage::MLSStorageBackend;
-    use catbird_mls::KeyPackageData;
-
-    let (api_client, storage, user_did) = with_state(|s| {
-        let did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), did))
-    })?;
-
-    let member_dids_vec = array_to_strings(&member_dids);
-    if member_dids_vec.len()==1{return Err(js_err!("Direct conversations require a local draft and an encrypted first message"));}
-    if member_dids_vec.len() > MAX_CONVERSATION_ITEMS
-        || member_dids_vec
-            .iter()
-            .any(|did| did.is_empty() || did == &user_did)
-    {
+    let members = array_to_strings(&member_dids);
+    if members.len() == 1 {
         return Err(js_err!(
-            "conversation invitee list contains an invalid or self DID"
+            "Direct conversations require a local draft and an encrypted first message"
         ));
     }
-    let mut unique_member_dids = std::collections::HashSet::new();
-    if member_dids_vec
-        .iter()
-        .any(|did| !unique_member_dids.insert(did.clone()))
-    {
-        return Err(js_err!("conversation invitee list contains duplicate DIDs"));
-    }
-    let identity_bytes = user_did.as_bytes().to_vec();
-
-    let group_id_bytes = with_state(|s| {
-        let ctx = s.mls_context.as_ref().ok_or_else(|| {
-            js_err!("MLS context not initialized — run catbird_mls_init() inside a Worker")
-        })?;
-        let result = ctx
-            .create_group(identity_bytes.clone(), None)
-            .map_err(|e| js_err!("create_group failed: {:?}", e))?;
-        Ok(result.group_id)
-    })?;
-
-    // Arm cancellation recovery immediately after the speculative MLS group
-    // is created.  Key-package lookup, commit construction, and the network
-    // request can all fail after this point; leaving the intent until after
-    // those steps would strand a group with no replay/cleanup owner.
-    let group_id_str = group_id_bytes
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>();
-    if let Err(error) = storage.mark_cleanup_intent(
-        &user_did,
-        &group_id_str,
-        &group_id_str,
-        "create-speculative",
-    ) {
-        let cleanup_error = with_state(|s| {
-            if let Some(ctx) = s.mls_context.as_ref() {
-                ctx.delete_group(group_id_bytes.clone())
-                    .map_err(|e| js_err!("speculative MLS cleanup failed: {:?}", e))?;
-            }
-            Ok(())
-        })
-        .err();
-        return Err(match cleanup_error {
-            Some(cleanup_error) => js_err!(
-                "cannot arm speculative create cleanup: {}; speculative cleanup failed: {:?}",
-                error,
-                cleanup_error
-            ),
-            None => js_err!("cannot arm speculative create cleanup: {}", error),
-        });
-    }
-
-    let (_commit_bytes, welcome_bytes) = if member_dids_vec.is_empty() {
-        (None, None)
-    } else {
-        let (credentials, user_did) = with_state(|s| {
-            let did = s
-                .user_did
-                .clone()
-                .ok_or_else(|| js_err!("Not authenticated"))?;
-            Ok((Arc::clone(&s.credentials), did))
-        })?;
-        let actor_device_id = credentials
-            .get_device_uuid(&user_did)
-            .await
-            .unwrap_or_default()
-            .unwrap_or_default();
-        let kp_refs = api_client
-            .get_key_packages(&actor_device_id, &member_dids_vec)
-            .await
-            .map_err(|e| js_err!("get_key_packages failed: {:?}", e))?;
-
-        let key_packages: Vec<KeyPackageData> = kp_refs
-            .into_iter()
-            .map(|r| KeyPackageData {
-                data: r.key_package_data,
-            })
-            .collect();
-
-        let add_result = with_state(|s| {
-            let ctx = s
-                .mls_context
-                .as_ref()
-                .ok_or_else(|| js_err!("MLS context not initialized"))?;
-            ctx.add_members(group_id_bytes.clone(), key_packages)
-                .map_err(|e| js_err!("add_members failed: {:?}", e))
-        })?;
-
-        with_state(|s| {
-            let ctx = s
-                .mls_context
-                .as_ref()
-                .ok_or_else(|| js_err!("MLS context not initialized"))?;
-            ctx.merge_pending_commit(group_id_bytes.clone())
-                .map_err(|e| js_err!("merge_pending_commit failed: {:?}", e))
-        })?;
-
-        (Some(add_result.commit_data), Some(add_result.welcome_data))
-    };
-
-    let mut req_body = serde_json::json!({
-        "groupId": group_id_str,
-        "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-        "members": member_dids_vec,
-    });
-    if let Some(welcome) = &welcome_bytes {
-        req_body["welcomeMessage"] = serde_json::json!({ "$bytes": B64.encode(welcome) });
-    }
-    let create_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation:
-            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CreateConversation,
-        method: "POST".to_string(),
-        path: "/xrpc/blue.catbird.chat.createConversation".to_string(),
-        body: Some(serde_json::to_vec(&req_body).map_err(|e| js_err!("JSON error: {:?}", e))?),
-    };
-    let resp = api_client
-        .submit_prepared_request(create_req)
+    let (owner, runtime) = request_runtime::current_engine()?;
+    let view = runtime
+        .create_group(&name, Some(&members), None)
         .await
-        .map_err(|e| js_err!("create_conversation failed: {:?}", e))?;
-    if resp.status != 200 {
-        return Err(js_err!(
-            "create_conversation failed with status {}: {}",
-            resp.status,
-            String::from_utf8_lossy(&resp.body)
-        ));
-    }
-    let output: serde_json::Value =
-        serde_json::from_slice(&resp.body).map_err(|e| js_err!("JSON decode: {:?}", e))?;
-    let parsed = parse_create_response(&output, &group_id_str)
-        .map_err(|error| js_err!("invalid create conversation result: {}", error))?;
-
-    // The server can report that a direct conversation already exists. The
-    // locally-created MLS group is speculative and must be discarded; return
-    // one projection for the existing stable conversation instead of adding a
-    // second row keyed by the fresh group id.
-    if let ParsedCreateResponse::ExistingDirect {
-        conversation_id: convo_id,
-        group_id: existing_group_id,
-        epoch: server_epoch,
-    } = parsed.clone()
-    {
-        with_state(|s| {
-            if let Some(ctx) = s.mls_context.as_ref() {
-                ctx.delete_group(group_id_bytes.clone())
-                    .map_err(|e| js_err!("existing direct MLS group cleanup failed: {:?}", e))?;
-            }
-            Ok(())
-        })?;
-        storage
-            .delete_group_state(&group_id_str)
-            .await
-            .map_err(|e| js_err!("existing direct group cleanup failed: {:?}", e))?;
-        storage
-            .delete_conversation_by_group(&user_did, &group_id_str)
-            .map_err(|e| js_err!("existing direct conversation cleanup failed: {}", e))?;
-        storage
-            .clear_cleanup_intent(&user_did, &group_id_str)
-            .map_err(|e| js_err!("existing direct cleanup intent clear failed: {}", e))?;
-
-        let mut existing_view = storage
-            .get_conversation(&user_did, &convo_id)
-            .await
-            .map_err(|e| js_err!("existing conversation lookup failed: {:?}", e))?;
-        // A legacy local projection may have a group and member DIDs but no
-        // persisted roles/creator, so treat any failed final-view validation
-        // as incomplete and fetch the authoritative server projection.
-        let local_view_incomplete = existing_view.as_ref().is_some_and(|view| {
-            validate_existing_direct_view(view, &convo_id, &existing_group_id).is_err()
-        });
-        if existing_view.is_none() || local_view_incomplete {
-            // A race loser may have no local projection (fresh browser,
-            // cleared storage, or a reset during create). Fetch the
-            // authoritative server view instead of fabricating one from the
-            // speculative request.
-            let mut cursor = None;
-            let mut seen_cursors = std::collections::HashSet::new();
-            let mut page_count = 0usize;
-            loop {
-                page_count = page_count.saturating_add(1);
-                if page_count > MAX_CONVERSATION_PAGES {
-                    return Err(js_err!(
-                        "existing direct authoritative lookup exceeded the page ceiling"
-                    ));
-                }
-                let page = api_client
-                    .get_conversations(50, cursor.as_deref())
-                    .await
-                    .map_err(|e| js_err!("existing direct authoritative lookup failed: {:?}", e))?;
-                if page.conversations.len() > 50 {
-                    return Err(js_err!(
-                        "existing direct authoritative lookup exceeded the item ceiling"
-                    ));
-                }
-                if let Some(found) = page
-                    .conversations
-                    .into_iter()
-                    .find(|view| view.conversation_id == convo_id)
-                {
-                    existing_view = Some(found);
-                    break;
-                }
-                let Some(next) = page.cursor else { break };
-                if !seen_cursors.insert(next.clone()) {
-                    return Err(js_err!(
-                        "existing direct conversation pagination repeated cursor"
-                    ));
-                }
-                cursor = Some(next);
-            }
-        }
-        if local_view_incomplete
-            && existing_view
-                .as_ref()
-                .is_some_and(|view| view.group_id.is_empty() || view.members.is_empty())
-        {
-            return Err(js_err!(
-                "existingDirectConversationResult authoritative conversation {} is incomplete",
-                convo_id
-            ));
-        }
-        let existing_view = existing_view.ok_or_else(|| {
-            js_err!(
-                "existingDirectConversationResult authoritative conversation {} was not found",
-                convo_id
-            )
-        })?;
-        validate_existing_direct_view(&existing_view, &convo_id, &existing_group_id)
-            .map_err(|error| js_err!("invalid existing direct authoritative view: {}", error))?;
-        let members = existing_view
-            .members
-            .iter()
-            .map(|member| member.did.clone())
-            .collect::<Vec<_>>();
-        let epoch = if server_epoch > 0 {
-            server_epoch
-        } else {
-            existing_view.epoch
-        };
-        storage
-            .upsert_conversation_projection(
-                &user_did,
-                &convo_id,
-                &existing_group_id,
-                epoch,
-                &existing_view.members,
-                None,
-                None,
-            )
-            .map_err(|e| js_err!("persist existing direct projection failed: {}", e))?;
-
-        let display_name = storage
-            .get_metadata_text(&existing_group_id)
-            .map_err(|e| js_err!("existing direct metadata lookup failed: {}", e))?
-            .and_then(|(title, _)| title)
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| {
-                if members.is_empty() {
-                    name.clone()
-                } else {
-                    members.join(", ")
-                }
-            });
-        SERVER_EPOCHS.with(|cache| cache.borrow_mut().insert(convo_id.clone(), epoch));
-        return to_js(&Conversation {
-            id: convo_id,
-            group_id: existing_group_id,
-            display_name,
-            members: members.clone(),
-            member_views: Some(existing_view.members.clone()),
-            conversation_kind: "direct".to_string(),
-            last_message: None,
-            last_message_at: None,
-            unread_count: 0,
-            is_group: members.len() != 2,
-        });
-    }
-
-    let ParsedCreateResponse::Created {
-        conversation_id: convo_id,
-        group_id: current_group_id,
-        epoch: server_epoch,
-    } = parsed
-    else {
-        unreachable!("existing direct result returned above")
-    };
-
-    let create_member_views: Vec<catbird_mls::orchestrator::types::MemberView> =
-        std::iter::once(catbird_mls::orchestrator::types::MemberView {
-            did: user_did.clone(),
-            role: catbird_mls::orchestrator::types::MemberRole::Admin,
-        })
-        .chain(member_dids_vec.iter().cloned().map(|did| {
-            catbird_mls::orchestrator::types::MemberView {
-                did,
-                role: catbird_mls::orchestrator::types::MemberRole::Member,
-            }
-        }))
-        .collect();
-    let create_member_dids: Vec<String> = create_member_views
-        .iter()
-        .map(|member| member.did.clone())
-        .collect();
-    let create_is_group = create_member_dids.len() != 2;
-    let create_epoch = if server_epoch > 0 {
-        server_epoch
-    } else {
-        with_state(|s| {
-            Ok(s.mls_context
-                .as_ref()
-                .and_then(|ctx| ctx.get_epoch(group_id_bytes.clone()).ok())
-                .unwrap_or(0))
-        })
-        .unwrap_or(0)
-    };
-    storage
-        .upsert_conversation_projection(
-            &user_did,
-            &convo_id,
-            &current_group_id,
-            create_epoch,
-            &create_member_views,
-            None,
-            None,
-        )
-        .map_err(|e| js_err!("persist created conversation projection failed: {}", e))?;
-    storage
-        .clear_cleanup_intent(&user_did, &group_id_str)
-        .map_err(|e| js_err!("create cleanup intent clear failed: {}", e))?;
-    SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), create_epoch));
-
-    // Mark as recently created so fetch_new_messages won't try to auto-join
-    // (we're already a member — auto-join would cause unnecessary External Commits)
-    RECENTLY_CREATED.with(|s| s.borrow_mut().insert(convo_id.clone()));
-
-    // Publish GroupInfo so other clients can join via external commit
-    let gi_result = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS not init"))?;
-        ctx.export_group_info(group_id_bytes.clone(), identity_bytes.clone())
-            .map_err(|e| js_err!("export_group_info: {:?}", e))
-    });
-    if let Ok(gi) = gi_result {
-        if let Err(e) = api_client.publish_group_info(&convo_id, &gi).await {
-            web_sys::console::warn_1(&js_err!(
-                "catbird-mls-web: publish_group_info failed after create: {:?}",
-                e
-            ));
-        }
-    }
-
-    let convo = Conversation {
-        id: convo_id.clone(),
-        group_id: current_group_id,
+        .map_err(|e| js_err!("{e}"))?;
+    request_runtime::current(&owner, &runtime)?;
+    to_js(&Conversation {
+        id: view.conversation_id,
+        group_id: view.group_id,
         display_name: name,
-        members: create_member_dids,
-        member_views: Some(create_member_views),
-        conversation_kind: if create_is_group {
-            "group".to_string()
-        } else {
-            "direct".to_string()
-        },
+        members: view.members.iter().map(|m| m.did.clone()).collect(),
+        member_views: Some(view.members),
+        conversation_kind: "group".into(),
         last_message: None,
         last_message_at: None,
         unread_count: 0,
-        is_group: create_is_group,
-    };
-
-    to_js(&convo)
+        is_group: true,
+    })
 }
 
 #[wasm_bindgen]
-pub async fn catbird_mls_subscribe(convo_id:String,on_message:js_sys::Function,on_event:js_sys::Function,on_status:js_sys::Function)->Result<browser_subscription::CanonicalSubscription,JsValue>{
-    browser_subscription::connect(convo_id,on_message,on_event,on_status).await
+pub async fn catbird_mls_subscribe(
+    convo_id: String,
+    on_message: js_sys::Function,
+    on_event: js_sys::Function,
+    on_status: js_sys::Function,
+) -> Result<browser_subscription::CanonicalSubscription, JsValue> {
+    browser_subscription::connect(convo_id, on_message, on_event, on_status).await
 }
 
 #[wasm_bindgen]
@@ -1750,142 +1240,6 @@ pub async fn catbird_mls_unsubscribe(_convo_id: String) -> Result<(), JsValue> {
 // Message commands
 // ---------------------------------------------------------------------------
 
-/// Re-join a group via external commit to sync the local epoch with the server.
-///
-/// Deletes the existing group state first so that `create_external_commit` can
-/// create a fresh one, then merges and sends the external commit.
-///
-/// NOTE: External Commit MUST NOT be triggered automatically from the send /
-/// 409 hot path — that causes epoch inflation (spec §5.3). Callers should
-/// instead call `storage.mark_needs_rejoin(&convo_id)` and surface the error.
-/// This function is retained for explicit user-driven rejoin flows and for the
-/// deferred-recovery worker.
-#[allow(dead_code)]
-async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
-    request_runtime::require_ordinary_access(convo_id).await?;
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-
-    let (resolved_convo_id, resolved_group_id) = resolve_conversation_identity(convo_id)?;
-
-    let (api_client, user_did) = with_state(|s| {
-        let did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), did))
-    })?;
-
-    let identity_bytes = user_did.as_bytes().to_vec();
-
-    // Delete existing group so OpenMLS doesn't complain about duplicate group IDs
-    let group_id_bytes = decode_group_coordinate(&resolved_group_id);
-    if let Some(ref gid) = group_id_bytes {
-        STATE.with(|s| {
-            let borrowed = s.borrow();
-            if let Some(state) = borrowed.as_ref() {
-                if let Some(ctx) = &state.mls_context {
-                    let _ = ctx.delete_group(gid.clone());
-                }
-            }
-        });
-    }
-
-    let group_info_bytes = api_client
-        .get_group_info(&resolved_convo_id)
-        .await
-        .map_err(|e| js_err!("rejoin get_group_info failed: {:?}", e))?;
-
-    let identity_for_gi = identity_bytes.clone();
-    let ext_commit = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.create_external_commit(group_info_bytes, identity_bytes)
-            .map_err(|e| js_err!("rejoin create_external_commit failed: {:?}", e))
-    })?;
-
-    let input = serde_json::json!({
-        "action": "externalCommit",
-        "convoId": resolved_convo_id,
-        "commit": { "$bytes": B64.encode(&ext_commit.commit_data) },
-        "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-    });
-    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation:
-            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
-        method: "POST".to_string(),
-        path: "/xrpc/blue.catbird.chat.submitTransition".to_string(),
-        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
-    };
-    let response = api_client
-        .submit_prepared_request(req)
-        .await
-        .map_err(|e| js_err!("rejoin process_external_commit failed: {:?}", e))?;
-    if response.status != 200 {
-        return Err(js_err!(
-            "rejoin process_external_commit failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
-    }
-    let output: serde_json::Value =
-        serde_json::from_slice(&response.body).map_err(|e| js_err!("JSON decode: {:?}", e))?;
-    let server_epoch = output.get("newEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
-
-    let local_epoch = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.merge_pending_commit(ext_commit.group_id.clone())
-            .map_err(|e| js_err!("rejoin merge_pending_commit failed: {:?}", e))
-    })?;
-
-    SERVER_EPOCHS.with(|m| {
-        m.borrow_mut()
-            .insert(resolved_convo_id.clone(), server_epoch)
-    });
-
-    // Publish updated GroupInfo so other clients can also external-commit join
-    let publish_result = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.export_group_info(ext_commit.group_id.clone(), identity_for_gi)
-            .map_err(|e| js_err!("export_group_info failed: {:?}", e))
-    });
-    match publish_result {
-        Ok(gi_bytes) => {
-            if let Err(e) = api_client
-                .publish_group_info(&resolved_convo_id, &gi_bytes)
-                .await
-            {
-                web_sys::console::warn_1(&js_err!(
-                    "catbird-mls-web: publish_group_info failed after rejoin: {:?}",
-                    e
-                ));
-            }
-        }
-        Err(e) => {
-            web_sys::console::warn_1(&js_err!(
-                "catbird-mls-web: export_group_info failed after rejoin: {:?}",
-                e
-            ));
-        }
-    }
-
-    web_sys::console::log_1(&js_err!(
-        "catbird-mls-web: rejoin_group({}) — server_epoch={}, local_epoch={}",
-        resolved_convo_id,
-        server_epoch,
-        local_epoch
-    ));
-
-    Ok(())
-}
-
 async fn send_payload_message_internal(
     convo_id: String,
     payload: catbird_mls::orchestrator::types::MLSMessagePayload,
@@ -1894,7 +1248,10 @@ async fn send_payload_message_internal(
     let (owner, runtime) = request_runtime::current_engine()?;
     let encoded = String::from_utf8(payload.encode().map_err(|e| js_err!("{e}"))?)
         .map_err(|e| js_err!("{e}"))?;
-    let message = runtime.send_payload_json(&resolved, &encoded).await.map_err(|e| js_err!("{e}"))?;
+    let message = runtime
+        .send_payload_json(&resolved, &encoded)
+        .await
+        .map_err(|e| js_err!("{e}"))?;
     request_runtime::current(&owner, &runtime)?;
     to_js(&ui_message_from_orchestrator(message))
 }
@@ -2020,12 +1377,22 @@ pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue,
     let (resolved, _) = resolve_conversation_identity(&convo_id)?;
     let (owner, runtime) = request_runtime::current_engine()?;
     let previous = SYNC_CURSORS.with(|m| m.borrow().get(&resolved).cloned());
-    let (messages, cursor) = runtime.fetch_messages(&resolved, previous.as_deref(), 50, None, None, None)
-        .await.map_err(|e| js_err!("{e}"))?;
+    let (messages, cursor) = runtime
+        .fetch_messages(&resolved, previous.as_deref(), 50, None, None, None)
+        .await
+        .map_err(|e| js_err!("{e}"))?;
     request_runtime::current(&owner, &runtime)?;
     // The shared engine rejects a failed control/application before this cursor advances.
-    if let Some(cursor) = cursor { SYNC_CURSORS.with(|m| m.borrow_mut().insert(resolved, cursor)); }
-    to_js(&messages.into_iter().filter(|m| m.has_displayable_body()).map(ui_message_from_orchestrator).collect::<Vec<_>>())
+    if let Some(cursor) = cursor {
+        SYNC_CURSORS.with(|m| m.borrow_mut().insert(resolved, cursor));
+    }
+    to_js(
+        &messages
+            .into_iter()
+            .filter(|m| m.has_displayable_body())
+            .map(ui_message_from_orchestrator)
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Build the shared MLS reaction envelope. Reactions are application
@@ -2127,108 +1494,16 @@ pub async fn catbird_mls_add_group_members(
     conversation_id: String,
     member_dids: Array,
 ) -> Result<(), JsValue> {
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-    use catbird_mls::KeyPackageData;
-
-    let member_dids_vec = array_to_strings(&member_dids);
-    if member_dids_vec.is_empty() {
-        return Ok(());
-    }
-
-    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
-
-    // Resolve stable conversation ID → current group ID bytes. Legacy group
-    // callers remain accepted when no durable mapping exists.
-    let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&conversation_id)?;
-    let group_id_bytes = decode_group_coordinate(&group_id_hex)
-        .ok_or_else(|| js_err!("Invalid conversation/group ID: {}", group_id_hex))?;
-
-    // 1. Fetch key packages for all new members in one batch request.
-    let (credentials, user_did) = with_state(|s| {
-        let did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.credentials), did))
-    })?;
-    let actor_device_id = credentials
-        .get_device_uuid(&user_did)
+    let (cid, _) = resolve_conversation_identity(&conversation_id)?;
+    request_runtime::require_ordinary_access(&cid).await?;
+    let (owner, runtime) = request_runtime::current_engine()?;
+    runtime
+        .add_members(&cid, &array_to_strings(&member_dids))
         .await
-        .unwrap_or_default()
-        .unwrap_or_default();
-    let kp_refs = api_client
-        .get_key_packages(&actor_device_id, &member_dids_vec)
-        .await
-        .map_err(|e| js_err!("get_key_packages failed: {:?}", e))?;
-
-    let key_packages: Vec<KeyPackageData> = kp_refs
-        .into_iter()
-        .map(|r| KeyPackageData {
-            data: r.key_package_data,
-        })
-        .collect();
-
-    if key_packages.is_empty() {
-        return Err(js_err!(
-            "No key packages available for any of the requested members"
-        ));
-    }
-
-    // 2. Single MLS add_members commit covering all new members (one epoch advance).
-    let add_result = with_state(|s| {
-        let ctx = s
-            .mls_context
-            .as_ref()
-            .ok_or_else(|| js_err!("MLS context not initialized"))?;
-        ctx.add_members(group_id_bytes.clone(), key_packages)
-            .map_err(|e| js_err!("add_members failed: {:?}", e))
-    })?;
-
-    // 3. Send commit + welcome to server.
-    let mut input = serde_json::json!({
-        "action": "addMembers",
-        "convoId": resolved_convo_id,
-        "memberDids": member_dids_vec,
-        "commit": { "$bytes": B64.encode(&add_result.commit_data) },
-        "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-    });
-    input["welcome"] = serde_json::json!({ "$bytes": B64.encode(&add_result.welcome_data) });
-    let add_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation:
-            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
-        method: "POST".to_string(),
-        path: "/xrpc/blue.catbird.chat.submitTransition".to_string(),
-        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
-    };
-    let response = api_client
-        .submit_prepared_request(add_req)
-        .await
-        .map_err(|e| {
-            let _ = with_state(|s| {
-                if let Some(ctx) = s.mls_context.as_ref() {
-                    let _ = ctx.clear_pending_commit(group_id_bytes.clone());
-                }
-                Ok(())
-            });
-            js_err!("add_members server call failed: {:?}", e)
-        })?;
-    if response.status != 200 {
-        let _ = with_state(|s| {
-            if let Some(ctx) = s.mls_context.as_ref() {
-                let _ = ctx.clear_pending_commit(group_id_bytes.clone());
-            }
-            Ok(())
-        });
-        return Err(js_err!(
-            "add_members server call failed with status {}",
-            response.status
-        ));
-    }
-
-    Ok(())
+        .map_err(|e| js_err!("{e}"))?;
+    request_runtime::current(&owner, &runtime)
 }
 
-/// Add a single member to a group (convenience wrapper around batch add).
 #[wasm_bindgen]
 pub async fn catbird_mls_add_participants(
     conversation_id: String,
@@ -2244,7 +1519,9 @@ pub async fn catbird_mls_demote_member(
     _conversation_id: String,
     _target_did: String,
 ) -> Result<(), JsValue> {
-    Err(js_err!("demoteAdmin is a signed policy transition and is not wired in WASM"))
+    Err(js_err!(
+        "demoteAdmin is a signed policy transition and is not wired in WASM"
+    ))
 }
 
 #[wasm_bindgen]
@@ -2252,62 +1529,26 @@ pub async fn catbird_mls_remove_participants(
     conversation_id: String,
     target_did: String,
 ) -> Result<(), JsValue> {
-    let (resolved_convo_id, _group_id) = resolve_conversation_identity(&conversation_id)?;
-    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
-
-    let input = serde_json::json!({
-        "convoId": resolved_convo_id,
-        "targetDid": target_did,
-    });
-    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestLeave,
-        method: "POST".to_string(),
-        path: "/xrpc/blue.catbird.chat.requestLeave".to_string(),
-        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
-    };
-    let resp = api_client
-        .submit_prepared_request(req)
+    let (cid, _) = resolve_conversation_identity(&conversation_id)?;
+    request_runtime::require_ordinary_access(&cid).await?;
+    let (owner, runtime) = request_runtime::current_engine()?;
+    runtime
+        .remove_members(&cid, &[target_did])
         .await
-        .map_err(|e| js_err!("remove_group_member failed: {:?}", e))?;
-    if resp.status != 200 {
-        return Err(js_err!(
-            "remove_group_member failed with status {}: {}",
-            resp.status,
-            String::from_utf8_lossy(&resp.body)
-        ));
-    }
-
-    Ok(())
+        .map_err(|e| js_err!("{e}"))?;
+    request_runtime::current(&owner, &runtime)
 }
 
-/// Leave a conversation.
 #[wasm_bindgen]
 pub async fn catbird_mls_leave_conversation(conversation_id: String) -> Result<(), JsValue> {
-    let (resolved_convo_id, _group_id) = resolve_conversation_identity(&conversation_id)?;
-    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
-
-    let input = serde_json::json!({
-        "convoId": resolved_convo_id,
-    });
-    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestLeave,
-        method: "POST".to_string(),
-        path: "/xrpc/blue.catbird.chat.requestLeave".to_string(),
-        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
-    };
-    let resp = api_client
-        .submit_prepared_request(req)
+    let (cid, _) = resolve_conversation_identity(&conversation_id)?;
+    request_runtime::require_ordinary_access(&cid).await?;
+    let (owner, runtime) = request_runtime::current_engine()?;
+    runtime
+        .leave_group(&cid)
         .await
-        .map_err(|e| js_err!("leave_conversation failed: {:?}", e))?;
-    if resp.status != 200 {
-        return Err(js_err!(
-            "leave_conversation failed with status {}: {}",
-            resp.status,
-            String::from_utf8_lossy(&resp.body)
-        ));
-    }
-
-    Ok(())
+        .map_err(|e| js_err!("{e}"))?;
+    request_runtime::current(&owner, &runtime)
 }
 
 // ---------------------------------------------------------------------------
@@ -2319,7 +1560,9 @@ pub async fn catbird_mls_send_typing(
     _conversation_id: String,
     _is_typing: bool,
 ) -> Result<(), JsValue> {
-    Err(js_err!("Typing is temporarily unavailable: canonical signed typing transport is not wired in WASM"))
+    Err(js_err!(
+        "Typing is temporarily unavailable: canonical signed typing transport is not wired in WASM"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2331,7 +1574,9 @@ pub async fn catbird_mls_promote_member(
     _conversation_id: String,
     _target_did: String,
 ) -> Result<(), JsValue> {
-    Err(js_err!("promoteAdmin is a signed policy transition and is not wired in WASM"))
+    Err(js_err!(
+        "promoteAdmin is a signed policy transition and is not wired in WASM"
+    ))
 }
 
 /// Read MLS group metadata (title/description/avatar) from local decrypted
@@ -3105,46 +2350,8 @@ pub async fn catbird_mls_check_opt_in_status(dids: Array) -> Result<JsValue, JsV
 // Deferred recovery — first-responder bootstrap for ResetPending convos
 // ---------------------------------------------------------------------------
 
-/// Drive the deferred-recovery state machine for any conversation in
-/// `ResetPending` (spec §8.5 Phase 1, plan task #24).
-///
-/// Browser apps should call this on a periodic timer (e.g. every 30s) and on
-/// `visibilitychange="visible"`. It:
-///
-/// 1. Iterates conversations with `state == ResetPending`.
-/// 2. For each, attempts the Welcome → External Commit ladder
-///    (`try_join_group_internal`) — if either succeeds, clears `reset_pending`.
-/// 3. If both fail, runs the first-responder bootstrap: fetches the roster via
-///    `getConvos`, builds a local MLS group at the predetermined `newGroupId`
-///    via `WasmMLSContext::create_group_with_id`, and submits via
-///    `createConvo` with an `Idempotency-Key` header
-///    (`<convoId>:<resetGeneration>:<callerDid>:bootstrap`, per Phase 0 Q4).
-/// 4. On 409 `ConvoAlreadyExists` (race-loss): deletes the local
-///    pre-bootstrap group and leaves `reset_pending` set so the next loop
-///    picks up the winner's Welcome. Other server errors: same.
-///
-/// Returns the count of conversations the loop touched.
-///
-/// Shares the re-entrancy guard with the background-tasks timer: if a
-/// deferred-recovery pass is already in flight (a timer tick or another
-/// manual call), this returns `{ touched: 0, alreadyRunning: true }` instead
-/// of running a second pass concurrently — concurrent passes can clobber
-/// each other's bootstrap state. Each pass also runs under a deadline
-/// (`MANUAL_PASS_DEADLINE_MS` here; 2× `interval_ms` for timer ticks) — on
-/// timeout the pass is cancelled and `{ touched: 0, timedOut: true }` is
-/// returned.
-//
-// TODO(architecture): WASM bootstrap is currently inline-mirrored from
-// `catbird-mls/src/orchestrator/recovery.rs::try_first_responder_bootstrap`.
-// Long-term, WASM should migrate to driving `MLSOrchestrator` directly so
-// the ladder lives in one place across all platforms (Phase 4+ backlog).
-//
-// TODO(test-gap): bootstrap ladder itself has no unit coverage —
-// `catbird-mls-web` is `cdylib`-only and uses sqlite-wasm-rs OPFS VFS that
-// doesn't run on host. Verified by inspection against
-// `try_first_responder_bootstrap` (recovery.rs:1593) and the catmos /
-// catmos-cli inheritor implementations. (Guard/deadline plumbing IS covered
-// by `background_tasks_tests`.)
+/// Reconcile the exact authenticated account inventories through shared Rust.
+/// A failed pass retains prior durable progress and pending policy.
 #[wasm_bindgen]
 pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
     run_deferred_recovery_guarded(MANUAL_PASS_DEADLINE_MS).await
@@ -3155,9 +2362,9 @@ pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
 /// `run_deferred_recovery_guarded`; calling this directly bypasses the
 /// re-entrancy guard and can run concurrently with a timer tick.
 async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
-    let (owner,runtime)=request_runtime::current_engine()?;
-    request_runtime::synchronize(&owner,&runtime,true).await?;
-    request_runtime::current(&owner,&runtime)?;
+    let (owner, runtime) = request_runtime::current_engine()?;
+    request_runtime::synchronize(&owner, &runtime, true).await?;
+    request_runtime::current(&owner, &runtime)?;
     to_js(&serde_json::json!({"touched":0,"reconciled":true}))
 }
 
@@ -3438,7 +2645,7 @@ mod background_tasks_tests {
     use super::*;
     use wasm_bindgen_test::*;
 
-    #[cfg(not(feature="inventory-worker-tests"))]
+    #[cfg(not(feature = "inventory-worker-tests"))]
     wasm_bindgen_test_configure!(run_in_browser);
 
     fn in_flight() -> bool {
@@ -3575,7 +2782,7 @@ mod conversation_identity_tests {
     use super::*;
     use wasm_bindgen_test::*;
 
-    #[cfg(not(feature="inventory-worker-tests"))]
+    #[cfg(not(feature = "inventory-worker-tests"))]
     wasm_bindgen_test_configure!(run_in_browser);
 
     fn create_response(
@@ -3729,7 +2936,10 @@ mod conversation_identity_tests {
             vec!["did:plc:creator".to_string(), "did:plc:invitee".to_string()],
             "did:plc:creator",
         );
-        assert_eq!(serde_json::to_value(fallback).unwrap(), serde_json::to_value(&server_roster).unwrap());
+        assert_eq!(
+            serde_json::to_value(fallback).unwrap(),
+            serde_json::to_value(&server_roster).unwrap()
+        );
 
         let group = vec![
             server_roster[0].clone(),

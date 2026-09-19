@@ -69,7 +69,7 @@ impl SqliteConn {
     /// Register persistent OPFS storage in a dedicated Worker. A locked or
     /// unavailable pool is an error; never fall back to the default RAM VFS.
     pub async fn initialize_opfs() -> Result<(), WasmSqliteError> {
-        sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(
+        let pool = sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(
             &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
             false,
         )
@@ -78,6 +78,15 @@ impl SqliteConn {
             code: SQLITE_CANTOPEN,
             message: format!("OPFS initialization failed: {error}"),
         })?;
+        // The library's six-file default cannot hold several accounts plus
+        // SQLite journals. Reserve bounded persistent capacity without deleting
+        // retained databases or falling back to ephemeral storage.
+        pool.reserve_minimum_capacity(64)
+            .await
+            .map_err(|error| WasmSqliteError::Sqlite {
+                code: SQLITE_CANTOPEN,
+                message: format!("Protected OPFS capacity unavailable: {error}"),
+            })?;
         // sqlite3mc encryption requires its wrapper around the persistent VFS,
         // not an open directly against the underlying OPFS implementation.
         if unsafe { sqlite3_vfs_find(c"multipleciphers-opfs-sahpool".as_ptr()) }.is_null() {

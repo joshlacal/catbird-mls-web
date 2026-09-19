@@ -179,20 +179,33 @@ pub fn catbird_mls_has_signer_bridge() -> bool {
 /// keys are rejected, never forwarded.
 fn read_query_whitelist(operation: CanonicalOperation) -> &'static [&'static str] {
     match operation {
-        CanonicalOperation::GetConversations => &["actorDeviceId", "limit", "pageCursor", "supportedProtocolVersions"],
+        CanonicalOperation::GetConversations => &[
+            "actorDeviceId",
+            "limit",
+            "pageCursor",
+            "supportedProtocolVersions",
+        ],
         CanonicalOperation::GetBlob => &["actorDeviceId", "blobId"],
         CanonicalOperation::GetBlobUsage => &["actorDeviceId"],
         CanonicalOperation::GetConversationState => &["actorDeviceId", "conversationId"],
         CanonicalOperation::GetDevices => &["actorDeviceId", "userDids"],
-        CanonicalOperation::GetDeviceKey => &["actorDeviceId","ownerDid","deviceId","keyId"],
+        CanonicalOperation::GetDeviceKey => &["actorDeviceId", "ownerDid", "deviceId", "keyId"],
         CanonicalOperation::GetEntries => &["actorDeviceId", "afterSeq", "conversationId", "limit"],
-        CanonicalOperation::GetLeafRecoveryInbox => {
-            &["actorDeviceId", "inventorySessionId", "limit", "pageCursor", "supportedProtocolVersions"]
-        }
+        CanonicalOperation::GetLeafRecoveryInbox => &[
+            "actorDeviceId",
+            "inventorySessionId",
+            "limit",
+            "pageCursor",
+            "supportedProtocolVersions",
+        ],
         CanonicalOperation::GetOwnDevices => &["actorDeviceId", "limit", "pageCursor"],
-        CanonicalOperation::GetPendingWelcomes => {
-            &["actorDeviceId", "inventorySessionId", "limit", "pageCursor", "supportedProtocolVersions"]
-        }
+        CanonicalOperation::GetPendingWelcomes => &[
+            "actorDeviceId",
+            "inventorySessionId",
+            "limit",
+            "pageCursor",
+            "supportedProtocolVersions",
+        ],
         _ => &[],
     }
 }

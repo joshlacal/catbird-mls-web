@@ -1343,8 +1343,8 @@ pub(crate) fn parse_generated_request(
         CancelLeafRecoveryRequestBody, CancelLeaveRequestBody, CloseConversationRequestBody,
         CreateConversationRequestBody, DeleteBlobRequestBody, EnrollDeviceRequestBody,
         GetBlobRequestBody, GetBlobUsageRequestBody, GetConversationStateRequestBody,
-        GetDevicesRequestBody, GetDeviceKeyRequestBody, GetLeafRecoveryInboxRequestBody, GetOwnDevicesRequestBody,
-        GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody,
+        GetDeviceKeyRequestBody, GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody,
+        GetOwnDevicesRequestBody, GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody,
         PrepareBlobUploadRequestBody, PublishTypingRequestBody, RejectWelcomeRequestBody,
         ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
         RequestResetRequestBody, RevokeDeviceRequestBody, SendMessageRequestBody,
@@ -1469,10 +1469,13 @@ pub(crate) fn finish_signed_request(
 
 /// Validate an unsigned read/event shape against the pinned canonical schema.
 /// This validates framing only; shared orchestration owns all state authority.
-pub(crate) fn validate_read_shape(name: &str, raw: &[u8]) -> Result<serde_json::Value, TransportError> {
-    let value=parse_strict_signed_json(raw)?;
-    project_schema_ref(name,&value,false)?;
-    serde_json::from_slice(raw).map_err(|e|TransportError::Serialization(e.to_string()))
+pub(crate) fn validate_read_shape(
+    name: &str,
+    raw: &[u8],
+) -> Result<serde_json::Value, TransportError> {
+    let value = parse_strict_signed_json(raw)?;
+    project_schema_ref(name, &value, false)?;
+    serde_json::from_slice(raw).map_err(|e| TransportError::Serialization(e.to_string()))
 }
 
 pub(crate) fn derive_key_id(public_key: &[u8]) -> String {

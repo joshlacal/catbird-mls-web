@@ -25,6 +25,7 @@ pub struct WasmApiClient {
     base_url: String,
     auth_token: RwLock<Option<String>>,
     current_did: RwLock<Option<String>>,
+    actor_device: RwLock<Option<String>>,
 }
 
 impl WasmApiClient {
@@ -46,19 +47,28 @@ impl WasmApiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth_token: RwLock::new(None),
             current_did: RwLock::new(None),
+            actor_device: RwLock::new(None),
         }
     }
 
     pub fn set_auth(&self, did: String, token: String) {
+        if self.current_did.read().unwrap().as_deref()!=Some(&did){*self.actor_device.write().unwrap()=None;}
         *self.auth_token.write().unwrap() = Some(token);
         *self.current_did.write().unwrap() = Some(did);
     }
 
     pub fn clear_auth(&self) {
+        *self.actor_device.write().unwrap()=None;
         *self.auth_token.write().unwrap() = None;
         *self.current_did.write().unwrap() = None;
     }
 
+    pub(crate) fn bind_actor(&self,owner:&str,device:&str)->Result<()> {
+        if self.current_did.read().unwrap().as_deref()!=Some(owner){return Err(OrchestratorError::NotAuthenticated);}
+        catbird_mls::chat_v2::ids::CanonicalUuid::parse(device).map_err(|e|OrchestratorError::Api(e.to_string()))?;
+        *self.actor_device.write().unwrap()=Some(device.to_owned());Ok(())
+    }
+    pub(crate) fn actor_device(&self)->Result<String>{self.actor_device.read().unwrap().clone().ok_or_else(||OrchestratorError::Api("Enrolled actor device is unavailable".into()))}
     pub fn get_auth_token(&self) -> Option<String> {
         self.auth_token.read().unwrap().clone()
     }
@@ -502,8 +512,9 @@ impl MLSAPIClient for WasmApiClient {
         _to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
         let token = self.auth_header()?;
-        let after_seq = cursor.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let after_seq = cursor.map(|v| v.parse::<u64>().map_err(|_|OrchestratorError::Api("Invalid entry cursor".into()))).transpose()?.unwrap_or(0);
         let query = vec![
+            ("actorDeviceId", self.actor_device()?),
             ("conversationId", convo_id.to_string()),
             ("afterSeq", after_seq.to_string()),
             ("limit", limit.to_string()),
@@ -551,33 +562,11 @@ impl MLSAPIClient for WasmApiClient {
     }
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
-        let token = self.auth_header()?;
-        let resp = self
-            .client
-            .get(self.xrpc_url("blue.catbird.chat.getOwnDevices"))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String> =
-            serde_json::from_slice(&body)
-                .map_err(|e| OrchestratorError::Api(format!("getOwnDevices parse: {e}")))?;
-        let available: u32 = output
-            .items
-            .iter()
-            .map(|item| item.device.available_package_count.max(0) as u32)
-            .sum();
-        Ok(KeyPackageStats {
-            available,
-            total: available,
-        })
+        let actor=self.actor_device()?;
+        let device=self.list_devices(&actor).await?.into_iter().find(|d|d.device_id==actor && d.status.as_deref()==Some("enabled"))
+            .ok_or_else(||OrchestratorError::Api("Current enrolled device is unavailable".into()))?;
+        let available=device.available_package_count.ok_or_else(||OrchestratorError::Api("Missing device package inventory".into()))?;
+        Ok(KeyPackageStats{available,total:available.saturating_add(device.reserved_package_count.unwrap_or(0))})
     }
 
     async fn sync_key_packages(
@@ -591,42 +580,30 @@ impl MLSAPIClient for WasmApiClient {
         })
     }
 
-    async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
-        let token = self.auth_header()?;
-        let resp = self
-            .client
-            .get(self.xrpc_url("blue.catbird.chat.getOwnDevices"))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
+    async fn list_devices(&self, actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
+        let token=self.auth_header()?;
+        let current_did=self.current_did().await.ok_or(OrchestratorError::NotAuthenticated)?;
+        let mut items=Vec::new();let mut cursor=None;let mut seen=std::collections::HashSet::new();let mut seen_cursors=std::collections::HashSet::new();
+        for _ in 0..100 {
+            let mut query=vec![("actorDeviceId",actor_device_id.to_owned()),("limit","100".into())];
+            if let Some(c)=cursor.take(){query.push(("pageCursor",c));}
+            let resp=self.client.get(self.xrpc_url("blue.catbird.chat.getOwnDevices")).bearer_auth(&token).query(&query).send().await.map_err(|e|OrchestratorError::Api(e.to_string()))?;
+            if !resp.status().is_success(){return Err(self.handle_error(resp).await);}
+            let body=resp.bytes().await.map_err(|e|OrchestratorError::Api(e.to_string()))?;
+            let output:blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>=serde_json::from_slice(&body).map_err(|e|OrchestratorError::Api(format!("getOwnDevices parse: {e}")))?;
+            for d in output.items {
+                let device_id=d.device.device_id.to_string();
+                if !seen.insert(device_id.clone()){return Err(OrchestratorError::Api("Repeated own-device entry".into()));}
+                items.push(DeviceInfo {mls_did:format!("{current_did}#{device_id}"),device_uuid:device_id.clone(),device_id,created_at:None,key_id:Some(d.device.key_id.to_string()),signature_public_key:Some(d.device.signature_public_key.to_vec()),auth_generation:Some(d.device.auth_generation),status:Some(d.device.status.to_string()),available_package_count:Some(d.device.available_package_count.max(0) as u32),reserved_package_count:Some(d.device.reserved_package_count.max(0) as u32)});
+            }
+            if !self.is_authenticated_as(&current_did).await{return Err(OrchestratorError::NotAuthenticated);}
+            match (output.has_more,output.next_page_cursor) {
+                (false,None)=>return Ok(items),
+                (true,Some(c)) if seen_cursors.insert(c.to_string())=>cursor=Some(c.to_string()),
+                _=>return Err(OrchestratorError::Api("Own-device inventory cursor is inconsistent".into()))
+            }
         }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String> =
-            serde_json::from_slice(&body)
-                .map_err(|e| OrchestratorError::Api(format!("getOwnDevices parse: {e}")))?;
-        let current_did = self.current_did().await.unwrap_or_default();
-        Ok(output
-            .items
-            .iter()
-            .map(|d| DeviceInfo {
-                device_id: d.device.device_id.to_string(),
-                mls_did: current_did.clone(),
-                device_uuid: d.device.key_id.to_string(),
-                created_at: None,
-                key_id: Some(d.device.key_id.to_string()),
-                signature_public_key: Some(d.device.signature_public_key.to_vec()),
-                auth_generation: Some(d.device.auth_generation),
-                status: Some("active".to_string()),
-                available_package_count: Some(d.device.available_package_count.max(0) as u32),
-                reserved_package_count: Some(d.device.reserved_package_count.max(0) as u32),
-            })
-            .collect())
+        Err(OrchestratorError::Api("Own-device inventory page bound exceeded".into()))
     }
 
     async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {

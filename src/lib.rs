@@ -32,6 +32,8 @@
 mod api_client;
 mod browser_transport;
 mod credentials;
+mod browser_enrollment;
+mod request_runtime;
 pub mod mls_storage;
 pub mod sqlite_conn;
 mod storage;
@@ -510,7 +512,9 @@ struct AppState {
     credentials: Arc<SqliteCredentialStore>,
     user_did: Option<String>,
     auth_token: Option<String>,
-    mls_context: Option<WasmMLSContext>,
+    mls_context: Option<Arc<WasmMLSContext>>,
+    request_engine: Option<Arc<request_runtime::BrowserOrchestrator>>,
+    request_ready: bool,
 }
 
 thread_local! {
@@ -719,7 +723,7 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
     let credentials = SqliteCredentialStore::new(Rc::clone(&shared_conn));
 
     let mls_context = match WasmMLSContext::open_with_conn(Rc::clone(&shared_conn)) {
-        Ok(ctx) => Some(ctx),
+        Ok(ctx) => Some(Arc::new(ctx)),
         Err(e) => {
             web_sys::console::warn_1(&js_err!(
                 "catbird-mls-web: MLS context unavailable ({}). \
@@ -786,17 +790,25 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
         }
     }
 
+    let storage=Arc::new(storage);
+    let credentials=Arc::new(credentials);
+    let request_engine = if let Some(ctx)=mls_context.as_ref() {
+        credentials.attach_runtime(Arc::clone(ctx), Arc::clone(&api_client)).map_err(|e|js_err!("{e}"))?;
+        Some(Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(Arc::clone(ctx),Arc::clone(&storage),Arc::clone(&api_client),Arc::clone(&credentials),Default::default())))
+    } else {None};
     let state = AppState {
         base_url: cfg.base_url,
         storage_prefix: cfg.storage_prefix,
         db_prefix: cfg.db_prefix,
         proxy_did: cfg.proxy_did,
         api_client,
-        storage: Arc::new(storage),
-        credentials: Arc::new(credentials),
+        storage,
+        credentials,
         user_did: None,
         auth_token: None,
         mls_context,
+        request_engine,
+        request_ready: false,
     };
 
     STATE.with(|s| {
@@ -825,6 +837,8 @@ pub fn catbird_mls_ping() -> String {
 #[wasm_bindgen]
 pub fn catbird_mls_set_auth(did: String, token: String) -> Result<(), JsValue> {
     with_state_mut(|state| {
+        state.mls_context.as_ref().ok_or_else(||js_err!("Protected crypto unavailable"))?.bind_request_owner(&did).map_err(|e|js_err!("{e}"))?;
+        state.request_ready = false;
         state.api_client.set_auth(did.clone(), token.clone());
         save_session(&state.storage_prefix, &did, &token)?;
         state.storage.set_active_user_did(Some(did.clone()));
@@ -838,6 +852,7 @@ pub fn catbird_mls_set_auth(did: String, token: String) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn catbird_mls_clear_auth() -> Result<(), JsValue> {
     with_state_mut(|state| {
+        state.request_ready = false;
         state.api_client.clear_auth();
         clear_session(&state.storage_prefix);
         state.storage.set_active_user_did(None);
@@ -855,13 +870,7 @@ pub fn catbird_mls_try_restore_session() -> Result<bool, JsValue> {
     let storage_prefix = with_state(|s| Ok(s.storage_prefix.clone()))?;
 
     match load_session(&storage_prefix) {
-        Some((did, token)) => with_state_mut(|state| {
-            state.api_client.set_auth(did.clone(), token.clone());
-            state.storage.set_active_user_did(Some(did.clone()));
-            state.user_did = Some(did);
-            state.auth_token = Some(token);
-            Ok(true)
-        }),
+        Some((did, token)) => { catbird_mls_set_auth(did, token)?; Ok(true) },
         None => Ok(false),
     }
 }
@@ -880,270 +889,7 @@ pub fn catbird_mls_try_restore_session() -> Result<bool, JsValue> {
 /// Returns a JSON object with `status`, `deviceId`, `mlsDid`, `keyPackagesPublished`.
 #[wasm_bindgen]
 pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-    use catbird_mls::orchestrator::credentials::CredentialStore;
-
-    let (api_client, credentials, storage, user_did) = with_state(|s| {
-        let did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated — call catbird_mls_set_auth() first"))?;
-        Ok((
-            Arc::clone(&s.api_client),
-            Arc::clone(&s.credentials),
-            Arc::clone(&s.storage),
-            did,
-        ))
-    })?;
-
-    // Replay owner-bound speculative cleanup intents before any new setup
-    // work. A crash/cancellation between MLS group creation and server
-    // projection therefore cannot strand a group indefinitely; a target that
-    // has since been adopted by the stable mapping is retained idempotently.
-    for (intent_conversation, intent_group, reason) in storage
-        .list_cleanup_intents(&user_did)
-        .map_err(|e| js_err!("cleanup intent replay failed: {}", e))?
-    {
-        match storage
-            .resolve_conversation_mapping(&user_did, &intent_group)
-            .map_err(|e| js_err!("cleanup intent ownership lookup failed: {}", e))?
-        {
-            Some((stable_id, _))
-                if stable_id == intent_conversation
-                    // A create intent is armed before the server chooses the
-                    // stable UUID, so its recorded conversation field is the
-                    // speculative group itself. Any authenticated stable
-                    // projection adopting that exact target is the intended
-                    // outcome and may clear the replay intent idempotently.
-                    || (reason == "create-speculative" && intent_conversation == intent_group) =>
-            {
-                storage
-                    .clear_cleanup_intent(&user_did, &intent_group)
-                    .map_err(|e| js_err!("clear adopted cleanup intent failed: {}", e))?;
-            }
-            Some((stable_id, _)) => {
-                return Err(js_err!(
-                    "cleanup intent {} conflicts with stable conversation {}",
-                    intent_group,
-                    stable_id
-                ));
-            }
-            None => {
-                let Some(group_bytes) = decode_group_coordinate(&intent_group) else {
-                    return Err(js_err!(
-                        "cleanup intent {} has an invalid exact group coordinate",
-                        intent_group
-                    ));
-                };
-                with_state(|s| {
-                    if let Some(ctx) = s.mls_context.as_ref() {
-                        ctx.delete_group(group_bytes.clone()).map_err(|e| {
-                            js_err!("cleanup intent {} MLS delete failed: {:?}", intent_group, e)
-                        })?;
-                    }
-                    Ok(())
-                })?;
-                storage
-                    .delete_group_state(&intent_group)
-                    .await
-                    .map_err(|e| {
-                        js_err!(
-                            "cleanup intent {} group-state delete failed: {:?}",
-                            intent_group,
-                            e
-                        )
-                    })?;
-                storage
-                    .delete_conversation_by_group(&user_did, &intent_group)
-                    .map_err(|e| {
-                        js_err!(
-                            "cleanup intent {} projection delete failed: {}",
-                            intent_group,
-                            e
-                        )
-                    })?;
-                storage
-                    .clear_cleanup_intent(&user_did, &intent_group)
-                    .map_err(|e| js_err!("cleanup intent {} clear failed: {}", intent_group, e))?;
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "catbird-mls-web: replayed {} cleanup intent for {}",
-                    reason, intent_group
-                )));
-            }
-        }
-    }
-
-    web_sys::console::log_1(&js_err!(
-        "catbird-mls-web: catbird_mls_setup() starting for {}",
-        user_did
-    ));
-
-    // 1. Check if already registered
-    let has_creds = credentials
-        .has_credentials(&user_did)
-        .await
-        .map_err(|e| js_err!("Credential check failed: {:?}", e))?;
-    web_sys::console::log_1(&js_err!("catbird-mls-web: has_credentials={}", has_creds));
-
-    if has_creds {
-        let stats = api_client
-            .get_key_package_stats()
-            .await
-            .map_err(|e| js_err!("Key package stats failed: {:?}", e))?;
-        if stats.available > 0 {
-            let result = serde_json::json!({
-                "status": "already_registered",
-                "keyPackagesAvailable": stats.available,
-            });
-            return to_js(&result);
-        }
-        // No key packages on server — clear stale credentials and re-register
-        credentials
-            .clear_all(&user_did)
-            .await
-            .map_err(|e| js_err!("Failed to clear stale credentials: {:?}", e))?;
-    }
-
-    // 2. Generate device UUID
-    let device_uuid = uuid::Uuid::new_v4().to_string();
-    let identity_bytes = user_did.as_bytes().to_vec();
-
-    // 3. Create initial key package (also creates signing key pair)
-    let kp_result = with_state(|s| {
-        let ctx = s.mls_context.as_ref().ok_or_else(|| {
-            js_err!("MLS context not initialized — run catbird_mls_init() inside a Worker")
-        })?;
-        ctx.create_key_package(identity_bytes.clone())
-            .map_err(|e| js_err!("create_key_package failed: {:?}", e))
-    })?;
-
-    web_sys::console::log_1(&js_err!(
-        "catbird-mls-web: key package created, registering device {}...",
-        device_uuid
-    ));
-
-    // 4. Register device with server via prepared request
-    let expires_str = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
-    let input = serde_json::json!({
-        "deviceUuid": device_uuid,
-        "deviceName": "Catbird Web",
-        "signaturePublicKey": { "$bytes": B64.encode(&kp_result.hash_ref) },
-        "keyPackages": [{
-            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            "expiresAt": expires_str,
-            "data": { "$bytes": B64.encode(&kp_result.key_package_data) },
-        }],
-    });
-    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::EnrollDevice,
-        method: "POST".to_string(),
-        path: "/xrpc/blue.catbird.chat.enrollDevice".to_string(),
-        body: Some(serde_json::to_vec(&input).map_err(|e| js_err!("JSON error: {:?}", e))?),
-    };
-    let response = api_client
-        .submit_prepared_request(req)
-        .await
-        .map_err(|e| js_err!("Device registration failed: {:?}", e))?;
-    if response.status != 200 {
-        return Err(js_err!(
-            "Device registration failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
-    }
-    let output: serde_json::Value =
-        serde_json::from_slice(&response.body).map_err(|e| js_err!("JSON decode: {:?}", e))?;
-    let server_device_id = output
-        .get("deviceId")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&device_uuid)
-        .to_string();
-    let mls_did = output
-        .get("mlsDid")
-        .or_else(|| output.get("credentialDid"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&user_did)
-        .to_string();
-
-    // 5. Store credentials
-    credentials
-        .store_mls_did(&user_did, &mls_did)
-        .await
-        .map_err(|e| js_err!("store_mls_did failed: {:?}", e))?;
-    credentials
-        .store_device_uuid(&user_did, &server_device_id)
-        .await
-        .map_err(|e| js_err!("store_device_uuid failed: {:?}", e))?;
-    credentials
-        .store_signing_key(&user_did, &kp_result.hash_ref)
-        .await
-        .map_err(|e| js_err!("store_signing_key failed: {:?}", e))?;
-
-    // 6. Publish additional key packages (target: 10)
-    let target_count = 10u32;
-    let mut published = 1u32; // 1 already sent during registration
-    LOCAL_KP_COUNT.with(|c| *c.borrow_mut() = 1); // Track the registration KP
-    for _ in 0..(target_count - 1) {
-        let kp = with_state(|s| {
-            let ctx = s
-                .mls_context
-                .as_ref()
-                .ok_or_else(|| js_err!("MLS context not initialized"))?;
-            ctx.create_key_package(identity_bytes.clone())
-                .map_err(|e| js_err!("create_key_package failed: {:?}", e))
-        })?;
-
-        let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
-        let replenish_input = serde_json::json!({
-            "keyPackages": [{
-                "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                "expiresAt": expires_at,
-                "data": { "$bytes": B64.encode(&kp.key_package_data) },
-            }],
-            "deviceId": server_device_id,
-        });
-        let replenish_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-            operation:
-                catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ReplenishKeyPackages,
-            method: "POST".to_string(),
-            path: "/xrpc/blue.catbird.chat.replenishKeyPackages".to_string(),
-            body: Some(
-                serde_json::to_vec(&replenish_input).map_err(|e| js_err!("JSON error: {:?}", e))?,
-            ),
-        };
-        match api_client.submit_prepared_request(replenish_req).await {
-            Ok(resp) if resp.status == 200 => {
-                published += 1;
-                LOCAL_KP_COUNT.with(|c| *c.borrow_mut() += 1);
-            }
-            Ok(resp) => {
-                web_sys::console::warn_1(&js_err!(
-                    "Key package publish failed with status {}",
-                    resp.status
-                ));
-                break;
-            }
-            Err(e) => {
-                web_sys::console::warn_1(&js_err!("Key package publish failed: {:?}", e));
-                break;
-            }
-        }
-    }
-
-    web_sys::console::log_1(&js_err!(
-        "catbird-mls-web: device registered! id={}, mls_did={}, key_packages={}",
-        server_device_id,
-        mls_did,
-        published
-    ));
-
-    let result = serde_json::json!({
-        "status": "registered",
-        "deviceId": server_device_id,
-        "mlsDid": mls_did,
-        "keyPackagesPublished": published,
-    });
-    to_js(&result)
+    request_runtime::setup().await
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,118 +904,7 @@ pub async fn catbird_mls_setup() -> Result<JsValue, JsValue> {
 /// Returns a JSON object with `available` (before) and `published` counts.
 #[wasm_bindgen]
 pub async fn catbird_mls_replenish_key_packages() -> Result<JsValue, JsValue> {
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-
-    let (api_client, credentials, user_did) = with_state(|s| {
-        let did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), Arc::clone(&s.credentials), did))
-    })?;
-    let device_uuid = credentials
-        .get_device_uuid(&user_did)
-        .await
-        .map_err(|e| js_err!("Device UUID lookup failed: {:?}", e))?;
-
-    // Track how many key packages THIS web device has published in this session.
-    // Server stats are per-DID (includes iOS key packages) so we can't rely on them
-    // to know if this device has enough of its own key packages on the server.
-    let local_published = LOCAL_KP_COUNT.with(|c| *c.borrow());
-
-    // If we've already published enough this session, skip.
-    // Key packages from other devices (iOS) are useless to us since private keys are local.
-    if local_published >= 5 {
-        let result = serde_json::json!({
-            "localPublished": local_published,
-            "published": 0,
-            "status": "sufficient_this_session",
-        });
-        return to_js(&result);
-    }
-
-    let identity_bytes = user_did.as_bytes().to_vec();
-    let target = 10u32;
-    let to_create = target.saturating_sub(local_published) as usize;
-    let mut published = 0u32;
-
-    let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
-    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
-
-    web_sys::console::log_1(&js_err!(
-        "catbird-mls-web: replenishing key packages: local_published={}, creating {}",
-        local_published,
-        to_create
-    ));
-
-    for _ in 0..to_create {
-        let kp_result = with_state(|s| {
-            let ctx = s
-                .mls_context
-                .as_ref()
-                .ok_or_else(|| js_err!("MLS context not initialized"))?;
-            ctx.create_key_package(identity_bytes.clone())
-                .map_err(|e| js_err!("create_key_package failed: {:?}", e))
-        });
-        match kp_result {
-            Ok(kp) => {
-                let replenish_input = serde_json::json!({
-                    "keyPackages": [{
-                        "cipherSuite": cipher_suite,
-                        "expiresAt": expires_at,
-                        "data": { "$bytes": B64.encode(&kp.key_package_data) },
-                    }],
-                    "deviceId": device_uuid.as_deref(),
-                });
-                let replenish_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-                    operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ReplenishKeyPackages,
-                    method: "POST".to_string(),
-                    path: "/xrpc/blue.catbird.chat.replenishKeyPackages".to_string(),
-                    body: Some(serde_json::to_vec(&replenish_input).map_err(|e| js_err!("JSON error: {:?}", e))?),
-                };
-                match api_client.submit_prepared_request(replenish_req).await {
-                    Ok(resp) if resp.status == 200 => {
-                        published += 1;
-                        LOCAL_KP_COUNT.with(|c| *c.borrow_mut() += 1);
-                    }
-                    Ok(resp) => {
-                        web_sys::console::warn_1(&js_err!(
-                            "Key package publish failed with status {}",
-                            resp.status
-                        ));
-                        break;
-                    }
-                    Err(e) => {
-                        web_sys::console::warn_1(&js_err!(
-                            "catbird-mls-web: publish_key_package failed: {:?}",
-                            e
-                        ));
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                web_sys::console::warn_1(&js_err!(
-                    "catbird-mls-web: create_key_package failed: {:?}",
-                    e
-                ));
-                break;
-            }
-        }
-    }
-
-    web_sys::console::log_1(&js_err!(
-        "catbird-mls-web: replenished {} key packages (total this session: {})",
-        published,
-        LOCAL_KP_COUNT.with(|c| *c.borrow())
-    ));
-
-    let result = serde_json::json!({
-        "localPublished": LOCAL_KP_COUNT.with(|c| *c.borrow()),
-        "published": published,
-        "status": if published > 0 { "replenished" } else { "failed" },
-    });
-    to_js(&result)
+    request_runtime::replenish().await
 }
 
 // ---------------------------------------------------------------------------
@@ -1291,6 +926,7 @@ pub async fn catbird_mls_join_group(convo_id: String) -> Result<JsValue, JsValue
 
 /// Internal join helper — returns a JSON value, reusable from auto-join paths.
 async fn try_join_group_internal(convo_id: &str) -> Result<serde_json::Value, JsValue> {
+    request_runtime::require_ordinary_access(convo_id).await?;
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
     use catbird_mls::orchestrator::storage::MLSStorageBackend;
 
@@ -1858,6 +1494,7 @@ pub async fn catbird_mls_create_conversation(
     })?;
 
     let member_dids_vec = array_to_strings(&member_dids);
+    if member_dids_vec.len()==1{return Err(js_err!("Direct conversations require a local draft and an encrypted first message"));}
     if member_dids_vec.len() > MAX_CONVERSATION_ITEMS
         || member_dids_vec
             .iter()
@@ -2286,6 +1923,7 @@ pub async fn catbird_mls_unsubscribe(_convo_id: String) -> Result<(), JsValue> {
 /// deferred-recovery worker.
 #[allow(dead_code)]
 async fn rejoin_group(convo_id: &str) -> Result<(), JsValue> {
+    request_runtime::require_ordinary_access(convo_id).await?;
     use catbird_mls::orchestrator::api_client::MLSAPIClient;
 
     let (resolved_convo_id, resolved_group_id) = resolve_conversation_identity(convo_id)?;
@@ -2413,190 +2051,13 @@ async fn send_payload_message_internal(
     convo_id: String,
     payload: catbird_mls::orchestrator::types::MLSMessagePayload,
 ) -> Result<JsValue, JsValue> {
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-
-    let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&convo_id)?;
-    let (api_client, storage, user_did) = with_state(|s| {
-        let did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), did))
-    })?;
-
-    let group_id_bytes = decode_group_coordinate(&group_id_hex).ok_or_else(|| {
-        js_err!(
-            "Invalid MLS group id '{}': not hex or base64url",
-            group_id_hex
-        )
-    })?;
-
-    // Encode as MLSMessagePayload JSON envelope (interoperable with iOS Catbird)
-    let payload_bytes = payload
-        .encode()
-        .map_err(|e| js_err!("Failed to encode MLSMessagePayload: {:?}", e))?;
-    let payload_json = String::from_utf8(payload_bytes.clone())
-        .map_err(|e| js_err!("Failed to stringify MLSMessagePayload: {:?}", e))?;
-    let display_text = payload.display_text();
-
-    // Generate a stable msg_id before the retry loop for idempotent sends
-    let msg_id = uuid::Uuid::new_v4().to_string();
-
-    // Try sending up to 3 times, syncing epoch on 409 conflict
-    for _attempt in 0..3 {
-        // Try encrypt; if group not found locally, auto-join first
-        let encrypt_result = {
-            let first_try = with_state(|s| {
-                let ctx = s.mls_context.as_ref().ok_or_else(|| {
-                    js_err!("MLS context not initialized — run catbird_mls_init() inside a Worker")
-                })?;
-                match ctx.encrypt_message(group_id_bytes.clone(), payload_bytes.clone()) {
-                    Ok(r) => Ok(Ok(r)),
-                    Err(MLSError::GroupNotFound { .. }) => Ok(Err(())),
-                    Err(e) => Err(js_err!("encrypt_message failed: {:?}", e)),
-                }
-            })?;
-
-            match first_try {
-                Ok(result) => result,
-                Err(()) => {
-                    // Spec §5.3 (MLS_CLIENT_PROTOCOL): Do NOT perform External Commit
-                    // in the send hot path. External commits inflate epochs and race
-                    // with other clients doing the same. Flag the conversation for
-                    // deferred recovery and return an error; the sync loop / explicit
-                    // rejoin entrypoint will handle the actual rejoin.
-                    use catbird_mls::orchestrator::storage::MLSStorageBackend;
-                    web_sys::console::warn_1(&js_err!(
-                        "catbird-mls-web: group {} not found locally for send — flagging for deferred rejoin",
-                        resolved_convo_id
-                    ));
-                    let _ = storage.mark_needs_rejoin(&resolved_convo_id).await;
-                    return Err(js_err!(
-                        "Group not found locally — sync in progress, please retry"
-                    ));
-                }
-            }
-        };
-
-        // Query epoch AFTER encryption succeeds — the encrypt call ensures the
-        // group is loaded in the MLS context, so get_epoch will find it.
-        // Prefer SERVER_EPOCHS cache (set by join/rejoin/409 recovery), then
-        // fall back to querying the MLS context directly.
-        let epoch = {
-            let mls_epoch = STATE.with(|s| {
-                let borrowed = s.borrow();
-                borrowed
-                    .as_ref()
-                    .and_then(|st| st.mls_context.as_ref())
-                    .and_then(|ctx| ctx.get_epoch(group_id_bytes.clone()).ok())
-            });
-            // If MLS context returned an epoch, use it and update cache
-            if let Some(e) = mls_epoch {
-                if e > 0 {
-                    SERVER_EPOCHS.with(|m| m.borrow_mut().insert(resolved_convo_id.clone(), e));
-                }
-                // Still prefer server cache if it's higher (server may be ahead after commits)
-                let cached = SERVER_EPOCHS.with(|m| m.borrow().get(&resolved_convo_id).copied());
-                cached.unwrap_or(e)
-            } else {
-                SERVER_EPOCHS
-                    .with(|m| m.borrow().get(&resolved_convo_id).copied())
-                    .unwrap_or(0)
-            }
-        };
-
-        let send_input = serde_json::json!({
-            "convoId": resolved_convo_id.clone(),
-            "ciphertext": { "$bytes": B64.encode(&encrypt_result.ciphertext) },
-            "epoch": epoch,
-            "msgId": msg_id.clone(),
-            "paddedSize": encrypt_result.ciphertext.len() as u32,
-        });
-        let send_req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
-            operation:
-                catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage,
-            method: "POST".to_string(),
-            path: "/xrpc/blue.catbird.chat.sendMessage".to_string(),
-            body: Some(
-                serde_json::to_vec(&send_input).map_err(|e| js_err!("JSON error: {:?}", e))?,
-            ),
-        };
-        match api_client.submit_prepared_request(send_req).await {
-            Ok(resp) if resp.status == 200 => {
-                // Persist to IndexedDB so messages survive navigation/reload
-                let now = chrono::Utc::now();
-                {
-                    use catbird_mls::orchestrator::storage::MLSStorageBackend;
-                    let stored_msg = catbird_mls::orchestrator::types::Message {
-                        id: msg_id.clone(),
-                        conversation_id: resolved_convo_id.clone(),
-                        sender_did: user_did.clone(),
-                        text: display_text.clone(),
-                        timestamp: now,
-                        epoch,
-                        sequence_number: 0,
-                        is_own: true,
-                        delivery_status: None,
-                        payload_json: Some(payload_json.clone()),
-                    };
-                    if let Err(e) = storage.store_message(&stored_msg).await {
-                        web_sys::console::warn_1(&js_err!(
-                            "catbird-mls-web: failed to persist sent message: {:?}",
-                            e
-                        ));
-                    }
-                }
-                let message =
-                    ui_message_from_orchestrator(catbird_mls::orchestrator::types::Message {
-                        id: msg_id.clone(),
-                        conversation_id: resolved_convo_id.clone(),
-                        sender_did: user_did,
-                        text: display_text.clone(),
-                        timestamp: now,
-                        epoch,
-                        sequence_number: 0,
-                        is_own: true,
-                        delivery_status: None,
-                        payload_json: Some(payload_json.clone()),
-                    });
-                return to_js(&message);
-            }
-            Ok(resp) => {
-                let is_409 = resp.status == 409;
-                let server_epoch_hint = if is_409 {
-                    serde_json::from_slice::<serde_json::Value>(&resp.body)
-                        .ok()
-                        .and_then(|v| v.get("serverEpoch").and_then(|e| e.as_u64()))
-                } else {
-                    None
-                };
-                if is_409 {
-                    web_sys::console::warn_1(&js_err!(
-                        "catbird-mls-web: send_message 409 conflict for {}: server_epoch_hint={:?}, client_epoch={}",
-                        resolved_convo_id,
-                        server_epoch_hint,
-                        epoch
-                    ));
-                    if let Some(target_epoch) = server_epoch_hint {
-                        SERVER_EPOCHS.with(|m| {
-                            m.borrow_mut()
-                                .insert(resolved_convo_id.clone(), target_epoch)
-                        });
-                    }
-                }
-                return Err(js_err!(
-                    "send_message failed with status {}: {}",
-                    resp.status,
-                    String::from_utf8_lossy(&resp.body)
-                ));
-            }
-            Err(e) => {
-                return Err(js_err!("send_message failed: {:?}", e));
-            }
-        }
-    }
-
-    Err(js_err!("send_message failed after retries"))
+    let (resolved, _) = resolve_conversation_identity(&convo_id)?;
+    let (owner, runtime) = request_runtime::current_engine()?;
+    let encoded = String::from_utf8(payload.encode().map_err(|e| js_err!("{e}"))?)
+        .map_err(|e| js_err!("{e}"))?;
+    let message = runtime.send_payload_json(&resolved, &encoded).await.map_err(|e| js_err!("{e}"))?;
+    request_runtime::current(&owner, &runtime)?;
+    to_js(&ui_message_from_orchestrator(message))
 }
 
 #[wasm_bindgen]
@@ -2621,6 +2082,7 @@ pub async fn catbird_mls_send_image(
     height: u32,
     alt_text: Option<String>,
 ) -> Result<JsValue, JsValue> {
+    request_runtime::require_ordinary_access(&convo_id).await?;
     if !content_type.starts_with("image/") {
         return Err(js_err!("Unsupported image content type: {}", content_type));
     }
@@ -2716,241 +2178,15 @@ pub async fn catbird_mls_messages(
 
 #[wasm_bindgen]
 pub async fn catbird_mls_fetch_new_messages(convo_id: String) -> Result<JsValue, JsValue> {
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-    use catbird_mls::orchestrator::storage::MLSStorageBackend;
-    use catbird_mls::orchestrator::types::MLSMessagePayload;
-
-    let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&convo_id)?;
-    let (api_client, user_did, storage) = with_state(|s| {
-        let did = s.user_did.clone().unwrap_or_default();
-        Ok((Arc::clone(&s.api_client), did, Arc::clone(&s.storage)))
-    })?;
-
-    let stored_cursor = SYNC_CURSORS.with(|m| m.borrow().get(&resolved_convo_id).cloned());
-    let (envelopes, new_cursor) = api_client
-        .get_messages(
-            &resolved_convo_id,
-            stored_cursor.as_deref(),
-            50,
-            None,
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| js_err!("fetch_new_messages failed: {:?}", e))?;
-
-    // Update sync cursor for next poll
-    if let Some(ref cursor) = new_cursor {
-        SYNC_CURSORS.with(|m| {
-            m.borrow_mut()
-                .insert(resolved_convo_id.clone(), cursor.clone())
-        });
-    }
-
-    let group_id_bytes = decode_group_coordinate(&group_id_hex);
-
-    web_sys::console::log_1(&js_err!(
-        "catbird-mls-web: fetch_new_messages({}) — {} envelopes, group_id_decoded={}",
-        resolved_convo_id,
-        envelopes.len(),
-        group_id_bytes.is_some()
-    ));
-
-    // Before decrypting, check if the group exists locally. If not, try to join.
-    // Skip auto-join for groups we just created (we're already a member).
-    let recently_created = RECENTLY_CREATED.with(|s| s.borrow().contains(&resolved_convo_id));
-    if let Some(ref gid) = group_id_bytes {
-        if recently_created {
-            web_sys::console::log_1(&js_err!(
-                "catbird-mls-web: skipping auto-join for recently created group {}",
-                resolved_convo_id
-            ));
-        } else {
-            let group_exists = STATE.with(|s| {
-                let borrowed = s.borrow();
-                if let Some(state) = borrowed.as_ref() {
-                    if let Some(ctx) = &state.mls_context {
-                        return ctx.get_epoch(gid.clone()).is_ok();
-                    }
-                }
-                false
-            });
-
-            if !group_exists {
-                match try_join_group_internal(&resolved_convo_id).await {
-                    Ok(result) => {
-                        let status = result["status"].as_str().unwrap_or("unknown");
-                        web_sys::console::log_1(&js_err!(
-                            "catbird-mls-web: auto-joined group {} ({})",
-                            resolved_convo_id,
-                            status
-                        ));
-                    }
-                    Err(e) => {
-                        web_sys::console::warn_1(&js_err!(
-                            "catbird-mls-web: auto-join failed for {}: {:?}",
-                            resolved_convo_id,
-                            e
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    let mut messages = Vec::with_capacity(envelopes.len());
-    for env in envelopes {
-        // Self-echo filter: skip our own messages (already shown locally from send)
-        if env.sender_did.to_lowercase() == user_did.to_lowercase() {
-            continue;
-        }
-
-        let msg_id = env
-            .server_message_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-        // Dedup: skip messages already seen via WebSocket
-        let already_seen = SEEN_MSG_IDS.with(|s| s.borrow().contains(&msg_id));
-        if already_seen {
-            continue;
-        }
-
-        // Returns Some((message, sender_did)) for displayable messages,
-        // None for commit/proposal control messages that should be hidden.
-        let decoded = match &group_id_bytes {
-            Some(gid) => STATE.with(|s| {
-                let borrowed = s.borrow();
-                if let Some(state) = borrowed.as_ref() {
-                    if let Some(ctx) = &state.mls_context {
-                        match ctx.decrypt_message(gid.clone(), env.ciphertext.clone()) {
-                            Ok(res) => {
-                                // Empty plaintext = commit/control message, skip
-                                if res.plaintext.is_empty() {
-                                    return None;
-                                }
-                                let (text, payload_json) =
-                                    match MLSMessagePayload::decode(&res.plaintext) {
-                                        Ok(payload) => {
-                                            if !payload.is_displayable() {
-                                                return None;
-                                            }
-                                            (
-                                                payload.display_text(),
-                                                String::from_utf8(res.plaintext.clone()).ok(),
-                                            )
-                                        }
-                                        Err(_) => {
-                                            let text = String::from_utf8(res.plaintext)
-                                                .unwrap_or_else(|_| "[Binary]".to_string());
-                                            if text.trim().is_empty() {
-                                                return None;
-                                            }
-                                            (text, None)
-                                        }
-                                    };
-                                let sender = String::from_utf8(res.sender_credential.identity)
-                                    .unwrap_or_else(|_| env.sender_did.clone());
-                                return Some((
-                                    catbird_mls::orchestrator::types::Message {
-                                        id: msg_id.clone(),
-                                        conversation_id: resolved_convo_id.clone(),
-                                        sender_did: sender.clone(),
-                                        text,
-                                        timestamp: env.timestamp,
-                                        epoch: res.epoch,
-                                        sequence_number: res.sequence_number,
-                                        is_own: false,
-                                        delivery_status: None,
-                                        payload_json,
-                                    },
-                                    sender,
-                                ));
-                            }
-                            Err(MLSError::InvalidInput { ref message })
-                                if message.contains("commit message")
-                                    || message.contains("proposal") =>
-                            {
-                                // Task #56: commit/proposal messages no longer auto-merge inside
-                                // `decrypt_message`. For commits, the staged commit is sitting in
-                                // `pending_incoming_merges`; drive the explicit merge here so the
-                                // local epoch advances. Proposals don't stage anything, so skip.
-                                if message.contains("commit message") {
-                                    if let Err(e) = ctx.merge_incoming_commit(gid.clone()) {
-                                        web_sys::console::warn_1(&js_err!(
-                                            "catbird-mls-web: merge_incoming_commit failed for msg {}: {:?}",
-                                            msg_id,
-                                            e
-                                        ));
-                                    }
-                                }
-                                return None;
-                            }
-                            Err(ref e) => {
-                                let err_str = format!("{:?}", e);
-                                // WrongEpoch / TooDistantInThePast / AeadError = message from
-                                // before we joined (after external commit, earlier epochs are
-                                // undecryptable — this is expected MLS forward secrecy behavior)
-                                let is_historical = err_str.contains("WrongEpoch")
-                                    || err_str.contains("TooDistantInThePast")
-                                    || err_str.contains("AeadError")
-                                    || err_str.contains("UnableToDecrypt");
-                                if !is_historical {
-                                    web_sys::console::warn_1(&js_err!(
-                                        "catbird-mls-web: decrypt error for msg {}: {:?}",
-                                        msg_id,
-                                        e
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                // Undecryptable — skip rather than show "[Encrypted]"
-                None
-            }),
-            None => None,
-        };
-
-        let Some((mut storage_msg, _sender_did)) = decoded else {
-            continue;
-        };
-        storage_msg.conversation_id = resolved_convo_id.clone();
-
-        // Record as seen for dedup against WebSocket path
-        SEEN_MSG_IDS.with(|s| {
-            let mut set = s.borrow_mut();
-            // Bound the set to prevent unbounded memory growth
-            if set.len() > 1000 {
-                set.clear();
-            }
-            set.insert(msg_id.clone());
-        });
-
-        // Persist to storage so catbird_mls_messages() returns these
-        let _ = storage.store_message(&storage_msg).await;
-
-        messages.push(ui_message_from_orchestrator(storage_msg));
-    }
-
-    // After processing all messages (including commits that advance the epoch),
-    // refresh the SERVER_EPOCHS cache with the latest epoch from the MLS context.
-    if let Some(ref gid) = group_id_bytes {
-        let updated_epoch = STATE.with(|s| {
-            let borrowed = s.borrow();
-            borrowed
-                .as_ref()
-                .and_then(|st| st.mls_context.as_ref())
-                .and_then(|ctx| ctx.get_epoch(gid.clone()).ok())
-        });
-        if let Some(epoch) = updated_epoch {
-            if epoch > 0 {
-                SERVER_EPOCHS.with(|m| m.borrow_mut().insert(resolved_convo_id.clone(), epoch));
-            }
-        }
-    }
-
-    to_js(&messages)
+    let (resolved, _) = resolve_conversation_identity(&convo_id)?;
+    let (owner, runtime) = request_runtime::current_engine()?;
+    let previous = SYNC_CURSORS.with(|m| m.borrow().get(&resolved).cloned());
+    let (messages, cursor) = runtime.fetch_messages(&resolved, previous.as_deref(), 50, None, None, None)
+        .await.map_err(|e| js_err!("{e}"))?;
+    request_runtime::current(&owner, &runtime)?;
+    // The shared engine rejects a failed control/application before this cursor advances.
+    if let Some(cursor) = cursor { SYNC_CURSORS.with(|m| m.borrow_mut().insert(resolved, cursor)); }
+    to_js(&messages.into_iter().filter(|m| m.has_displayable_body()).map(ui_message_from_orchestrator).collect::<Vec<_>>())
 }
 
 /// Build the shared MLS reaction envelope. Reactions are application
@@ -3328,6 +2564,7 @@ pub async fn catbird_mls_update_group_metadata(
     use catbird_mls::metadata;
 
     let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&conversation_id)?;
+    request_runtime::require_ordinary_access(&resolved_convo_id).await?;
     let (api_client, storage, user_did) = with_state(|s| {
         let user_did = s
             .user_did
@@ -3521,6 +2758,8 @@ pub async fn catbird_mls_update_group_metadata(
 #[wasm_bindgen]
 pub async fn wasm_bootstrap_group_metadata(group_id_hex: String) -> Result<JsValue, JsValue> {
     use catbird_mls::metadata;
+    let (stable_id, _) = resolve_conversation_identity(&group_id_hex)?;
+    request_runtime::require_ordinary_access(&stable_id).await?;
 
     let (api_client, storage, user_did) = with_state(|s| {
         let user_did = s

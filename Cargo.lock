@@ -462,6 +462,7 @@ dependencies = [
  "openmls_basic_credential",
  "openmls_libcrux_crypto",
  "openmls_traits",
+ "p256",
  "reqwest",
  "serde",
  "serde-wasm-bindgen",

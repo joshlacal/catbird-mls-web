@@ -116,6 +116,8 @@ pub struct WasmMLSContext {
     content_root_key: RefCell<Option<Vec<u8>>>,
 }
 
+mod direct_requests;
+
 impl WasmMLSContext {
     /// Open (or create) the MLS SQLite database as a standalone database.
     ///
@@ -131,13 +133,15 @@ impl WasmMLSContext {
         Self::ensure_request_schema(storage.conn())?;
         let crypto = LibcruxCrypto::new()
             .map_err(|e| MLSError::OpenMLS(format!("LibcruxCrypto::new: {e:?}")))?;
-        Ok(Self {
+        let context = Self {
             provider: WasmOpenMlsProvider { crypto, storage },
             groups: RefCell::new(HashMap::new()),
             signers: RefCell::new(HashMap::new()),
             pending_incoming_merges: RefCell::new(HashMap::new()),
             content_root_key: RefCell::new(None),
-        })
+        };
+        context.validate_request_custody()?;
+        Ok(context)
     }
 
     /// Open using a shared [`SqliteConn`].
@@ -151,13 +155,15 @@ impl WasmMLSContext {
         Self::ensure_request_schema(storage.conn())?;
         let crypto = LibcruxCrypto::new()
             .map_err(|e| MLSError::OpenMLS(format!("LibcruxCrypto::new: {e:?}")))?;
-        Ok(Self {
+        let context = Self {
             provider: WasmOpenMlsProvider { crypto, storage },
             groups: RefCell::new(HashMap::new()),
             signers: RefCell::new(HashMap::new()),
             pending_incoming_merges: RefCell::new(HashMap::new()),
             content_root_key: RefCell::new(None),
-        })
+        };
+        context.validate_request_custody()?;
+        Ok(context)
     }
 
     fn ensure_request_schema(conn: &SqliteConn) -> Result<(), MLSError> {
@@ -167,6 +173,7 @@ impl WasmMLSContext {
             record_json TEXT NOT NULL
         )",
         )?;
+        Self::ensure_request_custody_schema(conn)?;
         Ok(())
     }
 
@@ -214,7 +221,7 @@ impl WasmMLSContext {
         );
         let signer = self.existing_signer(identity.as_bytes())?;
         let conn = self.provider.storage().conn();
-        conn.transaction(|| -> Result<DirectRequestJournal, MLSError> {
+        let record=conn.transaction(|| -> Result<DirectRequestJournal, MLSError> {
             for record in self.list_direct_request_journal()? {
                 if record.request_id == request_id {
                     if record.input_sha256 != DirectRequestJournal::input_digest(input)? {
@@ -239,7 +246,9 @@ impl WasmMLSContext {
                 &[(1, request_id), (2, &hex::encode(&input.group_id)), (3, &json)],
             )?;
             Ok(record)
-        })
+        })?;
+        conn.ensure_durable()?;
+        Ok(record)
     }
 
     fn require_published_group(&self, group_id: &[u8]) -> Result<(), MLSError> {
@@ -575,6 +584,7 @@ impl WasmMLSContext {
     }
 
     pub(crate) fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        if self.retire_request_group(&group_id)? { return Ok(()); }
         if !self.ensure_group_loaded(&group_id)? {
             return Ok(());
         }
@@ -1135,7 +1145,7 @@ impl WasmMLSContext {
         // a retained request/artifact binding, or publish it into the live cache.
         let group_id = hex::encode(verifiable_group_info.group_id().as_slice());
         if self.provider.storage().conn().exists(
-            "SELECT 1 FROM direct_request_journal_v2 WHERE group_id = ?1",
+            "SELECT 1 FROM direct_request_journal_v2 WHERE group_id = ?1 UNION ALL SELECT 1 FROM direct_request_live_v2 WHERE group_id = ?1 UNION ALL SELECT 1 FROM direct_request_import_ownership_v2 WHERE group_id = ?1",
             &[(1, &group_id)],
         )? {
             return Err(MLSError::OperationNotSupported {
@@ -1374,7 +1384,7 @@ impl WasmMLSContext {
             .map(|h| h.as_slice().to_vec())
             .map_err(|e| MLSError::OpenMLS(format!("key_package.hash_ref: {e:?}")))?;
 
-        let key_package_data = key_package
+        let key_package_data = MlsMessageOut::from(key_package)
             .tls_serialize_detached()
             .map_err(|e| MLSError::OpenMLS(format!("key_package serialize: {e:?}")))?;
 
@@ -1504,6 +1514,23 @@ impl MlsCryptoContext for WasmMLSContext {
     fn list_direct_request_journal(&self) -> Result<Vec<DirectRequestJournal>, MLSError> {
         WasmMLSContext::list_direct_request_journal(self)
     }
+
+    fn process_direct_request_welcome(&self, input: &catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestWelcomeInput) -> Result<WelcomeResult, MLSError> { self.import_request_welcome(input) }
+    fn decrypt_direct_request_introduction(&self, input: &catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestWelcomeInput) -> Result<catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestIntroductionResult, MLSError> { self.decrypt_request_intro(input) }
+    fn read_direct_request_key_publication(&self, device: &str) -> Result<Option<Vec<u8>>, MLSError> { self.request_value("keys", device) }
+    fn prepare_direct_request_key_publication(&self, input: &catbird_mls::orchestrator::direct_request_keys::DirectRequestKeyPublicationInput, expected: Option<&[u8]>) -> Result<Option<Vec<u8>>, MLSError> { self.prepare_request_keys(input, expected) }
+    fn acknowledge_direct_request_key_publication(&self, device: &str, expected: &[u8], next: &[u8]) -> Result<bool, MLSError> { self.acknowledge_request_keys(device, expected, next) }
+    fn commit_closed_direct_request_projection(&self, cid: &str, expected: &[u8], next: &[u8]) -> Result<bool, MLSError> { self.close_request_projection(cid, expected, next) }
+    fn persist_direct_request_publish(&self, id: &str, bytes: &[u8]) -> Result<(), MLSError> { self.persist_request_publish(id, bytes) }
+    fn confirm_published_bootstrap(&self, id: &str, receipt: &[u8], key: &[u8]) -> Result<DirectRequestJournal, MLSError> { self.resolve_request_journal(id, receipt, key, true) }
+    fn abandon_rejected_bootstrap(&self, id: &str, receipt: &[u8], key: &[u8]) -> Result<DirectRequestJournal, MLSError> { self.resolve_request_journal(id, receipt, key, false) }
+    fn mark_direct_request_projected(&self, id: &str) -> Result<(), MLSError> { self.mark_request_projected(id) }
+    fn read_direct_request_intent(&self, id: &str) -> Result<Option<Vec<u8>>, MLSError> { self.request_value("intent", id) }
+    fn compare_exchange_direct_request_intent(&self, id: &str, old: Option<&[u8]>, next: &[u8]) -> Result<bool, MLSError> { self.request_value_cas("intent", id, old, next) }
+    fn list_direct_request_intents(&self) -> Result<Vec<Vec<u8>>, MLSError> { self.request_values("intent") }
+    fn read_direct_request_projection(&self, id: &str) -> Result<Option<Vec<u8>>, MLSError> { self.request_value("projection", id) }
+    fn compare_exchange_direct_request_projection(&self, id: &str, old: Option<&[u8]>, next: &[u8]) -> Result<bool, MLSError> { self.request_value_cas("projection", id, old, next) }
+    fn list_direct_request_projections(&self) -> Result<Vec<Vec<u8>>, MLSError> { self.request_values("projection") }
 
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError> {
         WasmMLSContext::create_key_package(self, identity)

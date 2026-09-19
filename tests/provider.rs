@@ -128,15 +128,6 @@ async fn external_join_cannot_overwrite_request_candidate_after_reopen() {
     let recipient_package = context
         .create_key_package(recipient.as_bytes().to_vec())
         .unwrap();
-    // Browser's legacy package API returns a raw package. Shared request
-    // input requires RFC MLSMessage framing, which is produced here by OpenMLS.
-    let package = KeyPackageIn::tls_deserialize_exact(&recipient_package.key_package_data)
-        .unwrap()
-        .validate(
-            &openmls_libcrux_crypto::CryptoProvider::new().unwrap(),
-            ProtocolVersion::Mls10,
-        )
-        .unwrap();
     let now = chrono::Utc::now().timestamp() as u64;
     let context_json = serde_json::to_vec(&serde_json::json!({
             "protocolVersion":"2", "requestId":uuid::Uuid::new_v4().to_string(),
@@ -152,9 +143,7 @@ async fn external_join_cannot_overwrite_request_candidate_after_reopen() {
         group_id: vec![37; 32],
         generation: 0,
         state_version: 1,
-        key_packages: vec![MlsMessageOut::from(package)
-            .tls_serialize_detached()
-            .unwrap()],
+        key_packages: vec![recipient_package.key_package_data],
         expected_package_refs: vec![recipient_package.hash_ref],
         authority_import_until: now + 20 * 86400,
         preparation_request_digest: [21; 32],

@@ -121,6 +121,12 @@ impl Drop for SqliteTransactionGuard<'_> {
 }
 
 impl WasmStorageBackend {
+    fn write_recovery_value(&self,id:&str,value:&str)->Result<()> {
+        let owner=self.active_user_did.borrow().clone().ok_or_else(|| OrchestratorError::Storage("recovery owner unavailable".into()))?;
+        self.conn.exec_with_text_params("INSERT OR REPLACE INTO browser_recovery_v2(owner,id,value) VALUES(?1,?2,?3)",&[(1,&owner),(2,id),(3,value)]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        self.conn.ensure_durable().map_err(|e|OrchestratorError::Storage(e.to_string()))
+    }
+
     /// Create a new storage backend wrapping the shared SQLite connection.
     ///
     /// The caller must have already called [`Self::ensure_schema`] on this
@@ -375,6 +381,7 @@ impl WasmStorageBackend {
         // DDL/backfill step must not leave an apparently migrated database
         // with only half of the identity contract installed.
         let schema_tx = SqliteTransactionGuard::begin(conn, "conversation schema")?;
+        conn.exec_raw("CREATE TABLE IF NOT EXISTS browser_recovery_v2 (owner TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(owner,id));").map_err(|e|format!("recovery schema: {e}"))?;
         conn.exec_raw(
             "CREATE TABLE IF NOT EXISTS conversations (
                 conversation_id        TEXT NOT NULL,
@@ -3929,8 +3936,27 @@ impl MLSStorageBackend for WasmStorageBackend {
             .map_err(Self::store_err)
     }
 
+    async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
+        let owner=self.active_user_did.borrow().clone().ok_or_else(|| OrchestratorError::Storage("recovery owner unavailable".into()))?;
+        let rows=self.conn.query_text("SELECT id,value FROM browser_recovery_v2 WHERE owner=?1", &[(1,&owner)],2).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        let mut state=PersistedRecoveryState::default();
+        for row in rows { let id=row[0].as_deref().ok_or_else(|| OrchestratorError::Storage("corrupt recovery key".into()))?; let raw=row[1].as_deref().ok_or_else(|| OrchestratorError::Storage("corrupt recovery value".into()))?; if id=="global" {state.last_global_rejoin_attempt_at_ms=Some(serde_json::from_str(raw).map_err(|e|OrchestratorError::Storage(format!("recovery timestamp: {e}")))?);} else {let entry:PersistedRecoveryBackoff=serde_json::from_str(raw).map_err(|e|OrchestratorError::Storage(e.to_string()))?;if entry.conversation_id!=id{return Err(OrchestratorError::Storage("recovery identity mismatch".into()));}state.entries.push(entry);} }
+        Ok(state)
+    }
+    async fn set_recovery_backoff(&self, entry: &PersistedRecoveryBackoff) -> Result<()> { self.write_recovery_value(&entry.conversation_id,&serde_json::to_string(entry).map_err(|e|OrchestratorError::Storage(e.to_string()))?) }
+    async fn clear_recovery_backoff(&self, id: &str) -> Result<()> {
+        let owner=self.active_user_did.borrow().clone().ok_or_else(|| OrchestratorError::Storage("recovery owner unavailable".into()))?;
+        self.conn.exec_with_text_params("DELETE FROM browser_recovery_v2 WHERE owner=?1 AND id=?2",&[(1,&owner),(2,id)]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        self.conn.ensure_durable().map_err(|e|OrchestratorError::Storage(e.to_string()))
+    }
+    async fn set_last_global_rejoin_attempt_at(&self, at_ms:i64)->Result<()> {self.write_recovery_value("global",&at_ms.to_string())}
+
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
+            "get_recovery_state",
+            "set_recovery_backoff",
+            "clear_recovery_backoff",
+            "set_last_global_rejoin_attempt_at",
             "commit_conversation_projection",
             "get_conversation_state",
             "mark_reset_pending",

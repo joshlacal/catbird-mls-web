@@ -66,6 +66,32 @@ pub struct SqliteConn {
 }
 
 impl SqliteConn {
+    /// Register persistent OPFS storage in a dedicated Worker. A locked or
+    /// unavailable pool is an error; never fall back to the default RAM VFS.
+    pub async fn initialize_opfs() -> Result<(), WasmSqliteError> {
+        sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(
+            &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
+            false,
+        )
+        .await
+        .map_err(|error| WasmSqliteError::Sqlite {
+            code: SQLITE_CANTOPEN,
+            message: format!("OPFS initialization failed: {error}"),
+        })?;
+        // sqlite3mc encryption requires its wrapper around the persistent VFS,
+        // not an open directly against the underlying OPFS implementation.
+        if unsafe { sqlite3_vfs_find(c"multipleciphers-opfs-sahpool".as_ptr()) }.is_null() {
+            let result = unsafe { sqlite3mc_vfs_create(c"opfs-sahpool".as_ptr(), 0) };
+            if result != SQLITE_OK {
+                return Err(WasmSqliteError::Sqlite {
+                    code: result,
+                    message: "cannot register encrypted OPFS VFS".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Open a database at the given path with sqlite3mc ChaCha20 encryption.
     ///
     /// - `db_path` -- file path for the database (e.g. `"catbird-mls-app.db"`)
@@ -74,6 +100,11 @@ impl SqliteConn {
     /// Does NOT create any tables — the caller is responsible for schema setup
     /// via each consumer's `ensure_schema()` method.
     pub fn open(db_path: &str, key: &str) -> Result<Self, WasmSqliteError> {
+        if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(WasmSqliteError::Serialization(
+                "database key must be 64 hexadecimal characters".into(),
+            ));
+        }
         let c_path =
             CString::new(db_path).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
         let mut db: *mut sqlite3 = std::ptr::null_mut();
@@ -83,11 +114,16 @@ impl SqliteConn {
                 c_path.as_ptr().cast(),
                 &mut db as *mut _,
                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                std::ptr::null(),
+                c"multipleciphers-opfs-sahpool".as_ptr().cast(),
             )
         };
 
         if ret != SQLITE_OK || db.is_null() {
+            if !db.is_null() {
+                unsafe {
+                    sqlite3_close(db);
+                }
+            }
             return Err(WasmSqliteError::Sqlite {
                 code: ret,
                 message: "Failed to open database".to_string(),
@@ -100,8 +136,51 @@ impl SqliteConn {
         conn.exec_raw(&format!("PRAGMA key = '{}';", key))?;
         conn.exec_raw("PRAGMA cipher = 'chacha20';")?;
         conn.exec_raw("PRAGMA page_size = 4096;")?;
+        conn.exec_raw("PRAGMA synchronous = FULL;")?;
+        // Force key validation now, before callers can reserve remote work.
+        conn.exec_raw("SELECT count(*) FROM sqlite_master;")?;
 
         Ok(conn)
+    }
+
+    /// Synchronous transaction on this shared connection. Never await inside
+    /// the closure: the OPFS connection belongs to a single Worker.
+    /// Nested transactions fail before running the closure.
+    pub fn transaction<T, E>(&self, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<WasmSqliteError>,
+    {
+        self.exec_raw("BEGIN IMMEDIATE").map_err(E::from)?;
+        struct Rollback<'a>(&'a SqliteConn, bool);
+        impl Drop for Rollback<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    let _ = self.0.exec_raw("ROLLBACK");
+                }
+            }
+        }
+        let mut rollback = Rollback(self, true);
+        let value = operation()?;
+        self.exec_raw("COMMIT").map_err(E::from)?;
+        rollback.1 = false;
+        Ok(value)
+    }
+
+    /// Refuse to certify uncommitted data; completed FULL-synchronous SQLite
+    /// transactions already request the VFS durability barrier. Flush any
+    /// remaining cache pages and propagate locked/storage errors.
+    pub fn ensure_durable(&self) -> Result<(), WasmSqliteError> {
+        if unsafe { sqlite3_get_autocommit(self.db) } == 0 {
+            return Err(WasmSqliteError::Sqlite {
+                code: SQLITE_BUSY,
+                message: "durability requested inside an open transaction".into(),
+            });
+        }
+        let result = unsafe { sqlite3_db_cacheflush(self.db) };
+        if result != SQLITE_OK {
+            return Err(self.last_error(result));
+        }
+        Ok(())
     }
 
     /// Execute a SQL statement with no parameters and no result.

@@ -28,6 +28,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_libcrux_crypto::CryptoProvider as LibcruxCrypto;
 use openmls_traits::OpenMlsProvider;
 
+use catbird_mls::orchestrator::mls_provider::{IncomingCommitMergeOutcome, MlsCryptoContext};
 use catbird_mls::{
     AddMembersResult, CredentialData, DecryptResult, EncryptResult, ExternalCommitResult,
     GroupConfig, GroupCreationResult, KeyPackageData, KeyPackageResult, MLSError, WelcomeResult,
@@ -35,6 +36,16 @@ use catbird_mls::{
 
 use crate::mls_storage::WasmSqliteStorage;
 use crate::sqlite_conn::SqliteConn;
+use catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrapInput;
+use catbird_mls::orchestrator::direct_request_journal::{
+    DirectRequestJournal, DirectRequestJournalPhase,
+};
+
+impl From<crate::sqlite_conn::WasmSqliteError> for MLSError {
+    fn from(_: crate::sqlite_conn::WasmSqliteError) -> Self {
+        MLSError::StorageError
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -117,6 +128,7 @@ impl WasmMLSContext {
         let storage = WasmSqliteStorage::open(db_path, encryption_key)
             .map_err(|e| MLSError::invalid_input(format!("WasmSqliteStorage::open: {e}")))?;
 
+        Self::ensure_request_schema(storage.conn())?;
         let crypto = LibcruxCrypto::new()
             .map_err(|e| MLSError::OpenMLS(format!("LibcruxCrypto::new: {e:?}")))?;
         Ok(Self {
@@ -136,6 +148,7 @@ impl WasmMLSContext {
     pub fn open_with_conn(conn: Rc<SqliteConn>) -> Result<Self, MLSError> {
         let storage = WasmSqliteStorage::new(conn);
 
+        Self::ensure_request_schema(storage.conn())?;
         let crypto = LibcruxCrypto::new()
             .map_err(|e| MLSError::OpenMLS(format!("LibcruxCrypto::new: {e:?}")))?;
         Ok(Self {
@@ -145,6 +158,112 @@ impl WasmMLSContext {
             pending_incoming_merges: RefCell::new(HashMap::new()),
             content_root_key: RefCell::new(None),
         })
+    }
+
+    fn ensure_request_schema(conn: &SqliteConn) -> Result<(), MLSError> {
+        conn.exec_raw(
+            "CREATE TABLE IF NOT EXISTS direct_request_journal_v2 (
+            request_id TEXT PRIMARY KEY, group_id TEXT NOT NULL UNIQUE,
+            record_json TEXT NOT NULL
+        )",
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn list_direct_request_journal(
+        &self,
+    ) -> Result<Vec<DirectRequestJournal>, MLSError> {
+        self.provider
+            .storage()
+            .conn()
+            .query_text(
+                "SELECT record_json FROM direct_request_journal_v2 ORDER BY request_id",
+                &[],
+                1,
+            )?
+            .into_iter()
+            .map(|row| {
+                let record: DirectRequestJournal =
+                    serde_json::from_str(row[0].as_deref().ok_or(MLSError::StorageError)?)
+                        .map_err(|_| MLSError::StorageError)?;
+                record.validate()?;
+                Ok(record)
+            })
+            .collect()
+    }
+
+    /// Shared bootstrap crypto and its unpublished ownership journal commit in
+    /// one encrypted transaction. Never inserts into live cache/projection.
+    pub(crate) fn prepare_direct_request_bootstrap(
+        &self,
+        input: &DirectRequestBootstrapInput,
+    ) -> Result<DirectRequestJournal, MLSError> {
+        let (context, _) =
+            catbird_mls::orchestrator::direct_request_bootstrap::context(&input.context_json)?;
+        let request_id = context["requestId"]
+            .as_str()
+            .ok_or_else(|| MLSError::invalid_input("request ID missing"))?;
+        let identity = format!(
+            "{}#{}",
+            context["actorDid"]
+                .as_str()
+                .ok_or(MLSError::SerializationError)?,
+            context["actorDeviceId"]
+                .as_str()
+                .ok_or(MLSError::SerializationError)?
+        );
+        let signer = self.existing_signer(identity.as_bytes())?;
+        let conn = self.provider.storage().conn();
+        conn.transaction(|| -> Result<DirectRequestJournal, MLSError> {
+            for record in self.list_direct_request_journal()? {
+                if record.request_id == request_id {
+                    if record.input_sha256 != DirectRequestJournal::input_digest(input)? {
+                        return Err(MLSError::invalid_input("request identity already binds different input"));
+                    }
+                    return Ok(record);
+                }
+            }
+            if MlsGroup::load(self.provider.storage(), &GroupId::from_slice(&input.group_id))
+                .map_err(|_| MLSError::StorageError)?.is_some() {
+                return Err(MLSError::invalid_input("bootstrap group already exists"));
+            }
+            let now = u64::try_from(chrono::Utc::now().timestamp()).map_err(|_| MLSError::SerializationError)?;
+            let (_unpublished_group, bootstrap) = catbird_mls::orchestrator::direct_request_bootstrap::prepare_with_provider(
+                &self.provider, signer.as_ref(), input, now,
+            )?;
+            let record = DirectRequestJournal::from_prepared(input, bootstrap.clone())?;
+            record.validate()?;
+            let json = serde_json::to_string(&record).map_err(|_| MLSError::SerializationError)?;
+            conn.exec_with_text_params(
+                "INSERT INTO direct_request_journal_v2(request_id, group_id, record_json) VALUES(?1, ?2, ?3)",
+                &[(1, request_id), (2, &hex::encode(&input.group_id)), (3, &json)],
+            )?;
+            Ok(record)
+        })
+    }
+
+    fn require_published_group(&self, group_id: &[u8]) -> Result<(), MLSError> {
+        let rows = self.provider.storage().conn().query_text(
+            "SELECT record_json FROM direct_request_journal_v2 WHERE group_id = ?1",
+            &[(1, &hex::encode(group_id))],
+            1,
+        )?;
+        if let Some(row) = rows.first() {
+            let record: DirectRequestJournal =
+                serde_json::from_str(row[0].as_deref().ok_or(MLSError::StorageError)?)
+                    .map_err(|_| MLSError::StorageError)?;
+            record.validate()?;
+            if !matches!(
+                record.phase,
+                DirectRequestJournalPhase::PublishedAwaitingProjection
+                    | DirectRequestJournalPhase::RequestSent
+            ) {
+                return Err(MLSError::OperationNotSupported {
+                    reason: "request group is unpublished".into(),
+                });
+            }
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -163,12 +282,30 @@ impl WasmMLSContext {
             return Ok(s.clone());
         }
 
+        let conn = self.provider.storage().conn();
+        let mapping_key = [b"catbird.browser.identity.v1\0".as_slice(), identity_bytes].concat();
+        if let Some(public_key) = conn.get(&mapping_key).map_err(|_| MLSError::StorageError)? {
+            let signer = SignatureKeyPair::read(
+                self.provider.storage(),
+                &public_key,
+                SignatureScheme::ED25519,
+            )
+            .ok_or(MLSError::StorageError)?;
+            let signer = Rc::new(signer);
+            self.signers
+                .borrow_mut()
+                .insert(identity_bytes.to_vec(), Rc::clone(&signer));
+            return Ok(signer);
+        }
+
         let signer = SignatureKeyPair::new(SignatureScheme::ED25519)
             .map_err(|e| MLSError::OpenMLS(format!("SignatureKeyPair::new: {e:?}")))?;
 
-        signer
-            .store(self.provider.storage())
-            .map_err(|e| MLSError::OpenMLS(format!("signer.store: {e:?}")))?;
+        conn.transaction(|| -> Result<(), crate::sqlite_conn::WasmSqliteError> {
+            signer.store(self.provider.storage())?;
+            conn.put(&mapping_key, signer.public())
+        })
+        .map_err(|_| MLSError::StorageError)?;
 
         let signer = Rc::new(signer);
         let result = Rc::clone(&signer);
@@ -204,6 +341,21 @@ impl WasmMLSContext {
         let s = Rc::new(s);
         self.signers.borrow_mut().insert(identity, Rc::clone(&s));
         Ok(s)
+    }
+
+    fn existing_signer(&self, identity: &[u8]) -> Result<Rc<SignatureKeyPair>, MLSError> {
+        if let Some(signer) = self.signers.borrow().get(identity) {
+            return Ok(Rc::clone(signer));
+        }
+        let key = [b"catbird.browser.identity.v1\0".as_slice(), identity].concat();
+        let public_key = self
+            .provider
+            .storage()
+            .conn()
+            .get(&key)
+            .map_err(|_| MLSError::StorageError)?
+            .ok_or_else(|| MLSError::invalid_input("identity is not enrolled"))?;
+        self.signer_from_identity(identity.to_vec(), public_key)
     }
 
     // -----------------------------------------------------------------------
@@ -252,6 +404,7 @@ impl WasmMLSContext {
     /// group is missing — callers (such as startup group reload) can distinguish
     /// "missing" from "load error" and log appropriately.
     pub fn ensure_group_loaded(&self, group_id: &[u8]) -> Result<bool, MLSError> {
+        self.require_published_group(group_id)?;
         if self.groups.borrow().contains_key(group_id) {
             return Ok(true);
         }
@@ -270,6 +423,7 @@ impl WasmMLSContext {
     /// Ensure the group is in the in-memory cache, loading from OpenMLS
     /// storage if necessary.
     fn ensure_loaded(&self, group_id: &[u8]) -> Result<(), MLSError> {
+        self.require_published_group(group_id)?;
         if self.groups.borrow().contains_key(group_id) {
             return Ok(());
         }
@@ -380,6 +534,13 @@ impl WasmMLSContext {
         group_id: Vec<u8>,
         config: Option<GroupConfig>,
     ) -> Result<GroupCreationResult, MLSError> {
+        self.require_published_group(&group_id)?;
+        if MlsGroup::load(self.provider.storage(), &GroupId::from_slice(&group_id))
+            .map_err(|_| MLSError::StorageError)?
+            .is_some()
+        {
+            return Err(MLSError::invalid_input("group already exists"));
+        }
         let config = config.unwrap_or_else(Self::default_config);
         let signer = self.get_or_create_signer(&identity_bytes)?;
 
@@ -414,9 +575,19 @@ impl WasmMLSContext {
     }
 
     pub(crate) fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
-        if let Some(mut group) = self.groups.borrow_mut().remove(&group_id) {
-            let _ = group.delete(self.provider.storage());
+        if !self.ensure_group_loaded(&group_id)? {
+            return Ok(());
         }
+        let mut groups = self.groups.borrow_mut();
+        groups
+            .get_mut(&group_id)
+            .expect("group loaded")
+            .delete(self.provider.storage())
+            .map_err(|_| MLSError::StorageError)?;
+        groups.remove(&group_id);
+        self.pending_incoming_merges
+            .borrow_mut()
+            .retain(|(id, _), _| id != &group_id);
         Ok(())
     }
 
@@ -1303,3 +1474,337 @@ impl WasmMLSContext {
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod compatibility_tests;
+
+// The adapter implements the shared interface; request lifecycle remains in Rust.
+impl MlsCryptoContext for WasmMLSContext {
+    // Remains false until publication/outcome/adoption + intent storage are
+    // implemented and worker-restart tests qualify the full lifecycle.
+    fn supports_direct_request_bootstrap(&self) -> bool {
+        false
+    }
+    fn prepare_direct_request_bootstrap(
+        &self,
+        input: &DirectRequestBootstrapInput,
+    ) -> Result<DirectRequestJournal, MLSError> {
+        WasmMLSContext::prepare_direct_request_bootstrap(self, input)
+    }
+    fn list_direct_request_journal(&self) -> Result<Vec<DirectRequestJournal>, MLSError> {
+        WasmMLSContext::list_direct_request_journal(self)
+    }
+
+    fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError> {
+        WasmMLSContext::create_key_package(self, identity)
+    }
+    fn create_group(
+        &self,
+        identity: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
+        WasmMLSContext::create_group(self, identity, config)
+    }
+    fn create_group_with_id(
+        &self,
+        identity: Vec<u8>,
+        group_id: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
+        WasmMLSContext::create_group_with_id(self, identity, group_id, config)
+    }
+    fn add_members(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+    ) -> Result<AddMembersResult, MLSError> {
+        WasmMLSContext::add_members(self, group_id, key_packages)
+    }
+    fn remove_members(
+        &self,
+        group_id: Vec<u8>,
+        member_identities: Vec<Vec<u8>>,
+    ) -> Result<Vec<u8>, MLSError> {
+        WasmMLSContext::remove_members(self, group_id, member_identities)
+    }
+    fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+        WasmMLSContext::merge_pending_commit(self, group_id)
+    }
+    fn clear_pending_commit(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        WasmMLSContext::clear_pending_commit(self, group_id)
+    }
+    fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+        WasmMLSContext::get_epoch(self, group_id)
+    }
+    fn export_group_info(
+        &self,
+        group_id: Vec<u8>,
+        signer_identity: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        WasmMLSContext::export_group_info(self, group_id, signer_identity)
+    }
+    fn encrypt_message(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+    ) -> Result<EncryptResult, MLSError> {
+        WasmMLSContext::encrypt_message(self, group_id, plaintext)
+    }
+    fn decrypt_message(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<DecryptResult, MLSError> {
+        WasmMLSContext::decrypt_message(self, group_id, ciphertext)
+    }
+    fn create_external_commit(
+        &self,
+        group_info: Vec<u8>,
+        identity: Vec<u8>,
+    ) -> Result<ExternalCommitResult, MLSError> {
+        WasmMLSContext::create_external_commit(self, group_info, identity)
+    }
+    fn discard_pending_external_join(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        WasmMLSContext::discard_pending_external_join(self, group_id)
+    }
+    fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        WasmMLSContext::delete_group(self, group_id)
+    }
+    fn process_welcome(
+        &self,
+        welcome_data: Vec<u8>,
+        identity: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<WelcomeResult, MLSError> {
+        WasmMLSContext::process_welcome(self, welcome_data, identity, config)
+    }
+
+    fn identity_public_key(&self, identity: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        Ok(self.existing_signer(&identity)?.public().to_vec())
+    }
+    fn sign_with_identity_key(
+        &self,
+        identity: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        use openmls_traits::signatures::Signer;
+        self.existing_signer(&identity)?
+            .sign(&payload)
+            .map_err(|_| MLSError::OpenMLSError)
+    }
+    fn export_identity_key(&self, identity: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        serde_json::to_vec(self.existing_signer(&identity)?.as_ref())
+            .map_err(|_| MLSError::SerializationError)
+    }
+    fn import_identity_key(&self, identity: Vec<u8>, key_data: Vec<u8>) -> Result<(), MLSError> {
+        let signer: SignatureKeyPair =
+            serde_json::from_slice(&key_data).map_err(|_| MLSError::SerializationError)?;
+        let mapping_key = [
+            b"catbird.browser.identity.v1\0".as_slice(),
+            identity.as_slice(),
+        ]
+        .concat();
+        let conn = self.provider.storage().conn();
+        conn.transaction(|| -> Result<(), crate::sqlite_conn::WasmSqliteError> {
+            if let Some(existing) = conn.get(&mapping_key)? {
+                if existing != signer.public() {
+                    return Err(crate::sqlite_conn::WasmSqliteError::Serialization(
+                        "identity signer replacement requires explicit rotation".into(),
+                    ));
+                }
+            }
+            signer.store(self.provider.storage())?;
+            conn.put(&mapping_key, signer.public())
+        })
+        .map_err(|_| MLSError::StorageError)?;
+        self.signers.borrow_mut().insert(identity, Rc::new(signer));
+        Ok(())
+    }
+    fn update_group_metadata(
+        &self,
+        _group_id: Vec<u8>,
+        _metadata_json: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "shared encrypted metadata update is not wired for browser".into(),
+        })
+    }
+    fn propose_self_remove(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "browser self-remove proposal unavailable".into(),
+        })
+    }
+    fn commit_pending_proposals(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "browser proposal commit unavailable".into(),
+        })
+    }
+    fn add_members_with_aad(
+        &self,
+        _group_id: Vec<u8>,
+        _key_packages: Vec<KeyPackageData>,
+        _aad: Option<Vec<u8>>,
+    ) -> Result<AddMembersResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "browser authenticated Add unavailable".into(),
+        })
+    }
+    fn remove_members_with_aad(
+        &self,
+        _group_id: Vec<u8>,
+        _member_identities: Vec<Vec<u8>>,
+        _aad: Option<Vec<u8>>,
+    ) -> Result<catbird_mls::RemoveMembersResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "browser authenticated Remove unavailable".into(),
+        })
+    }
+    fn add_members_with_metadata(
+        &self,
+        _group_id: Vec<u8>,
+        _key_packages: Vec<KeyPackageData>,
+        _title: Option<String>,
+        _description: Option<String>,
+    ) -> Result<AddMembersResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "browser Add with metadata unavailable".into(),
+        })
+    }
+    fn ensure_storage_durable(&self) -> Result<(), MLSError> {
+        self.provider
+            .storage()
+            .conn()
+            .ensure_durable()
+            .map_err(|_| MLSError::StorageError)
+    }
+    fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        use openmls_traits::storage::StorageProvider;
+        self.ensure_loaded(&group_id)?;
+        let tag: ConfirmationTag = self
+            .provider
+            .storage()
+            .confirmation_tag(&GroupId::from_slice(&group_id))
+            .map_err(|_| MLSError::StorageError)?
+            .ok_or(MLSError::StorageError)?;
+        let bytes = tag
+            .tls_serialize_detached()
+            .map_err(|_| MLSError::SerializationError)?;
+        Ok(if bytes.len() == 33 && bytes[0] == 32 {
+            bytes[1..].to_vec()
+        } else {
+            bytes
+        })
+    }
+    fn get_group_context_hash(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        use openmls_traits::storage::StorageProvider;
+        use sha2::Digest;
+        self.ensure_loaded(&group_id)?;
+        let context: GroupContext = self
+            .provider
+            .storage()
+            .group_context(&GroupId::from_slice(&group_id))
+            .map_err(|_| MLSError::StorageError)?
+            .ok_or(MLSError::StorageError)?;
+        let bytes = context
+            .tls_serialize_detached()
+            .map_err(|_| MLSError::SerializationError)?;
+        Ok(sha2::Sha256::digest(bytes).to_vec())
+    }
+    fn epoch_authenticator(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        self.ensure_loaded(&group_id)?;
+        Ok(self.groups.borrow()[&group_id]
+            .epoch_authenticator()
+            .as_slice()
+            .to_vec())
+    }
+    fn group_member_identities(&self, group_id: Vec<u8>) -> Result<Vec<Vec<u8>>, MLSError> {
+        self.ensure_loaded(&group_id)?;
+        Ok(self.groups.borrow()[&group_id]
+            .members()
+            .map(|member| member.credential.serialized_content().to_vec())
+            .collect())
+    }
+    fn group_is_active(&self, group_id: Vec<u8>) -> Result<bool, MLSError> {
+        self.ensure_loaded(&group_id)?;
+        Ok(self.groups.borrow()[&group_id].is_active())
+    }
+    fn merge_incoming_commit(&self, group_id: Vec<u8>, target_epoch: u64) -> Result<u64, MLSError> {
+        self.merge_incoming_commit_with_outcome(group_id, target_epoch)
+            .map(|outcome| outcome.epoch())
+    }
+    fn merge_incoming_commit_with_outcome(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<IncomingCommitMergeOutcome, MLSError> {
+        self.ensure_loaded(&group_id)?;
+        if self.get_epoch(group_id.clone())?.checked_add(1) != Some(target_epoch) {
+            return Err(MLSError::invalid_input(
+                "incoming commit target does not follow local epoch",
+            ));
+        }
+        let key = (group_id.clone(), target_epoch);
+        let staged = self
+            .pending_incoming_merges
+            .borrow_mut()
+            .remove(&key)
+            .ok_or_else(|| MLSError::invalid_input("exact incoming commit is not staged"))?;
+        let removed = staged.self_removed();
+        self.groups
+            .borrow_mut()
+            .get_mut(&group_id)
+            .expect("group loaded")
+            .merge_staged_commit(&self.provider, staged)
+            .map_err(|e| MLSError::OpenMLS(format!("merge_staged_commit: {e:?}")))?;
+        Ok(if removed {
+            IncomingCommitMergeOutcome::Removed {
+                epoch: target_epoch,
+            }
+        } else {
+            IncomingCommitMergeOutcome::Active {
+                epoch: target_epoch,
+            }
+        })
+    }
+    fn discard_incoming_commit(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<(), MLSError> {
+        self.pending_incoming_merges
+            .borrow_mut()
+            .remove(&(group_id, target_epoch));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+    use catbird_mls::orchestrator::mls_provider::MlsCryptoContext;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
+    #[wasm_bindgen_test]
+    async fn provider_reopens_identity_and_group_from_opfs() {
+        SqliteConn::initialize_opfs().await.unwrap();
+        let path = format!("provider-{}.db", uuid::Uuid::new_v4());
+        let key = "ab".repeat(32);
+        let identity = b"did:example:alice#device".to_vec();
+        let (public_key, group_id) = {
+            let context = WasmMLSContext::open(&path, &key).unwrap();
+            let provider: &dyn MlsCryptoContext = &context;
+            let kp = provider.create_key_package(identity.clone()).unwrap();
+            let group = provider.create_group(identity.clone(), None).unwrap();
+            provider.ensure_storage_durable().unwrap();
+            (kp.signature_public_key, group.group_id)
+        };
+        let context = WasmMLSContext::open(&path, &key).unwrap();
+        let provider: &dyn MlsCryptoContext = &context;
+        let kp = provider.create_key_package(identity).unwrap();
+        assert_eq!(public_key, kp.signature_public_key);
+        assert_eq!(provider.get_epoch(group_id.clone()).unwrap(), 0);
+        assert!(provider
+            .add_members_with_aad(group_id.clone(), vec![], Some(vec![1]))
+            .is_err());
+        assert_eq!(provider.get_epoch(group_id).unwrap(), 0);
+    }
+}

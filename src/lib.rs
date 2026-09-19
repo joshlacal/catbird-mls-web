@@ -689,6 +689,8 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
     // conversations/messages, and credentials. Previously each used a separate
     // IndexedDB — credentials leaked signing keys and MLS DID in plaintext, and
     // conversation storage had no encryption at the IDB layer.
+    sqlite_conn::SqliteConn::initialize_opfs().await
+        .map_err(|error| js_err!("Persistent encrypted storage unavailable: {}", error))?;
     let sqlite_db_name = format!("{}-app.db", cfg.db_prefix);
     let shared_conn = match sqlite_conn::SqliteConn::open(&sqlite_db_name, &db_key) {
         Ok(conn) => Rc::new(conn),

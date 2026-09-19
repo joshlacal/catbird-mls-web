@@ -539,42 +539,15 @@ impl MLSAPIClient for WasmApiClient {
 
     async fn get_key_packages(
         &self,
-        actor_device_id: &str,
-        dids: &[String],
+        _actor_device_id: &str,
+        _dids: &[String],
     ) -> Result<Vec<KeyPackageRef>> {
-        let token = self.auth_header()?;
-        let mut query: Vec<(&str, &str)> = vec![("actorDeviceId", actor_device_id)];
-        for did in dids {
-            query.push(("userDids", did.as_str()));
-        }
-        let resp = self
-            .client
-            .get(self.xrpc_url("blue.catbird.chat.getDevices"))
-            .bearer_auth(&token)
-            .query(&query)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: blue_catbird::chat::get_devices::GetDevicesOutput<String> =
-            serde_json::from_slice(&body)
-                .map_err(|e| OrchestratorError::Api(format!("getDevices parse: {e}")))?;
-        Ok(output
-            .devices
-            .iter()
-            .map(|kp| KeyPackageRef {
-                did: kp.user_did.to_string(),
-                key_package_data: vec![],
-                hash: Some(kp.key_id.to_string()),
-                cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
-            })
-            .collect())
+        // getDevices is an inventory of device identities, not an authorized
+        // package reservation. Never manufacture empty packages or treat a
+        // device key ID as an MLS KeyPackage reference.
+        Err(OrchestratorError::Api(
+            "browser key-package acquisition requires an authorized preparation; legacy getDevices cannot supply packages".into(),
+        ))
     }
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {

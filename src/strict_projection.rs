@@ -1467,6 +1467,14 @@ pub(crate) fn finish_signed_request(
 // Validators (ported verbatim from the approved native module)
 // ---------------------------------------------------------------------------
 
+/// Validate an unsigned read/event shape against the pinned canonical schema.
+/// This validates framing only; shared orchestration owns all state authority.
+pub(crate) fn validate_read_shape(name: &str, raw: &[u8]) -> Result<serde_json::Value, TransportError> {
+    let value=parse_strict_signed_json(raw)?;
+    project_schema_ref(name,&value,false)?;
+    serde_json::from_slice(raw).map_err(|e|TransportError::Serialization(e.to_string()))
+}
+
 pub(crate) fn derive_key_id(public_key: &[u8]) -> String {
     use sha2::Digest as _;
     URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(public_key))

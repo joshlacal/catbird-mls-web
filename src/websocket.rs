@@ -1336,8 +1336,8 @@ impl WsSubscription {
 /// # Errors
 /// Returns `Err(JsValue)` when the ticket HTTP request fails, the ticket
 /// response cannot be parsed, or `WebSocket` construction itself fails.
-#[wasm_bindgen]
-pub async fn connect(
+#[allow(dead_code)]
+async fn connect(
     convo_id: String,
     base_url: String,
     auth_token: String,

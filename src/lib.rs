@@ -34,6 +34,7 @@ mod browser_transport;
 mod credentials;
 mod browser_enrollment;
 mod browser_inventory;
+mod browser_subscription;
 mod request_runtime;
 pub mod mls_storage;
 pub mod sqlite_conn;
@@ -205,6 +206,8 @@ pub struct Message {
     pub message_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageAttachment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_invitation: Option<catbird_mls::orchestrator::GroupInvitationReference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,6 +444,7 @@ fn image_attachment_from_message(
 
 fn ui_message_from_orchestrator(message: catbird_mls::orchestrator::types::Message) -> Message {
     let image = image_attachment_from_message(&message);
+    let group_invitation=message.payload().and_then(|p|p.checked_group_invitation().ok().flatten()).filter(|r|r.invited_by_did==catbird_mls::orchestrator::credential_binding::credential_root_did(&message.sender_did));
     let message_type = if image.is_some() {
         "image".to_string()
     } else {
@@ -462,6 +466,7 @@ fn ui_message_from_orchestrator(message: catbird_mls::orchestrator::types::Messa
         },
         message_type,
         image,
+        group_invitation,
     }
 }
 
@@ -480,8 +485,7 @@ struct InitConfig {
     #[serde(default = "default_proxy_did")]
     proxy_did: String,
     /// Pre-supplied MLS database encryption key (hex-encoded, 256-bit).
-    /// When provided, skips localStorage lookup for the key.
-    /// Required when running inside a Web Worker (no localStorage access).
+    /// Required: released by the host persistent protected key vault.
     mls_db_key: Option<String>,
 }
 
@@ -639,28 +643,6 @@ fn proxy_client(proxy_did: &str) -> reqwest::Client {
 // ---------------------------------------------------------------------------
 // MLS storage key management
 // ---------------------------------------------------------------------------
-
-fn get_or_create_mls_key(storage_prefix: &str) -> Result<String, JsValue> {
-    let ls = web_sys::window()
-        .ok_or_else(|| js_err!("No global window"))?
-        .local_storage()
-        .map_err(|e| js_err!("localStorage unavailable: {:?}", e))?
-        .ok_or_else(|| js_err!("No localStorage available"))?;
-
-    let key_name = format!("{}_mls_db_key", storage_prefix);
-
-    if let Some(key) = ls.get_item(&key_name).ok().flatten() {
-        return Ok(key);
-    }
-
-    let mut key_bytes = [0u8; 32];
-    getrandom::getrandom(&mut key_bytes)
-        .map_err(|e| js_err!("Failed to generate MLS key: {}", e))?;
-    let key_hex: String = key_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    ls.set_item(&key_name, &key_hex)
-        .map_err(|e| js_err!("Failed to persist MLS key: {:?}", e))?;
-    Ok(key_hex)
-}
 
 // ---------------------------------------------------------------------------
 // Init
@@ -1332,137 +1314,27 @@ fn validate_existing_direct_view(
 
 #[wasm_bindgen]
 pub async fn catbird_mls_list_conversations() -> Result<JsValue, JsValue> {
-    use catbird_mls::orchestrator::api_client::MLSAPIClient;
-
-    let (api_client, storage, user_did) = with_state(|s| {
-        let user_did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((Arc::clone(&s.api_client), Arc::clone(&s.storage), user_did))
-    })?;
-
-    let mut seen = std::collections::HashSet::new();
-    let mut seen_cursors = std::collections::HashSet::new();
-    let mut convos = Vec::new();
-    let mut cursor = None;
-    let mut page_count = 0usize;
-    loop {
-        page_count = page_count.saturating_add(1);
-        if page_count > MAX_CONVERSATION_PAGES {
-            return Err(js_err!("get_conversations exceeded the page ceiling"));
-        }
-        let page = api_client
-            .get_conversations(50, cursor.as_deref())
-            .await
-            .map_err(|e| js_err!("get_conversations failed: {:?}", e))?;
-        if page.conversations.len() > 50
-            || convos.len().saturating_add(page.conversations.len()) > MAX_CONVERSATION_ITEMS
-        {
-            return Err(js_err!("get_conversations exceeded the item ceiling"));
-        }
-        for c in page.conversations {
-            // The stable conversation id is the sole UI/API identity. A
-            // duplicate across pages must not create a second Svelte row or
-            // regress the already-authoritative group coordinate.
-            let conversation_id = c.conversation_id.clone();
-            canonical_uuid_string(&conversation_id, "conversationId")
-                .map_err(|e| js_err!("invalid conversation list identity: {}", e))?;
-            let listed_group_id = decode_group_coordinate(&c.group_id)
-                .map(|bytes| hex::encode(bytes))
-                .ok_or_else(|| js_err!("conversation {} has invalid groupId", conversation_id))?;
-            if !seen.insert(conversation_id.clone()) {
-                continue;
-            }
-            // A server page can race a completed reset and still contain the
-            // predecessor group alias. Preserve the locally fenced current
-            // coordinate instead of letting that stale snapshot regress the
-            // stable projection (or fail the entire list operation).
-            let mut group_id = listed_group_id.clone();
-            let mut members = c.members.clone();
-            let mut epoch = c.epoch;
-            let stale_alias = if let Some((_, current_group)) = storage
-                .resolve_conversation_mapping(&user_did, &conversation_id)
-                .map_err(|e| js_err!("conversation mapping lookup failed: {}", e))?
-            {
-                if current_group != listed_group_id
-                    && storage
-                        .conversation_group_aliases(&user_did, &conversation_id)
-                        .map_err(|e| js_err!("conversation alias lookup failed: {}", e))?
-                        .iter()
-                        .any(|alias| alias == &listed_group_id)
-                {
-                    if let Some(local) = storage
-                        .get_conversation(&user_did, &conversation_id)
-                        .await
-                        .map_err(|e| js_err!("stale conversation lookup failed: {:?}", e))?
-                    {
-                        group_id = local.group_id;
-                        members = local.members;
-                        epoch = local.epoch;
-                    } else {
-                        group_id = current_group;
-                    }
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if !stale_alias {
-                persist_conversation_projection(
-                    &storage,
-                    &user_did,
-                    &conversation_id,
-                    &group_id,
-                    epoch,
-                    members.clone(),
-                )
-                .await?;
-            }
-
-            // MLS metadata cutover: read display name from the local
-            // decrypted-blob cache only; storage errors are not absence.
-            let cached_title = storage
-                .get_metadata_text(&group_id)
-                .map_err(|e| js_err!("conversation metadata lookup failed: {}", e))?
-                .and_then(|(title, _desc)| title);
-            let member_dids: Vec<String> = members.iter().map(|m| m.did.clone()).collect();
-            let display_name = cached_title
-                .filter(|t: &String| !t.is_empty())
-                .unwrap_or_else(|| member_dids.join(", "));
-            let conversation_kind = storage
-                .conversation_kind(&user_did, &conversation_id)
-                .map_err(|e| js_err!("conversation kind lookup failed: {}", e))?
-                .unwrap_or_else(|| {
-                    if conversation_is_group(&members) {
-                        "group".to_string()
-                    } else {
-                        "direct".to_string()
-                    }
-                });
-            convos.push(Conversation {
-                id: conversation_id,
-                group_id,
-                display_name,
-                members: member_dids.clone(),
-                member_views: Some(members.clone()),
-                conversation_kind: conversation_kind.clone(),
-                last_message: None,
-                last_message_at: None,
-                unread_count: 0,
-                is_group: conversation_kind == "group",
-            });
-        }
-        let Some(next) = page.cursor else { break };
-        if !seen_cursors.insert(next.clone()) {
-            return Err(js_err!("get_conversations pagination repeated cursor"));
-        }
-        cursor = Some(next);
+    let (owner, runtime) = request_runtime::current_engine()?;
+    request_runtime::synchronize(&owner, &runtime, true).await?;
+    let views = runtime.conversations().lock().await.values().cloned().collect::<Vec<_>>();
+    let storage = with_state(|s| Ok(s.storage.clone()))?;
+    let requests = runtime.list_direct_request_views().await.map_err(|e| js_err!("{}", e))?;
+    request_runtime::current(&owner, &runtime)?;
+    let mut conversations = Vec::new();
+    for view in views {
+        if matches!(storage.get_conversation_state(&view.conversation_id).await.map_err(|e| js_err!("{}",e))?, Some(catbird_mls::orchestrator::types::ConversationState::Closed | catbird_mls::orchestrator::types::ConversationState::DeviceRemoved)) { continue; }
+        // Request rows live in the request workspace until consent is verified.
+        // A missing local request projection never authorizes normal chat UI.
+        if view.canonical_state.as_ref().is_some_and(|s|s.direct_request.is_some()) &&
+            !requests.iter().any(|r| r.conversation_id==view.conversation_id && r.consent==catbird_mls::orchestrator::RequestConsent::Accepted) { continue; }
+        let group_id=decode_group_coordinate(&view.group_id).map(hex::encode).ok_or_else(||js_err!("Invalid protected group coordinate"))?;
+        let members=view.members.iter().map(|m|m.did.clone()).collect::<Vec<_>>();
+        let title=storage.get_metadata_text(&group_id).map_err(|e|js_err!("{}",e))?.and_then(|(title,_)|title).filter(|t|!t.is_empty()).unwrap_or_else(||members.join(", "));
+        let kind=storage.conversation_kind(&owner,&view.conversation_id).map_err(|e|js_err!("{}",e))?.unwrap_or_else(||if conversation_is_group(&view.members){"group"}else{"direct"}.into());
+        conversations.push(Conversation{id:view.conversation_id,group_id,display_name:title,members,member_views:Some(view.members),is_group:kind=="group",conversation_kind:kind,last_message:None,last_message_at:None,unread_count:0});
     }
-
-    to_js(&convos)
+    request_runtime::current(&owner,&runtime)?;
+    to_js(&conversations)
 }
 
 #[wasm_bindgen]
@@ -1865,30 +1737,8 @@ pub async fn catbird_mls_create_conversation(
 }
 
 #[wasm_bindgen]
-pub async fn catbird_mls_subscribe(
-    convo_id: String,
-    on_message: js_sys::Function,
-    on_event: js_sys::Function,
-    on_status: js_sys::Function,
-) -> Result<websocket::WsSubscription, JsValue> {
-    let (resolved_convo_id, _) = resolve_conversation_identity(&convo_id)?;
-    let (base_url, auth_token) = with_state(|s| {
-        let token = s
-            .auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((s.base_url.clone(), token))
-    })?;
-
-    websocket::connect(
-        resolved_convo_id,
-        base_url,
-        auth_token,
-        on_message,
-        on_event,
-        on_status,
-    )
-    .await
+pub async fn catbird_mls_subscribe(convo_id:String,on_message:js_sys::Function,on_event:js_sys::Function,on_status:js_sys::Function)->Result<browser_subscription::CanonicalSubscription,JsValue>{
+    browser_subscription::connect(convo_id,on_message,on_event,on_status).await
 }
 
 #[wasm_bindgen]
@@ -3305,293 +3155,10 @@ pub async fn catbird_mls_run_deferred_recovery() -> Result<JsValue, JsValue> {
 /// `run_deferred_recovery_guarded`; calling this directly bypasses the
 /// re-entrancy guard and can run concurrently with a timer tick.
 async fn run_deferred_recovery_inner() -> Result<JsValue, JsValue> {
-    use catbird_mls::orchestrator::storage::MLSStorageBackend;
-    use catbird_mls::orchestrator::types::ConversationState;
-
-    let (api_client, storage, user_did, base_url, auth_token, proxy_did) = with_state(|s| {
-        let did = s
-            .user_did
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        let token = s
-            .auth_token
-            .clone()
-            .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((
-            Arc::clone(&s.api_client),
-            Arc::clone(&s.storage),
-            did,
-            s.base_url.clone(),
-            token,
-            s.proxy_did.clone(),
-        ))
-    })?;
-
-    // 1. Find ResetPending convos.
-    let convos = storage
-        .list_conversations(&user_did)
-        .await
-        .map_err(|e| js_err!("list_conversations failed: {:?}", e))?;
-
-    let mut pending: Vec<(String, String, i32)> = Vec::new();
-    for c in &convos {
-        if let Ok(Some(ConversationState::ResetPending {
-            new_group_id,
-            reset_generation,
-            ..
-        })) = storage.get_conversation_state(&c.conversation_id).await
-        {
-            pending.push((c.conversation_id.clone(), new_group_id, reset_generation));
-        }
-    }
-
-    if pending.is_empty() {
-        return to_js(&serde_json::json!({ "touched": 0 }));
-    }
-
-    let mut touched: usize = 0;
-    for (convo_id, new_group_id_hex, reset_generation) in pending {
-        touched += 1;
-
-        // 2. Try Welcome → External Commit ladder.
-        if try_join_group_internal(&convo_id).await.is_ok() {
-            web_sys::console::log_1(&js_err!(
-                "[deferred-recovery] {}: atomically completed via Welcome/ExternalCommit",
-                convo_id
-            ));
-            continue;
-        }
-
-        // 3. First-responder bootstrap fallback.
-        let new_group_id_bytes = match decode_group_coordinate(&new_group_id_hex) {
-            Some(bytes) => bytes,
-            None => {
-                web_sys::console::warn_1(&js_err!(
-                    "[deferred-recovery] {}: ResetPending.new_group_id is not an exact 16-byte coordinate ({})",
-                    convo_id,
-                    new_group_id_hex
-                ));
-                continue;
-            }
-        };
-
-        // 3a. Fetch fresh roster (server clears membership atomically with
-        // reset; cached `group_states.members` is the pre-reset roster).
-        let roster = match fetch_roster_for_convo(&api_client, &convo_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                web_sys::console::warn_1(&js_err!(
-                    "[deferred-recovery] {}: fetch_roster failed: {}",
-                    convo_id,
-                    e
-                ));
-                continue;
-            }
-        };
-        if roster.is_empty() {
-            web_sys::console::warn_1(&js_err!(
-                "[deferred-recovery] {}: roster empty — cannot bootstrap",
-                convo_id
-            ));
-            continue;
-        }
-
-        // 3b. Build the local group at the predetermined id.
-        storage
-            .mark_cleanup_intent(
-                &user_did,
-                &convo_id,
-                &new_group_id_hex,
-                "reset-bootstrap-speculative",
-            )
-            .map_err(|e| js_err!("{} reset cleanup intent failed: {}", convo_id, e))?;
-        let identity_bytes = user_did.as_bytes().to_vec();
-        let creation = with_state(|s| {
-            let ctx = s
-                .mls_context
-                .as_ref()
-                .ok_or_else(|| js_err!("MLS context not initialized"))?;
-            ctx.create_group_with_id(identity_bytes.clone(), new_group_id_bytes.clone(), None)
-                .map_err(|e| js_err!("create_group_with_id failed: {:?}", e))
-        });
-        if let Err(e) = creation {
-            web_sys::console::warn_1(&e);
-            continue;
-        }
-
-        // 3c. Export GroupInfo from the freshly-created group — required
-        // by `bootstrapResetGroup` (lexicon `groupInfo` field).
-        let group_info_bytes = with_state(|s| {
-            let ctx = s
-                .mls_context
-                .as_ref()
-                .ok_or_else(|| js_err!("MLS context not initialized"))?;
-            ctx.export_group_info(new_group_id_bytes.clone(), identity_bytes.clone())
-                .map_err(|e| js_err!("export_group_info failed: {:?}", e))
-        });
-        let group_info_bytes = match group_info_bytes {
-            Ok(b) => b,
-            Err(e) => {
-                web_sys::console::warn_1(&e);
-                let _ = with_state(|s| {
-                    if let Some(ctx) = s.mls_context.as_ref() {
-                        let _ = ctx.delete_group(new_group_id_bytes.clone());
-                    }
-                    Ok(())
-                });
-                continue;
-            }
-        };
-
-        // 3d. Submit via `bootstrapResetGroup` (server task #17 / spec §8.5).
-        // Server UPDATEs the post-reset row in place
-        // (id=originalConvoId, group_id=newGroupId) rather than INSERTing a
-        // new conversation — earlier fix-forward target was `createConvo`,
-        // but that orphaned the post-reset row (id mismatch). Members
-        // roster is preserved server-side; the lexicon `members` field is
-        // diagnostic-only but required. Idempotency-Key kept for
-        // client-side dedup of network retries.
-        let idem_key = format!("{}:{}:{}:bootstrap", convo_id, reset_generation, user_did);
-        let body = serde_json::json!({
-            "originalConvoId": &convo_id,
-            "newGroupId": &new_group_id_hex,
-            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            "groupInfo": &group_info_bytes,
-            "members": roster.iter().map(|member| member.did.clone()).collect::<Vec<_>>(),
-            "currentEpoch": 1,
-        });
-        let url = format!(
-            "{}/xrpc/blue.catbird.chat.requestReset",
-            base_url.trim_end_matches('/')
-        );
-        let client = proxy_client(&proxy_did);
-        let resp = match client
-            .post(&url)
-            .bearer_auth(&auth_token)
-            .header("Idempotency-Key", &idem_key)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                web_sys::console::warn_1(&js_err!(
-                    "[deferred-recovery] {}: bootstrapResetGroup network err: {} — dropping local pre-bootstrap group, keeping reset_pending",
-                    convo_id,
-                    e
-                ));
-                let _ = with_state(|s| {
-                    if let Some(ctx) = s.mls_context.as_ref() {
-                        let _ = ctx.delete_group(new_group_id_bytes.clone());
-                    }
-                    Ok(())
-                });
-                continue;
-            }
-        };
-
-        let status = resp.status().as_u16();
-        if resp.status().is_success() {
-            // 3e. Race winner — commit the stable mapping, historical alias,
-            // group state, roster, and reset-authority clear as one exact
-            // generation-fenced transaction. Recovery remains pending when
-            // any part of that commit fails.
-            let local_epoch = with_state(|s| {
-                Ok(s.mls_context
-                    .as_ref()
-                    .and_then(|ctx| ctx.get_epoch(new_group_id_bytes.clone()).ok())
-                    .unwrap_or(0))
-            })
-            .unwrap_or(0);
-            let expected_state_version = match storage
-                .conversation_state_version(&user_did, &convo_id)
-            {
-                Ok(version) => version,
-                Err(e) => {
-                    web_sys::console::warn_1(&js_err!(
-                        "[deferred-recovery] {}: reset state-version lookup failed: {} — keeping reset_pending",
-                        convo_id,
-                        e
-                    ));
-                    continue;
-                }
-            };
-            let committed = storage.complete_reset_pending_projection(
-                &user_did,
-                &convo_id,
-                reset_generation,
-                expected_state_version,
-                &new_group_id_hex,
-                local_epoch,
-                &roster,
-            );
-            match committed {
-                Ok(true) => {
-                    storage
-                        .clear_cleanup_intent(&user_did, &new_group_id_hex)
-                        .map_err(|e| {
-                            js_err!(
-                                "{} reset cleanup intent clear failed after commit: {}",
-                                convo_id,
-                                e
-                            )
-                        })?;
-                }
-                Ok(false) => {
-                    web_sys::console::warn_1(&js_err!(
-                        "[deferred-recovery] {}: reset winner lost generation/target CAS; keeping reset_pending",
-                        convo_id
-                    ));
-                    continue;
-                }
-                Err(e) => {
-                    web_sys::console::warn_1(&js_err!(
-                        "[deferred-recovery] {}: atomic reset projection failed: {} — keeping reset_pending",
-                        convo_id, e
-                    ));
-                    continue;
-                }
-            }
-            SERVER_EPOCHS.with(|m| m.borrow_mut().insert(convo_id.clone(), local_epoch));
-            web_sys::console::log_1(&js_err!(
-                "[deferred-recovery] {}: bootstrap WON at epoch {} (gen {})",
-                convo_id,
-                local_epoch,
-                reset_generation
-            ));
-            continue;
-        }
-
-        let body_text = resp.text().await.unwrap_or_default();
-        let race_loss = status == 409 && body_text.contains("AlreadyBootstrapped");
-
-        // 3f. On 409 race-loss OR other server error: drop the local
-        // pre-bootstrap group; leave reset_pending set so the next loop
-        // retries Welcome.
-        let _ = with_state(|s| {
-            if let Some(ctx) = s.mls_context.as_ref() {
-                let _ = ctx.delete_group(new_group_id_bytes.clone());
-            }
-            Ok(())
-        });
-
-        if race_loss {
-            web_sys::console::log_1(&js_err!(
-                "[deferred-recovery] {}: bootstrap LOST race (409 AlreadyBootstrapped, gen {}) — will retry Welcome",
-                convo_id,
-                reset_generation
-            ));
-        } else {
-            web_sys::console::warn_1(&js_err!(
-                "[deferred-recovery] {}: bootstrapResetGroup {} -> {} — keeping reset_pending, will retry",
-                convo_id,
-                status,
-                body_text
-            ));
-        }
-    }
-
-    to_js(&serde_json::json!({ "touched": touched }))
+    let (owner,runtime)=request_runtime::current_engine()?;
+    request_runtime::synchronize(&owner,&runtime,true).await?;
+    request_runtime::current(&owner,&runtime)?;
+    to_js(&serde_json::json!({"touched":0,"reconciled":true}))
 }
 
 /// Page through `getConvos` to find the membership roster for one

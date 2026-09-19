@@ -16,7 +16,7 @@ struct RequestDraft {
 }
 #[derive(Serialize)]
 #[serde(rename_all="camelCase")]
-struct Workspace { owner_did:String, delivery_enabled:Option<bool>, drafts:Vec<RequestDraft>, requests:Vec<catbird_mls::DirectRequestView> }
+struct Workspace { owner_did:String, delivery_enabled:Option<bool>, drafts:Vec<RequestDraft>, requests:Vec<catbird_mls::DirectRequestView>, discovery_error:Option<String> }
 fn err(error:impl std::fmt::Display)->JsValue {JsValue::from_str(&error.to_string())}
 fn engine(owner:&str)->Result<Arc<BrowserOrchestrator>,JsValue> {
     with_state(|s| {
@@ -34,6 +34,12 @@ pub(crate) async fn require_ordinary_access(cid:&str)->Result<(),JsValue>{
     let readiness=runtime.ensure_conversation_ready(cid).await.map_err(err)?;
     current(&did,&runtime)?;
     if !readiness.send_allowed{return Err(err("Conversation consent or device readiness does not allow this action"));}Ok(())
+}
+pub(crate) async fn synchronize(did:&str,runtime:&Arc<BrowserOrchestrator>,fresh:bool)->Result<(),JsValue>{
+    let api=with_state(|s|Ok(s.api_client.clone()))?;
+    let actor=runtime.credentials().get_device_uuid(did).await.map_err(err)?.ok_or_else(||err("Enrolled actor missing"))?;
+    crate::browser_inventory::synchronize_inventory(runtime.clone(),api,did,&actor,fresh).await.map_err(err)?;
+    current(did,runtime)
 }
 pub(crate) async fn replenish()->Result<JsValue,JsValue>{
     let (did,runtime)=current_engine()?;
@@ -55,14 +61,20 @@ fn save(ctx:&WasmMLSContext,value:&RequestDraft,expected:Option<&[u8]>)->Result<
 pub(crate) async fn setup()->Result<JsValue,JsValue>{
     let (did,engine,ctx,creds,api)=with_state(|s|Ok((s.user_did.clone().ok_or_else(||err("Not authenticated"))?,s.request_engine.clone().ok_or_else(||err("Request engine unavailable"))?,s.mls_context.clone().ok_or_else(||err("Crypto unavailable"))?,s.credentials.clone(),s.api_client.clone())))?;
     engine.initialize(&did).await.map_err(err)?;
-    let mls_did=crate::browser_enrollment::initialize_enrollment(ctx,creds.clone(),api.clone(),&did).await.map_err(err)?;
+    let mls_did=if let Some(journal)=creds.enrollment(&did).map_err(err)?.filter(|j|j.auth_generation.is_some()) {
+        journal.validate_local(&did,&ctx).map_err(err)?;
+        journal.mls_did
+    } else {crate::browser_enrollment::initialize_enrollment(ctx,creds.clone(),api.clone(),&did).await.map_err(err)?};
     current(&did,&engine)?;
     let device=creds.get_device_uuid(&did).await.map_err(err)?.ok_or_else(||err("Enrolled actor missing"))?;
     api.bind_actor(&did,&device).map_err(err)?;
-    engine.replenish_direct_request_keys_if_needed().await.map_err(err)?;
     current(&did,&engine)?;
     with_state_mut(|s|{s.request_ready=true;Ok(())})?;
-    to_js(&serde_json::json!({"status":"registered","mlsDid":mls_did}))
+    // Local custody is ready offline. Pool maintenance errors remain visible to
+    // the explicit delivery preference command and do not block existing chats.
+    let maintenance=engine.replenish_direct_request_keys_if_needed().await;
+    current(&did,&engine)?;
+    to_js(&serde_json::json!({"status":"registered","mlsDid":mls_did,"requestKeyMaintenancePending":maintenance.is_err()}))
 }
 
 #[wasm_bindgen]
@@ -104,10 +116,11 @@ pub async fn catbird_mls_request_command(command:String,args:JsValue)->Result<Js
     let runtime=engine(did)?;let ctx=runtime.mls_context();
     match command.as_str(){
         "get_request_workspace"=>{
+            let discovery_error=synchronize(did,&runtime,true).await.err().map(|_|"New requests could not be checked. Saved requests remain available.".to_owned());
             let requests=runtime.list_direct_request_views().await.map_err(err)?;
             let delivery_enabled=runtime.get_direct_request_delivery_enabled().await.map_err(err)?;
             let drafts=ctx.request_values("uiDraft").map_err(err)?.into_iter().map(|r|serde_json::from_slice(&r).map_err(err)).collect::<Result<Vec<_>,_>>()?;
-            current(did,&runtime)?;to_js(&Workspace{owner_did:did.to_owned(),delivery_enabled,drafts,requests})
+            current(did,&runtime)?;to_js(&Workspace{owner_did:did.to_owned(),delivery_enabled,drafts,requests,discovery_error})
         }
         "save_request_draft"=>{
             let input:DirectRequestInput=serde_json::from_value(args["input"].clone()).map_err(err)?;
@@ -139,4 +152,57 @@ pub async fn catbird_mls_request_command(command:String,args:JsValue)->Result<Js
         "request_sender"=>{let cid=args["conversationId"].as_str().ok_or_else(||err("Missing conversation"))?;let views=runtime.list_direct_request_views().await.map_err(err)?;current(did,&runtime)?;let view=views.into_iter().find(|v|v.conversation_id==cid&&v.consent==RequestConsent::IncomingPending).ok_or_else(||err("Verified incoming request unavailable"))?;to_js(&view.introduction.ok_or_else(||err("Sender proof unavailable"))?.sender_did)},
         _=>Err(err("Unknown request command"))
     }
+}
+
+#[cfg(all(test,feature="inventory-worker-tests"))]
+mod tests {
+ use super::*; use wasm_bindgen_test::*;
+ #[wasm_bindgen(inline_js=r#"
+ let previousFetch;let preparation=[];let cancellation=[];
+ export function installRequestFacadeFixture(doc){
+  previousFetch=globalThis.fetch;preparation=[];cancellation=[];
+  globalThis.fetch=async(input,options)=>{
+   const url=typeof input==='string'?input:input.url;
+   const response=(body,status=200)=>{const r=new Response(JSON.stringify(body),{status,headers:{'content-type':'application/json'}});Object.defineProperty(r,'url',{value:url});return r;};
+   if(url==='https://chat.catbird.blue/.well-known/did.json')return response(JSON.parse(doc));
+   if(url.includes('.enrollDevice')){const b=JSON.parse(await input.clone().text()).signedRequest.body;return response({device:{deviceId:b.deviceId,keyId:b.keyId,signaturePublicKey:{$bytes:b.signaturePublicKey},authGeneration:7,status:'active',availablePackageCount:1,reservedPackageCount:0,createdAt:'2026-09-19T12:00:00.000Z',updatedAt:'2026-09-19T12:00:00.000Z'}});}
+   if(url.includes('.getConversations'))return response({items:[],hasMore:false,inventorySessionId:'s'.repeat(32),snapshotEventCursor:'cursor',snapshotExpiresAt:'2099-01-01T00:00:00.000Z',inventoryScope:{supportedProtocolVersions:['1','2'],scopeDigest:btoa(String.fromCharCode(...new Array(32).fill(7)))}});
+   if(url.includes('.prepareDirectRequest')){preparation.push(await input.clone().text());throw new Error('injected uncertain preparation');}
+   if(url.includes('.cancelDirectRequestPreparation')){cancellation.push(await input.clone().text());throw new Error('injected uncertain cancellation');}
+   return response({error:'FixtureOffline'},503);
+  };
+ }
+ export function preparationCount(){return preparation.length;}
+ export function cancellationCount(){return cancellation.length;}
+ export function exactPreparations(){return preparation.length>=2&&preparation.every(x=>x===preparation[0]);}
+ export function exactCancellations(){return cancellation.length>=2&&cancellation.every(x=>x===cancellation[0]);}
+ export function restoreRequestFacadeFixture(){globalThis.fetch=previousFetch;}
+ "#)] extern "C" {fn installRequestFacadeFixture(doc:&str);fn preparationCount()->u32;fn cancellationCount()->u32;fn exactPreparations()->bool;fn exactCancellations()->bool;fn restoreRequestFacadeFixture();}
+ struct Restore;impl Drop for Restore{fn drop(&mut self){restoreRequestFacadeFixture();STATE.with(|s|*s.borrow_mut()=None);}}
+ async fn initialize(prefix:&str,owner:&str){
+  crate::catbird_mls_init(js_sys::JSON::parse(&serde_json::json!({"baseUrl":"https://facade.invalid","dbPrefix":prefix,"mlsDbKey":"bd".repeat(32)}).to_string()).unwrap()).await.unwrap();
+  crate::catbird_mls_set_auth(owner.into(),"fixture-session".into()).unwrap();
+  setup().await.unwrap();
+ }
+ #[wasm_bindgen_test]
+ async fn shared_facade_retains_uncertain_prepare_and_cancel_through_restart(){
+  use base64::engine::general_purpose::STANDARD_NO_PAD;
+  let key=p256::ecdsa::SigningKey::from_slice(&[41;32]).unwrap();let point=key.verifying_key().to_encoded_point(true);let id=catbird_mls::chat_v2::transcript::direct_request::direct_request_receipt_key_id(point.as_bytes()).unwrap();let mut multikey=vec![0x80,0x24];multikey.extend(point.as_bytes());
+  let doc=serde_json::json!({"id":"did:web:chat.catbird.blue","verificationMethod":[{"id":id,"controller":"did:web:chat.catbird.blue","type":"Multikey","publicKeyMultibase":format!("m{}",STANDARD_NO_PAD.encode(multikey))}]});
+  installRequestFacadeFixture(&doc.to_string());let _restore=Restore;
+  let owner="did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";let prefix=format!("facade-{}",uuid::Uuid::new_v4());initialize(&prefix,owner).await;
+  let input=DirectRequestInput{draft_id:uuid::Uuid::new_v4().to_string(),recipient_did:"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),text:"Protected draft content".into(),invitation:None};
+  let outcome=catbird_mls_start_direct_request(to_js(&input).unwrap()).await.unwrap();
+  let outcome:DirectRequestOutcome=serde_wasm_bindgen::from_value(outcome).unwrap();assert!(matches!(outcome,DirectRequestOutcome::OutcomeUnknown{..}));assert_eq!(preparationCount(),1);
+  let raw=with_state(|s|Ok(s.mls_context.as_ref().unwrap().read_direct_request_intent(&input.draft_id).unwrap().unwrap())).unwrap();
+  STATE.with(|s|*s.borrow_mut()=None);initialize(&prefix,owner).await;
+  let outcome=catbird_mls_resume_direct_request(input.draft_id.clone()).await.unwrap();let outcome:DirectRequestOutcome=serde_wasm_bindgen::from_value(outcome).unwrap();assert!(matches!(outcome,DirectRequestOutcome::OutcomeUnknown{..}));assert!(exactPreparations());
+  assert_eq!(with_state(|s|Ok(s.mls_context.as_ref().unwrap().read_direct_request_intent(&input.draft_id).unwrap().unwrap())).unwrap(),raw);
+  let mut changed=input.clone();changed.text="Different content".into();assert!(catbird_mls_start_direct_request(to_js(&changed).unwrap()).await.is_err());assert_eq!(preparationCount(),2);
+  catbird_mls_cancel_direct_request(input.draft_id.clone()).await.unwrap();assert_eq!(cancellationCount(),1);
+  STATE.with(|s|*s.borrow_mut()=None);initialize(&prefix,owner).await;
+  catbird_mls_resume_direct_request(input.draft_id.clone()).await.unwrap();assert!(exactCancellations());assert_eq!(preparationCount(),2);
+  assert!(with_state(|s|Ok(s.mls_context.as_ref().unwrap().list_direct_request_journal().unwrap().is_empty())).unwrap(),"No private group before verified preparation");
+  crate::catbird_mls_clear_auth().unwrap();assert!(catbird_mls_resume_direct_request(input.draft_id).await.is_err());
+ }
 }

@@ -461,7 +461,7 @@ impl MLSAPIClient for WasmApiClient {
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
         let token = self.auth_header()?;
-        let mut query = vec![("limit", limit.to_string())];
+        let mut query = vec![("actorDeviceId",self.actor_device()?),("limit", limit.to_string()),("supportedProtocolVersions","1".into()),("supportedProtocolVersions","2".into())];
         if let Some(c) = cursor {
             query.push(("pageCursor", c.to_string()));
         }
@@ -486,6 +486,9 @@ impl MLSAPIClient for WasmApiClient {
         let output = catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
             .map_err(|error| OrchestratorError::Api(format!("Canonical getConversations decode: {error}")))?;
 
+        if output.has_more != output.next_page_cursor.is_some() {return Err(OrchestratorError::Api("Conversation pagination is incomplete".into()));}
+        let wire:serde_json::Value=serde_json::from_slice(&body).map_err(|e|OrchestratorError::Api(e.to_string()))?;
+        if wire["inventoryScope"]["supportedProtocolVersions"]!=serde_json::json!(["1","2"]){return Err(OrchestratorError::Api("Conversation protocol scope mismatch".into()));}
         let mut conversations = Vec::new();
         for item in output.items {
             if let blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(
@@ -534,18 +537,21 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let mut envelopes = Vec::new();
-        if let Some(entries) = output.get("entries").and_then(|v| v.as_array()) {
-            for entry in entries {
-                if let Some(envelope) = IncomingEnvelope::from_canonical_entry(entry, convo_id)? {
-                    envelopes.push(envelope);
-                }
-            }
+        if body.len()>16*1024*1024 { return Err(OrchestratorError::Api("Entry page exceeds bound".into())); }
+        catbird_mls::chat_v2::transcript::decode_strict_json(&body).map_err(|e|OrchestratorError::Api(e.to_string()))?;
+        let output:serde_json::Value=serde_json::from_slice(&body).map_err(|e|OrchestratorError::Api(e.to_string()))?;
+        let entries=output["entries"].as_array().filter(|e|e.len()<=limit as usize).ok_or_else(||OrchestratorError::Api("Invalid entries page".into()))?;
+        let mut envelopes=Vec::new();let mut greatest=after_seq;
+        for entry in entries {
+            let seq=entry["seq"].as_u64().filter(|n|*n>greatest && *n<=9_007_199_254_740_991).ok_or_else(||OrchestratorError::Api("Nonmonotonic entry sequence".into()))?;
+            if entry["conversationId"]!=convo_id{return Err(OrchestratorError::Api("Foreign conversation entry".into()));}
+            crate::strict_projection::validate_read_shape("conversationEntry",&serde_json::to_vec(entry).map_err(|e|OrchestratorError::Api(e.to_string()))?).map_err(|e|OrchestratorError::Api(e.to_string()))?;
+            if let Some(envelope)=IncomingEnvelope::from_canonical_entry(entry,convo_id)?{envelopes.push(envelope);}
+            greatest=seq;
         }
-        let next_cursor = output.get("nextAfterSeq").map(|v| v.to_string());
-        Ok((envelopes, next_cursor))
+        if output["nextAfterSeq"].as_u64()!=Some(greatest){return Err(OrchestratorError::Api("Entry continuation mismatch".into()));}
+        let next_cursor=(greatest>after_seq).then(||greatest.to_string());
+        Ok((envelopes,next_cursor))
     }
 
     async fn get_key_packages(

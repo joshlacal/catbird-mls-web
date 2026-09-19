@@ -4094,6 +4094,7 @@ mod tests {
     use super::*;
     use wasm_bindgen_test::*;
 
+    #[cfg(not(feature = "inventory-worker-tests"))]
     wasm_bindgen_test_configure!(run_in_browser);
 
     const TEST_DB_KEY: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";

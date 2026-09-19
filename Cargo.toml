@@ -105,3 +105,6 @@ wasm-bindgen-test = "0.3"
 [profile.release]
 opt-level = "s"     # Optimize for size in WASM
 lto = true
+
+[features]
+inventory-worker-tests = []

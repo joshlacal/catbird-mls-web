@@ -238,6 +238,7 @@ mod identity_tests {
     use super::*;
     use wasm_bindgen_test::*;
 
+    #[cfg(not(feature = "inventory-worker-tests"))]
     wasm_bindgen_test_configure!(run_in_browser);
 
     fn message_frame(frame_conversation_id: &str) -> Vec<u8> {

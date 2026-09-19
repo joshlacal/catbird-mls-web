@@ -33,6 +33,7 @@ mod api_client;
 mod browser_transport;
 mod credentials;
 mod browser_enrollment;
+mod browser_inventory;
 mod request_runtime;
 pub mod mls_storage;
 pub mod sqlite_conn;
@@ -682,13 +683,10 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
         cfg.proxy_did.clone(),
     ));
 
-    // Resolve the MLS database encryption key. Pre-supplied key takes priority
-    // (Worker mode — localStorage is unavailable there); fall back to localStorage.
-    let db_key = match cfg.mls_db_key.clone() {
-        Some(key) if !key.is_empty() => key,
-        _ => get_or_create_mls_key(&cfg.storage_prefix)
-            .map_err(|e| js_err!("Could not obtain MLS database key: {:?}", e))?,
-    };
+    // The host releases the key from its protected persistent vault. Missing
+    // custody fails before opening a database or creating any MLS identity.
+    let db_key = cfg.mls_db_key.clone().filter(|key|key.len()==64 && key.bytes().all(|b|b.is_ascii_hexdigit()))
+        .ok_or_else(||js_err!("Protected database key is required"))?;
 
     // Open ONE shared encrypted SQLite database for OpenMLS state,
     // conversations/messages, and credentials. Previously each used a separate
@@ -722,17 +720,8 @@ pub async fn catbird_mls_init(config: JsValue) -> Result<(), JsValue> {
     let storage = WasmStorageBackend::new(Rc::clone(&shared_conn));
     let credentials = SqliteCredentialStore::new(Rc::clone(&shared_conn));
 
-    let mls_context = match WasmMLSContext::open_with_conn(Rc::clone(&shared_conn)) {
-        Ok(ctx) => Some(Arc::new(ctx)),
-        Err(e) => {
-            web_sys::console::warn_1(&js_err!(
-                "catbird-mls-web: MLS context unavailable ({}). \
-                 Crypto commands will return errors.",
-                e
-            ));
-            None
-        }
-    };
+    let mls_context = Some(Arc::new(WasmMLSContext::open_with_conn(Rc::clone(&shared_conn))
+        .map_err(|e|js_err!("Protected MLS custody validation failed: {e}"))?));
 
     // Reload persisted MLS groups into the in-memory cache so they survive
     // page refreshes. Group IDs in the `group_states` SQLite table are the
@@ -3882,6 +3871,7 @@ mod background_tasks_tests {
     use super::*;
     use wasm_bindgen_test::*;
 
+    #[cfg(not(feature="inventory-worker-tests"))]
     wasm_bindgen_test_configure!(run_in_browser);
 
     fn in_flight() -> bool {
@@ -4018,6 +4008,7 @@ mod conversation_identity_tests {
     use super::*;
     use wasm_bindgen_test::*;
 
+    #[cfg(not(feature="inventory-worker-tests"))]
     wasm_bindgen_test_configure!(run_in_browser);
 
     fn create_response(

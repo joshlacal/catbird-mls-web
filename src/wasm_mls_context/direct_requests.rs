@@ -46,6 +46,10 @@ impl WasmMLSContext {
         self.provider.storage().conn().exec_with_text_and_blob_params("INSERT OR REPLACE INTO direct_request_values_v2(namespace,id,value) VALUES(?1,?2,?3)", &[(1,namespace),(2,id)], &[(3,bytes)])?;
         Ok(())
     }
+    pub(crate) fn request_values_total_bytes(&self, namespace:&str)->Result<u64,MLSError>{
+        let rows=self.provider.storage().conn().query_text("SELECT COALESCE(SUM(length(value)),0) FROM direct_request_values_v2 WHERE namespace=?1",&[(1,namespace)],1)?;
+        rows.first().and_then(|r|r[0].as_deref()).ok_or(MLSError::StorageFailed)?.parse().map_err(failure)
+    }
     pub(crate) fn request_values(&self, namespace: &str) -> Result<Vec<Vec<u8>>, MLSError> {
         self.provider.storage().conn().query_text("SELECT hex(value) FROM direct_request_values_v2 WHERE namespace=?1 ORDER BY id", &[(1,namespace)],1)?.into_iter().map(|r| hex::decode(r[0].as_deref().ok_or(MLSError::StorageFailed)?).map_err(failure)).collect()
     }
@@ -226,10 +230,13 @@ impl WasmMLSContext {
         let raw=conn.transaction(||->Result<Option<Vec<u8>>,MLSError>{
             let old=self.request_value("keys",&input.actor_device_id)?;
             if old.as_deref()!=expected{return Ok(None);}
+            let private_count=conn.query_text("SELECT count(*) FROM openmls_kv WHERE substr(storage_key,1,10)=X'4B65795061636B616765'",&[],1)?[0][0].as_deref().ok_or(MLSError::StorageFailed)?.parse::<u64>().map_err(failure)?;
+            let history_count=conn.query_text("SELECT count(*) FROM direct_request_values_v2 WHERE namespace LIKE 'keysHistory:%'",&[],1)?[0][0].as_deref().ok_or(MLSError::StorageFailed)?.parse::<u64>().map_err(failure)?;
+            if (input.count>0 && private_count.saturating_add(u64::from(input.count))>128)||history_count>=256 {return Err(MLSError::OperationNotSupported{reason:"Request key custody quota reached; retained publications require reconciliation".into()});}
             if let Some(raw)=old {
                 let previous=DirectRequestKeyPublication::decode(&raw,&input.actor_did,&input.actor_device_id)?;
                 let body=previous.body()?;
-                if (!previous.acknowledged && body["authGeneration"]==input.auth_generation) || body["revision"].as_i64().ok_or(MLSError::StorageFailed)?>=input.revision{return Err(MLSError::invalid_input("Cannot replace unknown or newer request key publication"));}
+                if body["revision"].as_i64().ok_or(MLSError::StorageFailed)?>=input.revision{return Err(MLSError::invalid_input("Cannot replace unknown or newer request key publication"));}
                 self.put_request_value(&format!("keysHistory:{}",hex::encode(Sha256::digest(&raw))),&input.actor_device_id,&raw)?;
             }
             let (raw,_bundles)=catbird_mls::orchestrator::direct_request_shared_crypto::build_request_key_publication(&self.provider,signer.as_ref(),input,chrono::Utc::now().timestamp())?;
@@ -273,5 +280,40 @@ impl WasmMLSContext {
         conn.ensure_durable()?;
         if changed {self.groups.borrow_mut().remove(&gid);}
         Ok(changed)
+    }
+}
+
+impl WasmMLSContext {
+    pub(super) fn protected_policy(&self,owner:&str,cid:&str)->Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>,MLSError>{
+        self.bind_request_owner(owner)?;
+        self.request_value("policy",cid)?.map(|raw|catbird_mls::orchestrator::canonical_transport::decode_conversation_state(&raw).map_err(failure)).transpose()
+    }
+    pub(super) fn protect_policy(&self,owner:&str,state:&catbird_atproto::blue_catbird::chat::ConversationState)->Result<bool,MLSError>{
+        self.bind_request_owner(owner)?;
+        let cid=state.coordinates.conversation_id.as_str();
+        let conn=self.provider.storage().conn();
+        let changed=conn.transaction(||->Result<bool,MLSError>{
+            let old=self.request_value("policy",cid)?;
+            let previous=old.as_ref().map(|raw|catbird_mls::orchestrator::canonical_transport::decode_conversation_state(raw).map_err(failure)).transpose()?;
+            let Some(next)=catbird_mls::orchestrator::admission::merge_protected_conversation_policy(previous.as_ref(),state).map_err(failure)? else{return Ok(false)};
+            let encoded=catbird_mls::orchestrator::canonical_transport::encode_conversation_state(&next).map_err(failure)?;
+            self.put_request_value("policy",cid,&encoded)?;Ok(true)
+        })?;
+        conn.ensure_durable()?;Ok(changed)
+    }
+    pub(super) fn protected_departure(&self,owner:&str,cid:&str)->Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>,MLSError>{
+        self.bind_request_owner(owner)?;
+        self.request_value("departure",cid)?.map(|raw|catbird_mls::orchestrator::canonical_transport::decode_conversation_coordinates(&raw).map_err(failure)).transpose()
+    }
+    pub(super) fn protect_departure(&self,owner:&str,state:&catbird_atproto::blue_catbird::chat::ConversationCoordinates)->Result<bool,MLSError>{
+        self.bind_request_owner(owner)?;
+        let cid=state.conversation_id.as_str();let conn=self.provider.storage().conn();
+        let changed=conn.transaction(||->Result<bool,MLSError>{
+            let old=self.request_value("departure",cid)?;
+            let previous=old.as_ref().map(|raw|catbird_mls::orchestrator::canonical_transport::decode_conversation_coordinates(raw).map_err(failure)).transpose()?;
+            let Some(next)=catbird_mls::orchestrator::admission::merge_protected_conversation_departure(previous.as_ref(),state).map_err(failure)? else{return Ok(false)};
+            self.put_request_value("departure",cid,&serde_json::to_vec(&next).map_err(failure)?)?;Ok(true)
+        })?;
+        conn.ensure_durable()?;Ok(changed)
     }
 }

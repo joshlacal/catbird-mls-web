@@ -47,7 +47,7 @@ async fn unknown_publication_multisecret_import_ratchet_and_retirement_reopen(){
     let proof=receipt(&input,&journal.bootstrap,&publication,&authority);alice.confirm_published_bootstrap(&journal.request_id,&proof,&authority_key).unwrap();drop(alice);
     let alice=open(&alicepath);assert_eq!(alice.get_epoch(input.group_id.clone()).unwrap(),1);alice.mark_direct_request_projected(&journal.request_id).unwrap();
     let welcome=DirectRequestWelcomeInput{bootstrap:journal.bootstrap.clone(),local_identity:recipient.as_bytes().to_vec(),local_package_ref:bp.hash_ref,publication_request:publication.clone(),actor_signature_public_key:ap.signature_public_key,published_receipt:proof.clone(),receipt_authority_key:authority_key.clone(),preparation_request_digest:input.preparation_request_digest};
-    bob.process_direct_request_welcome(&welcome).unwrap();drop(bob);let bob=open(&bobpath);bob.process_direct_request_welcome(&welcome).unwrap();let outcome=bob.decrypt_direct_request_introduction(&welcome).unwrap();let DirectRequestIntroductionResult::Ready{plaintext}=&outcome else{panic!("preview unavailable")};let decoded=catbird_mls::chat_v2::transcript::direct_request::decode_direct_request_introduction(plaintext).unwrap();assert_eq!(decoded["text"],"Preview before consent");drop(bob);let bob=open(&bobpath);assert_eq!(bob.decrypt_direct_request_introduction(&welcome).unwrap(),outcome);
+    bob.process_direct_request_welcome(&welcome).unwrap();assert!(bob.create_external_commit(journal.bootstrap.final_group_info.clone(),recipient.as_bytes().to_vec()).is_err());assert!(bob.delete_group(input.group_id.clone()).is_err());drop(bob);let bob=open(&bobpath);bob.process_direct_request_welcome(&welcome).unwrap();let outcome=bob.decrypt_direct_request_introduction(&welcome).unwrap();let DirectRequestIntroductionResult::Ready{plaintext}=&outcome else{panic!("preview unavailable")};let decoded=catbird_mls::chat_v2::transcript::direct_request::decode_direct_request_introduction(plaintext).unwrap();assert_eq!(decoded["text"],"Preview before consent");drop(bob);let bob=open(&bobpath);assert_eq!(bob.decrypt_direct_request_introduction(&welcome).unwrap(),outcome);
     // A separately addressed device can import the full Welcome even if the
     // authenticated first application is poisoned. That never grants consent.
     let mut poisoned=journal.bootstrap.clone();*poisoned.initial_ciphertext.last_mut().unwrap() ^= 0x80;
@@ -67,4 +67,19 @@ async fn request_key_batch_is_atomic_exact_and_persistent() {
     let raw=context.prepare_direct_request_key_publication(&input,None).unwrap().unwrap();let record=DirectRequestKeyPublication::decode(&raw,ALICE,ADEV).unwrap();assert_eq!(record.body().unwrap()["keys"].as_array().unwrap().len(),2);assert!(!record.acknowledged);drop(context);
     let context=open(&path);assert_eq!(context.read_direct_request_key_publication(ADEV).unwrap().unwrap(),raw);assert!(context.prepare_direct_request_key_publication(&input,None).unwrap().is_none());assert!(context.prepare_direct_request_key_publication(&input,Some(&raw)).is_err());
     let mut ack=record;ack.acknowledged=true;let acknowledged=serde_json::to_vec(&ack).unwrap();assert!(context.acknowledge_direct_request_key_publication(ADEV,&raw,&acknowledged).unwrap());drop(context);let context=open(&path);assert_eq!(context.read_direct_request_key_publication(ADEV).unwrap().unwrap(),acknowledged);
+}
+
+#[wasm_bindgen_test]
+async fn protected_policy_is_monotonic_owner_bound_and_reopens() {
+    use catbird_mls::orchestrator::canonical_transport::decode_conversation_state;
+    SqliteConn::initialize_opfs().await.unwrap();
+    let mut state=decode_conversation_state(include_bytes!("../../catbird-mls/tests/fixtures/swift_pending_conversation_state.json")).unwrap();
+    let owner=state.participants[0].user_did.to_string();let cid=state.coordinates.conversation_id.to_string();
+    let path=format!("req-policy-{}.db",uuid::Uuid::new_v4());let ctx=open(&path);
+    assert!(ctx.put_conversation_policy(&owner,&state).unwrap());
+    let previous=state.clone();state.snapshot_seq+=1;
+    assert!(ctx.put_conversation_policy(&owner,&state).unwrap());
+    assert!(!ctx.put_conversation_policy(&owner,&previous).unwrap());
+    assert!(ctx.get_conversation_policy("did:plc:cccccccccccccccccccccccc",&cid).is_err());
+    drop(ctx);let ctx=open(&path);assert_eq!(ctx.get_conversation_policy(&owner,&cid).unwrap(),Some(state));
 }

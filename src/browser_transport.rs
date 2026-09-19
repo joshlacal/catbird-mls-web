@@ -179,18 +179,19 @@ pub fn catbird_mls_has_signer_bridge() -> bool {
 /// keys are rejected, never forwarded.
 fn read_query_whitelist(operation: CanonicalOperation) -> &'static [&'static str] {
     match operation {
-        CanonicalOperation::GetConversations => &["actorDeviceId", "limit", "pageCursor"],
+        CanonicalOperation::GetConversations => &["actorDeviceId", "limit", "pageCursor", "supportedProtocolVersions"],
         CanonicalOperation::GetBlob => &["actorDeviceId", "blobId"],
         CanonicalOperation::GetBlobUsage => &["actorDeviceId"],
         CanonicalOperation::GetConversationState => &["actorDeviceId", "conversationId"],
         CanonicalOperation::GetDevices => &["actorDeviceId", "userDids"],
+        CanonicalOperation::GetDeviceKey => &["actorDeviceId","ownerDid","deviceId","keyId"],
         CanonicalOperation::GetEntries => &["actorDeviceId", "afterSeq", "conversationId", "limit"],
         CanonicalOperation::GetLeafRecoveryInbox => {
-            &["actorDeviceId", "inventorySessionId", "limit", "pageCursor"]
+            &["actorDeviceId", "inventorySessionId", "limit", "pageCursor", "supportedProtocolVersions"]
         }
         CanonicalOperation::GetOwnDevices => &["actorDeviceId", "limit", "pageCursor"],
         CanonicalOperation::GetPendingWelcomes => {
-            &["actorDeviceId", "inventorySessionId", "limit", "pageCursor"]
+            &["actorDeviceId", "inventorySessionId", "limit", "pageCursor", "supportedProtocolVersions"]
         }
         _ => &[],
     }
@@ -204,6 +205,7 @@ fn is_read(operation: CanonicalOperation) -> bool {
             | CanonicalOperation::GetBlobUsage
             | CanonicalOperation::GetConversationState
             | CanonicalOperation::GetDevices
+            | CanonicalOperation::GetDeviceKey
             | CanonicalOperation::GetEntries
             | CanonicalOperation::GetLeafRecoveryInbox
             | CanonicalOperation::GetOwnDevices
@@ -384,6 +386,7 @@ fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {
         "getBlobUsage" => CanonicalOperation::GetBlobUsage,
         "getConversationState" => CanonicalOperation::GetConversationState,
         "getDevices" => CanonicalOperation::GetDevices,
+        "getDeviceKey" => CanonicalOperation::GetDeviceKey,
         "getEntries" => CanonicalOperation::GetEntries,
         "getLeafRecoveryInbox" => CanonicalOperation::GetLeafRecoveryInbox,
         "getOwnDevices" => CanonicalOperation::GetOwnDevices,
@@ -427,6 +430,7 @@ fn operation_name(operation: CanonicalOperation) -> &'static str {
         CanonicalOperation::GetBlobUsage => "getBlobUsage",
         CanonicalOperation::GetConversationState => "getConversationState",
         CanonicalOperation::GetDevices => "getDevices",
+        CanonicalOperation::GetDeviceKey => "getDeviceKey",
         CanonicalOperation::GetEntries => "getEntries",
         CanonicalOperation::GetLeafRecoveryInbox => "getLeafRecoveryInbox",
         CanonicalOperation::GetOwnDevices => "getOwnDevices",

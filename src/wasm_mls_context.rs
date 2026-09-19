@@ -1502,6 +1502,10 @@ mod compatibility_tests;
 impl MlsCryptoContext for WasmMLSContext {
     // Remains false until publication/outcome/adoption + intent storage are
     // implemented and worker-restart tests qualify the full lifecycle.
+    fn get_conversation_policy(&self,owner:&str,cid:&str)->Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>,MLSError>{self.protected_policy(owner,cid)}
+    fn put_conversation_policy(&self,owner:&str,state:&catbird_atproto::blue_catbird::chat::ConversationState)->Result<bool,MLSError>{self.protect_policy(owner,state)}
+    fn get_conversation_departure(&self,owner:&str,cid:&str)->Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>,MLSError>{self.protected_departure(owner,cid)}
+    fn put_conversation_departure(&self,owner:&str,state:&catbird_atproto::blue_catbird::chat::ConversationCoordinates)->Result<bool,MLSError>{self.protect_departure(owner,state)}
     fn supports_direct_request_bootstrap(&self) -> bool {
         false
     }

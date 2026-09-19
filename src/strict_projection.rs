@@ -1343,7 +1343,7 @@ pub(crate) fn parse_generated_request(
         CancelLeafRecoveryRequestBody, CancelLeaveRequestBody, CloseConversationRequestBody,
         CreateConversationRequestBody, DeleteBlobRequestBody, EnrollDeviceRequestBody,
         GetBlobRequestBody, GetBlobUsageRequestBody, GetConversationStateRequestBody,
-        GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody, GetOwnDevicesRequestBody,
+        GetDevicesRequestBody, GetDeviceKeyRequestBody, GetLeafRecoveryInboxRequestBody, GetOwnDevicesRequestBody,
         GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody,
         PrepareBlobUploadRequestBody, PublishTypingRequestBody, RejectWelcomeRequestBody,
         ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
@@ -1385,6 +1385,7 @@ pub(crate) fn parse_generated_request(
             parse!(GetConversationStateRequestBody, GetConversationState)
         }
         CanonicalOperation::GetDevices => parse!(GetDevicesRequestBody, GetDevices),
+        CanonicalOperation::GetDeviceKey => parse!(GetDeviceKeyRequestBody, GetDeviceKey),
         CanonicalOperation::GetEntries => parse!(GetEntries<String>, GetEntries),
         CanonicalOperation::GetLeafRecoveryInbox => {
             parse!(GetLeafRecoveryInboxRequestBody, GetLeafRecoveryInbox)

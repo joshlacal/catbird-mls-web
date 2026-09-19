@@ -917,7 +917,7 @@ pub(crate) mod tests {
                 && !view.capabilities.can_administer
         );
         STATE.with(|s| *s.borrow_mut() = None);
-        initialize(&bpath, bob).await;
+        initialize(bpath, bob).await;
         let views: Vec<catbird_mls::DirectRequestView> =
             serde_wasm_bindgen::from_value(catbird_mls_list_direct_request_views().await.unwrap())
                 .unwrap();
@@ -934,14 +934,14 @@ pub(crate) mod tests {
         let verified_accept = protocol::verify_signed_request(
             protocol::DirectRequestKind::Accept,
             &serde_json::to_vec(&pending_accept["directRequest"]).unwrap(),
-            &bob_public,
+            bob_public,
         )
         .unwrap();
         STATE.with(|s| *s.borrow_mut() = None);
-        initialize(&bpath, bob).await;
+        initialize(bpath, bob).await;
         let accept_entry = json!({"entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":2,"signedRequest":pending_accept["directRequest"],"receivedAt":utc(0)});
         let accepted_receipt = json!({"$type":"blue.catbird.chat.defs#directRequestAcceptanceCommitReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPTANCE-COMMIT\0","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":method,"requestId":accepted["requestId"],"acceptanceDigest":B64.encode(verified_accept.request_digest()),"entryHash":B64.encode(protocol::direct_request_acceptance_entry_hash(&serde_json::to_vec(&accept_entry).unwrap()).unwrap()),"prior":accepted["prior"],"next":accepted["next"],"recordedAt":utc(0)});
-        let proof = json!({"entry":accept_entry,"receipt":{"body":accepted_receipt,"signature":sign_receipt(&authority,&protocol::direct_request_signing_bytes(protocol::DirectRequestKind::AcceptanceCommit,&serde_json::to_vec(&accepted_receipt).unwrap()).unwrap())}});
+        let proof = json!({"entry":accept_entry,"receipt":{"body":accepted_receipt,"signature":sign_receipt(authority,&protocol::direct_request_signing_bytes(protocol::DirectRequestKind::AcceptanceCommit,&serde_json::to_vec(&accepted_receipt).unwrap()).unwrap())}});
         enqueue(
             "acceptConversation",
             json!({"coordinates":accepted["next"],"acceptanceProof":proof}),
@@ -955,12 +955,12 @@ pub(crate) mod tests {
         assert_eq!(pending_accept, last("acceptConversation"));
         assert_eq!(accepted["prior"]["epoch"], accepted["next"]["epoch"]);
         STATE.with(|s| *s.borrow_mut() = None);
-        initialize(&bpath, bob).await;
+        initialize(bpath, bob).await;
         let views: Vec<catbird_mls::DirectRequestView> =
             serde_wasm_bindgen::from_value(catbird_mls_list_direct_request_views().await.unwrap())
                 .unwrap();
         assert_eq!(views[0].consent, RequestConsent::Accepted);
-        let accepted_state = json!({"conversationKind":"direct","coordinates":accepted["next"],"cipherSuite":"MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519","participants":[{"userDid":p["actorDid"],"role":"admin","status":"active","leafCount":1},{"userDid":p["recipientDid"],"role":"admin","status":"active","leafCount":1,"invitationProvenance":{"invitationTransitionId":p["requestId"],"invitedByDid":p["actorDid"],"invitedByDeviceId":p["actorDeviceId"]}}],"leaves":[{"userDid":p["actorDid"],"deviceId":p["actorDeviceId"],"leafOrigin":"genesis","keyId":p["keyId"],"deviceStatus":"active"},{"userDid":p["recipientDid"],"deviceId":bob_device,"leafOrigin":"keyPackage","joinKeyPackageRef":B64.encode(key_package_ref),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"deviceStatus":"active"}],"metadataSnapshot":p["artifacts"]["metadataSnapshot"],"snapshotSeq":2,"directRequest":{"requestId":p["requestId"],"firstMessageId":p["firstMessageId"],"senderDid":p["actorDid"],"recipientDid":p["recipientDid"],"consent":"accepted","importUntil":p["importUntil"],"contextHash":p["contextHash"],"preparationDigest":p["preparationDigest"],"acceptanceProof":proof}});
+        let accepted_state = json!({"conversationKind":"direct","coordinates":accepted["next"],"cipherSuite":"MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519","participants":[{"userDid":p["actorDid"],"role":"admin","status":"active","leafCount":1},{"userDid":p["recipientDid"],"role":"admin","status":"active","leafCount":1,"invitationProvenance":{"invitationTransitionId":p["requestId"],"invitedByDid":p["actorDid"],"invitedByDeviceId":p["actorDeviceId"]}}],"leaves":[{"userDid":p["actorDid"],"deviceId":p["actorDeviceId"],"leafOrigin":"genesis","keyId":p["keyId"],"deviceStatus":"active"},{"userDid":p["recipientDid"],"deviceId":bob_device,"leafOrigin":"keyPackage","joinKeyPackageRef":B64.encode(key_package_ref),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(bob_public)),"deviceStatus":"active"}],"metadataSnapshot":p["artifacts"]["metadataSnapshot"],"snapshotSeq":2,"directRequest":{"requestId":p["requestId"],"firstMessageId":p["firstMessageId"],"senderDid":p["actorDid"],"recipientDid":p["recipientDid"],"consent":"accepted","importUntil":p["importUntil"],"contextHash":p["contextHash"],"preparationDigest":p["preparationDigest"],"acceptanceProof":proof}});
         accepted_state
     }
     async fn exchange_accepted_reply(
@@ -1036,7 +1036,7 @@ pub(crate) mod tests {
         );
         drop(bob_engine);
         STATE.with(|s| *s.borrow_mut() = None);
-        initialize(&bpath, bob).await;
+        initialize(bpath, bob).await;
         let (_, reopened) = current_engine().unwrap();
         assert!(reopened
             .mls_context()
@@ -1062,11 +1062,11 @@ pub(crate) mod tests {
             .unwrap());
         drop(reopened);
         STATE.with(|s| *s.borrow_mut() = None);
-        initialize(&apath, alice).await;
+        initialize(apath, alice).await;
         enqueue("getConversationState", json!({"state":accepted_state}));
         enqueue(
             "getDeviceKey",
-            json!({"ownerDid":bob,"deviceId":bob_device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"signaturePublicKey":B64.encode(&bob_public)}),
+            json!({"ownerDid":bob,"deviceId":bob_device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(bob_public)),"signaturePublicKey":B64.encode(bob_public)}),
         );
         let sender_view: catbird_mls::DirectRequestView = serde_wasm_bindgen::from_value(
             catbird_mls_refresh_request_preview(cid.into())

@@ -1,7 +1,8 @@
 use super::*;
 use wasm_bindgen_test::*;
 
-fn context() -> WasmMLSContext {
+async fn context() -> WasmMLSContext {
+    SqliteConn::initialize_opfs().await.unwrap();
     let conn = Rc::new(
         SqliteConn::open(
             &format!("crypto-{}.db", uuid::Uuid::new_v4()),
@@ -14,8 +15,8 @@ fn context() -> WasmMLSContext {
 }
 
 #[wasm_bindgen_test]
-fn signer_cache_matches_exact_public_key_without_copying_private_material() {
-    let context = context();
+async fn signer_cache_matches_exact_public_key_without_copying_private_material() {
+    let context = context().await;
     let first = context.get_or_create_signer(b"device").unwrap();
     let again = context.get_or_create_signer(b"device").unwrap();
     assert!(Rc::ptr_eq(&first, &again));
@@ -52,8 +53,8 @@ fn canonical_group_and_legacy_coordinates_decode_without_truncation() {
 }
 
 #[wasm_bindgen_test]
-fn own_private_echo_fails_without_merging_or_deleting_group() {
-    let context = context();
+async fn own_private_echo_fails_without_merging_or_deleting_group() {
+    let context = context().await;
     let group_id = vec![5; 32];
     context
         .create_group_with_id(b"device".to_vec(), group_id.clone(), None)
@@ -81,9 +82,9 @@ fn own_private_echo_fails_without_merging_or_deleting_group() {
 }
 
 #[wasm_bindgen_test]
-fn app_data_commit_resolves_and_stays_staged_until_explicit_merge() {
-    let alice = context();
-    let bob = context();
+async fn app_data_commit_resolves_and_stays_staged_until_explicit_merge() {
+    let alice = context().await;
+    let bob = context().await;
     let group_id = vec![9; 32];
     // This receiver-compatibility fixture explicitly negotiates the draft
     // capability. Canonical production clients do not advertise AppData.

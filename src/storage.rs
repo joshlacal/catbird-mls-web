@@ -393,6 +393,7 @@ impl WasmStorageBackend {
         // with only half of the identity contract installed.
         let schema_tx = SqliteTransactionGuard::begin(conn, "conversation schema")?;
         conn.exec_raw("CREATE TABLE IF NOT EXISTS browser_recovery_v2 (owner TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(owner,id));").map_err(|e|format!("recovery schema: {e}"))?;
+        conn.exec_raw("CREATE TABLE IF NOT EXISTS pending_local_deletes (conversation_id TEXT PRIMARY KEY, group_id_hex TEXT);").map_err(|e|format!("pending_local_deletes schema: {e}"))?;
         conn.exec_raw(
             "CREATE TABLE IF NOT EXISTS conversations (
                 conversation_id        TEXT NOT NULL,
@@ -4145,6 +4146,53 @@ impl MLSStorageBackend for WasmStorageBackend {
         self.write_recovery_value("global", &at_ms.to_string())
     }
 
+    async fn mark_pending_local_delete(
+        &self,
+        conversation_id: &str,
+        group_id_hex: Option<&str>,
+    ) -> Result<()> {
+        let group_id = group_id_hex.unwrap_or("");
+        self.conn
+            .exec_with_text_params(
+                "INSERT OR REPLACE INTO pending_local_deletes (conversation_id, group_id_hex) VALUES (?1, ?2)",
+                &[(1, conversation_id), (2, group_id)],
+            )
+            .map_err(|e| OrchestratorError::Storage(format!("mark_pending_local_delete: {e}")))?;
+        self.conn
+            .ensure_durable()
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))
+    }
+
+    async fn clear_pending_local_delete(&self, conversation_id: &str) -> Result<()> {
+        self.conn
+            .exec_with_text_params(
+                "DELETE FROM pending_local_deletes WHERE conversation_id = ?1",
+                &[(1, conversation_id)],
+            )
+            .map_err(|e| OrchestratorError::Storage(format!("clear_pending_local_delete: {e}")))?;
+        self.conn
+            .ensure_durable()
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))
+    }
+
+    async fn list_pending_local_deletes(&self) -> Result<Vec<PendingLocalDelete>> {
+        let rows = self
+            .conn
+            .query_text("SELECT conversation_id, group_id_hex FROM pending_local_deletes", &[], 2)
+            .map_err(|e| OrchestratorError::Storage(format!("list_pending_local_deletes: {e}")))?;
+        let mut list = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(Some(cid)) = row.get(0) {
+                let gid = row.get(1).and_then(|opt| opt.as_ref()).filter(|s| !s.is_empty()).cloned();
+                list.push(PendingLocalDelete {
+                    conversation_id: cid.clone(),
+                    group_id_hex: gid,
+                });
+            }
+        }
+        Ok(list)
+    }
+
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
             "get_recovery_state",
@@ -4159,6 +4207,9 @@ impl MLSStorageBackend for WasmStorageBackend {
             "complete_account_exit",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
+            "mark_pending_local_delete",
+            "clear_pending_local_delete",
+            "list_pending_local_deletes",
         ]
     }
 }

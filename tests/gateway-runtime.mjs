@@ -155,7 +155,7 @@ try {
  await alice.page.getByRole('heading',{name:'Request sent',exact:true}).waitFor();
  const sent=await alice.page.evaluate(async()=>{const api=await import('/src/lib/wasm.ts');return api.getRequestWorkspace(fixtureActor.did,fixtureActor.authRevision);});
  const outcome=sent.drafts.find(d=>d.input.text===introduction)?.outcome;assert.equal(outcome?.type,'requestSent');cid=outcome.conversationId;
- await bob.page.evaluate(async cid=>{const {requests}=await import('/src/lib/stores/requests.ts');await requests.load();requests.selectRequest(cid);},cid);
+ await bob.page.evaluate(async cid=>{const {requests}=await import('/src/lib/stores/requests.ts');for(let i=0;i<30;i++){await requests.load();requests.selectRequest(cid);let ready=false;const unsub=requests.subscribe(s=>{const v=s.views.find(x=>x.conversationId===cid);if(v&&v.preview)ready=true;});unsub();if(ready)break;await new Promise(r=>setTimeout(r,500));}},cid);
  await bob.page.getByLabel('Decrypted introduction').getByText(introduction,{exact:true}).waitFor();
  await bob.page.screenshot({path:join(out,'bob-encrypted-introduction.png')});
  const pending=await bob.page.evaluate(async cid=>{const api=await import('/src/lib/wasm.ts');return api.refreshDirectRequest(fixtureActor.did,cid,fixtureActor.authRevision);},cid);
@@ -170,7 +170,10 @@ try {
  const received=await alice.page.evaluate(async cid=>{const api=await import('/src/lib/wasm.ts');await api.refreshDirectRequest(fixtureActor.did,cid,fixtureActor.authRevision);return api.fetchNewMessages(cid,fixtureActor.did,fixtureActor.authRevision);},cid);
  assert(received.some(message=>message.content===reply),'Sender decrypts real accepted reply');
  await bob.page.screenshot({path:join(out,'bob-accepted-request.png')});
- const group=await alice.page.evaluate(async recipient=>{const api=await import('/src/lib/wasm.ts');return api.createGroup('Separate invitation fixture',[recipient],undefined,fixtureActor.did,fixtureActor.authRevision);},bob.actor.did);
+ // A one-invitee creation is a direct creation by protocol (shared core kind
+ // selection); a separate group invitation is a zero-invitee group plus a policy
+ // addParticipant invitation that leaves Bob pending with no leaf.
+ const group=await alice.page.evaluate(async recipient=>{const api=await import('/src/lib/wasm.ts');const g=await api.createGroup('Separate invitation fixture',[],undefined,fixtureActor.did,fixtureActor.authRevision);await api.addGroupMembers(g.id,[recipient],fixtureActor.did,fixtureActor.authRevision);return g;},bob.actor.did);
  const invitation=await alice.page.evaluate(async({groupId,recipient})=>{const api=await import('/src/lib/wasm.ts');return api.getGroupInvitationReference(fixtureActor.did,groupId,recipient,fixtureActor.authRevision);},{groupId:group.id,recipient:bob.actor.did});
  assert(invitation,'Pending group invitation has authenticated reference');
  const note='A separate invitation note after direct acceptance.';

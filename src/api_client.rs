@@ -629,11 +629,12 @@ impl MLSAPIClient for WasmApiClient {
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
         let actor = self.actor_device()?;
+        let active_status: blue_catbird::chat::DeviceStatus<&str> = "active";
         let device = self
             .list_devices(&actor)
             .await?
             .into_iter()
-            .find(|d| d.device_id == actor && d.status.as_deref() == Some("enabled"))
+            .find(|d| d.device_id == actor && d.status.as_deref() == Some(active_status))
             .ok_or_else(|| {
                 OrchestratorError::Api("Current enrolled device is unavailable".into())
             })?;

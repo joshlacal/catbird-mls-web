@@ -403,8 +403,12 @@ impl WasmMLSContext {
     // Internal: group config builders
     // -----------------------------------------------------------------------
 
-    fn make_create_config(config: &GroupConfig) -> MlsGroupCreateConfig {
-        MlsGroupCreateConfig::builder()
+    /// The creator's genesis leaf must carry the same closed clean-leaf profile
+    /// and bounded lifetime as browser KeyPackages; OpenMLS defaults (every
+    /// suite, 3-month lifetime) make the router reject the genesis GroupInfo
+    /// with `LifetimeTooLong`. Mirrors native `MLSContext::create_group`.
+    fn make_create_config(config: &GroupConfig) -> Result<MlsGroupCreateConfig, MLSError> {
+        Ok(MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
             .max_past_epochs(config.max_past_epochs as usize)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(
@@ -412,8 +416,10 @@ impl WasmMLSContext {
                 config.maximum_forward_distance,
             ))
             .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .capabilities(clean_leaf_capabilities())
+            .lifetime(key_package_lifetime()?)
             .use_ratchet_tree_extension(true)
-            .build()
+            .build())
     }
 
     fn make_join_config(config: &GroupConfig) -> MlsGroupJoinConfig {
@@ -541,16 +547,26 @@ impl WasmMLSContext {
             signature_key: signer.public().into(),
         };
 
-        let group_config = Self::make_create_config(&config);
-        let group = MlsGroup::new(
+        // Clean-chat coordinates require an exact 32-byte groupId (native
+        // `MLSContext::create_group` uses the same bound); OpenMLS' default
+        // `MlsGroup::new` id length does not satisfy it.
+        use openmls_traits::random::OpenMlsRand;
+        let group_id = self
+            .provider
+            .rand()
+            .random_vec(32)
+            .map_err(|e| MLSError::OpenMLS(format!("group id randomness: {e:?}")))?;
+        let openmls_group_id = openmls::prelude::GroupId::from_slice(&group_id);
+        let group_config = Self::make_create_config(&config)?;
+        let group = MlsGroup::new_with_group_id(
             &self.provider,
             signer.as_ref(),
             &group_config,
+            openmls_group_id,
             cred_with_key,
         )
-        .map_err(|e| MLSError::OpenMLS(format!("MlsGroup::new: {e:?}")))?;
+        .map_err(|e| MLSError::OpenMLS(format!("MlsGroup::new_with_group_id: {e:?}")))?;
 
-        let group_id = group.group_id().as_slice().to_vec();
         self.groups.borrow_mut().insert(group_id.clone(), group);
 
         Ok(GroupCreationResult {
@@ -591,7 +607,7 @@ impl WasmMLSContext {
             signature_key: signer.public().into(),
         };
 
-        let group_config = Self::make_create_config(&config);
+        let group_config = Self::make_create_config(&config)?;
         let openmls_group_id = openmls::prelude::GroupId::from_slice(&group_id);
         let group = MlsGroup::new_with_group_id(
             &self.provider,
@@ -2135,5 +2151,43 @@ impl MlsCryptoContext for WasmMLSContext {
             .borrow_mut()
             .remove(&(group_id, target_epoch));
         Ok(())
+    }
+    fn export_metadata_key(&self, group_id: Vec<u8>, epoch: u64) -> Result<Vec<u8>, MLSError> {
+        self.ensure_loaded(&group_id)?;
+        let mut groups = self.groups.borrow_mut();
+        let group = groups
+            .get_mut(&group_id)
+            .ok_or_else(|| MLSError::Internal("group not loaded".into()))?;
+        let key = catbird_mls::metadata::derive_metadata_key_from_group(
+            group,
+            self.provider.crypto(),
+            self.provider.storage(),
+            &group_id,
+            epoch,
+        )
+        .map_err(|e| MLSError::Internal(format!("derive metadata key: {e:?}")))?;
+        Ok(key.to_vec())
+    }
+    fn export_metadata_key_from_pending(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.ensure_loaded(&group_id)?;
+        let groups = self.groups.borrow();
+        let group = groups
+            .get(&group_id)
+            .ok_or_else(|| MLSError::Internal("group not loaded".into()))?;
+        let staged_commit = group
+            .pending_commit()
+            .ok_or_else(|| MLSError::Internal("no pending commit".into()))?;
+        let key = catbird_mls::metadata::derive_metadata_key(
+            staged_commit,
+            self.provider.crypto(),
+            &group_id,
+            target_epoch,
+        )
+        .map_err(|e| MLSError::Internal(format!("derive metadata key from pending: {e:?}")))?;
+        Ok(key.to_vec())
     }
 }

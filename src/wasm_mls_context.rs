@@ -1803,6 +1803,24 @@ impl MlsCryptoContext for WasmMLSContext {
     fn list_direct_request_projections(&self) -> Result<Vec<Vec<u8>>, MLSError> {
         self.request_values("projection")
     }
+    fn read_request_value(&self, namespace: &str, id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        self.request_value(namespace, id)
+    }
+    fn compare_exchange_request_value(
+        &self,
+        namespace: &str,
+        id: &str,
+        expected: Option<&[u8]>,
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.request_value_cas(namespace, id, expected, next)
+    }
+    fn list_request_values(&self, namespace: &str) -> Result<Vec<Vec<u8>>, MLSError> {
+        self.request_values(namespace)
+    }
+    fn request_values_total_bytes(&self, namespace: &str) -> Result<u64, MLSError> {
+        self.request_values_total_bytes(namespace)
+    }
 
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError> {
         WasmMLSContext::create_key_package(self, identity)

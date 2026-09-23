@@ -4,7 +4,7 @@ use crate::{
     request_runtime::{self, BrowserOrchestrator},
     *,
 };
-use catbird_mls::orchestrator::mls_provider::MlsCryptoContext;
+use catbird_mls::orchestrator::subscription::SubscriptionDispatchOutcome;
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -13,24 +13,12 @@ use std::{
 use wasm_bindgen::closure::Closure;
 use web_sys::{CloseEvent, ErrorEvent, MessageEvent, WebSocket};
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CursorFence {
-    owner: String,
-    actor: String,
-    generation: i64,
-    session: String,
-    connection: String,
-    cursor: String,
-}
 struct Consumer {
     runtime: Arc<BrowserOrchestrator>,
     session_epoch: u64,
     owner: String,
-    actor: String,
-    generation: i64,
+    connection_id: String,
     selected: String,
-    fence: RefCell<(CursorFence, Vec<u8>)>,
     ws: WebSocket,
     queue: RefCell<VecDeque<String>>,
     running: Cell<bool>,
@@ -39,28 +27,11 @@ struct Consumer {
     on_event: js_sys::Function,
     on_status: js_sys::Function,
 }
+
 fn error(message: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&message.to_string())
 }
-fn decode(raw: &str) -> Result<serde_json::Value, JsValue> {
-    if raw.len() > 64 * 1024 {
-        return Err(error("Subscription frame exceeds bound"));
-    }
-    crate::strict_projection::validate_read_shape("subscriptionMessage", raw.as_bytes())
-        .map_err(error)
-}
-fn next_cursor(current: &str, value: &serde_json::Value) -> Result<Option<String>, JsValue> {
-    if value["$type"] == "blue.catbird.chat.defs#typingEvent" {
-        return Ok(None);
-    }
-    let next = value["cursor"]
-        .as_str()
-        .ok_or_else(|| error("Missing event cursor"))?;
-    if value["previousCursor"] != current || next == current {
-        return Err(error("Subscription cursor chain changed"));
-    }
-    Ok(Some(next.into()))
-}
+
 impl Consumer {
     fn stop(&self, status: &str) {
         self.closed.set(true);
@@ -68,155 +39,116 @@ impl Consumer {
         let _ = self.ws.close();
         self.status(status);
     }
+
     fn status(&self, status: &str) {
         if self.session_epoch == crate::browser_session::generation() {
-            if let Ok(value) = to_js(&serde_json::json!({"type":status})) {
+            if let Ok(value) = to_js(&serde_json::json!({"type": status})) {
                 let _ = self.on_status.call1(&JsValue::NULL, &value);
             }
         }
     }
+
     async fn current(&self) -> Result<(), JsValue> {
         if self.closed.get() || self.session_epoch != crate::browser_session::generation() {
             return Err(error("Subscription closed"));
         }
         request_runtime::current(&self.owner, &self.runtime)?;
-        if self
-            .runtime
-            .credentials()
-            .get_auth_generation(&self.owner)
-            .await
-            .map_err(error)?
-            != Some(self.generation)
-            || self
-                .runtime
-                .credentials()
-                .get_device_uuid(&self.owner)
-                .await
-                .map_err(error)?
-                .as_deref()
-                != Some(&self.actor)
-        {
-            return Err(error("Subscription device authority changed"));
+        match self.runtime.current_subscription_cursor().await.map_err(error)? {
+            Some(fence) if fence.connection == self.connection_id => Ok(()),
+            _ => Err(error("Subscription was superseded")),
         }
-        request_runtime::current(&self.owner, &self.runtime)?;
-        let retained = self
-            .runtime
-            .mls_context()
-            .request_value("subscriptionCursor", &self.actor)
-            .map_err(error)?;
-        if retained.as_deref() != Some(self.fence.borrow().1.as_slice()) {
-            return Err(error("Subscription was superseded"));
-        }
-        Ok(())
     }
-    async fn messages_through(&self, cid: &str, target: u64) -> Result<Vec<Message>, JsValue> {
-        let ctx = self.runtime.mls_context();
-        let previous = ctx.request_value("entryCursor", cid).map_err(error)?;
-        let mut cursor = previous
-            .as_deref()
-            .map(|raw| serde_json::from_slice::<u64>(raw).map_err(error))
-            .transpose()?
-            .unwrap_or(0);
-        let mut exact = previous;
-        let mut output = Vec::new();
-        for _ in 0..100 {
-            if cursor >= target {
-                return Ok(output);
-            }
-            let (messages, next) = self
-                .runtime
-                .fetch_messages(cid, Some(&cursor.to_string()), 100, None, None, None)
-                .await
-                .map_err(error)?;
-            self.current().await?;
-            let next = next
-                .ok_or_else(|| error("Message hint not present in verified entries"))?
-                .parse::<u64>()
-                .map_err(error)?;
-            if next <= cursor {
-                return Err(error("Message cursor did not advance"));
-            }
-            ctx.ensure_storage_durable().map_err(error)?;
-            let raw = serde_json::to_vec(&next).map_err(error)?;
-            if !ctx
-                .request_value_cas("entryCursor", cid, exact.as_deref(), &raw)
-                .map_err(error)?
-            {
-                return Err(error("Entry progress changed concurrently"));
-            }
-            exact = Some(raw);
-            cursor = next;
-            output.extend(
-                messages
-                    .into_iter()
-                    .filter(|m| m.has_displayable_body())
-                    .map(ui_message_from_orchestrator),
-            );
-        }
-        Err(error("Message catch-up exceeded page bound"))
-    }
+
     async fn consume(&self, raw: &str) -> Result<(), JsValue> {
         self.current().await?;
-        let value = decode(raw)?;
-        let current = self.fence.borrow().0.cursor.clone();
-        let Some(next) = next_cursor(&current, &value)? else {
-            // Best-effort typing is deliberately omitted from this adapter.
-            // It cannot advance a durable cursor or authorize consent.
-            return Ok(());
-        };
-        let payload = &value["payload"];
-        let kind = payload["$type"]
-            .as_str()
-            .ok_or_else(|| error("Missing event payload type"))?;
-        let mut messages = Vec::new();
-        if kind == "blue.catbird.chat.defs#messageAvailableEvent" {
-            let cid = payload["conversationId"]
-                .as_str()
-                .ok_or_else(|| error("Missing conversation"))?;
-            // A new request may arrive before a local row exists. A fresh
-            // exact inventory establishes its policy before processing entries.
-            if !self.runtime.conversations().lock().await.contains_key(cid) {
-                request_runtime::synchronize(&self.owner, &self.runtime, true).await?;
-            }
-            let target = payload["seq"]
-                .as_u64()
-                .ok_or_else(|| error("Missing entry sequence"))?;
-            messages = self.messages_through(cid, target).await?;
-        } else if kind != "blue.catbird.chat.defs#watermarkEvent" {
-            if kind == "blue.catbird.chat.defs#accessEndedEvent"
-                && (payload["userDid"] != self.owner || payload["deviceId"] != self.actor)
-            {
-                return Err(error("Foreign access-ended audience"));
-            }
-            request_runtime::synchronize(&self.owner, &self.runtime, true).await?;
-        }
-        self.current().await?;
-        self.runtime
-            .mls_context()
-            .ensure_storage_durable()
-            .map_err(error)?;
-        let (mut fence, expected) = self.fence.borrow().clone();
-        fence.cursor = next;
-        let encoded = serde_json::to_vec(&fence).map_err(error)?;
-        if !self
+        let outcome = self
             .runtime
-            .mls_context()
-            .request_value_cas("subscriptionCursor", &self.actor, Some(&expected), &encoded)
-            .map_err(error)?
-        {
-            return Err(error("Subscription progress superseded"));
+            .apply_subscription_frame(raw)
+            .await
+            .map_err(error)?;
+        self.current().await?;
+
+        match outcome {
+            SubscriptionDispatchOutcome::Typing {
+                conversation_id,
+                sender_did,
+                is_typing,
+            } => {
+                if conversation_id == self.selected {
+                    let event = serde_json::json!({
+                        "type": "typing",
+                        "data": {
+                            "conversationId": conversation_id,
+                            "senderDid": sender_did,
+                            "isTyping": is_typing,
+                        }
+                    });
+                    let _ = self.on_event.call1(&JsValue::NULL, &to_js(&event)?);
+                }
+            }
+            SubscriptionDispatchOutcome::MessageAvailable {
+                conversation_id,
+                messages,
+                ..
+            } => {
+                for message in messages
+                    .into_iter()
+                    .filter(|m| m.conversation_id == self.selected)
+                {
+                    let _ = self
+                        .on_message
+                        .call1(&JsValue::NULL, &to_js(&ui_message_from_orchestrator(message))?);
+                }
+                let event = serde_json::json!({
+                    "type": "fetchNeeded",
+                    "reason": "canonical",
+                    "data": {
+                        "conversationId": conversation_id,
+                        "source": "canonical"
+                    }
+                });
+                let _ = self.on_event.call1(&JsValue::NULL, &to_js(&event)?);
+            }
+            SubscriptionDispatchOutcome::Watermark { .. } => {
+                let event = serde_json::json!({
+                    "type": "fetchNeeded",
+                    "reason": "canonical",
+                    "data": {
+                        "conversationId": serde_json::Value::Null,
+                        "source": "canonical"
+                    }
+                });
+                let _ = self.on_event.call1(&JsValue::NULL, &to_js(&event)?);
+            }
+            SubscriptionDispatchOutcome::AccessEnded { .. } => {
+                let event = serde_json::json!({
+                    "type": "fetchNeeded",
+                    "reason": "canonical",
+                    "data": {
+                        "conversationId": serde_json::Value::Null,
+                        "source": "canonical"
+                    }
+                });
+                let _ = self.on_event.call1(&JsValue::NULL, &to_js(&event)?);
+            }
+            SubscriptionDispatchOutcome::OtherEvent {
+                conversation_id,
+                ..
+            } => {
+                let event = serde_json::json!({
+                    "type": "fetchNeeded",
+                    "reason": "canonical",
+                    "data": {
+                        "conversationId": conversation_id,
+                        "source": "canonical"
+                    }
+                });
+                let _ = self.on_event.call1(&JsValue::NULL, &to_js(&event)?);
+            }
         }
-        *self.fence.borrow_mut() = (fence, encoded);
-        for message in messages
-            .into_iter()
-            .filter(|m| m.conversation_id == self.selected)
-        {
-            let _ = self.on_message.call1(&JsValue::NULL, &to_js(&message)?);
-        }
-        let event = serde_json::json!({"type":"fetchNeeded","reason":"canonical","data":{"conversationId":payload["conversationId"].as_str(),"source":"canonical"}});
-        let _ = self.on_event.call1(&JsValue::NULL, &to_js(&event)?);
         Ok(())
     }
+
     fn enqueue(self: &Rc<Self>, raw: String) {
         if self.closed.get() || self.session_epoch != crate::browser_session::generation() {
             return;
@@ -255,6 +187,7 @@ pub struct CanonicalSubscription {
     _error: Closure<dyn FnMut(ErrorEvent)>,
     _close: Closure<dyn FnMut(CloseEvent)>,
 }
+
 #[wasm_bindgen]
 impl CanonicalSubscription {
     pub fn close(&self) {
@@ -264,6 +197,7 @@ impl CanonicalSubscription {
         !self.consumer.closed.get() && self.consumer.ws.ready_state() == WebSocket::OPEN
     }
 }
+
 impl Drop for CanonicalSubscription {
     fn drop(&mut self) {
         self.consumer.stop("closed");
@@ -282,57 +216,29 @@ pub(crate) async fn connect(
 ) -> Result<CanonicalSubscription, JsValue> {
     canonical_uuid_string(&selected, "subscription conversation").map_err(error)?;
     let (owner, runtime) = request_runtime::current_engine()?;
-    let api = with_state(|s| Ok(s.api_client.clone()))?;
-    let actor = runtime
-        .credentials()
-        .get_device_uuid(&owner)
+    let ticket = runtime
+        .prepare_subscription()
         .await
-        .map_err(error)?
-        .ok_or_else(|| error("Enrolled actor missing"))?;
-    let generation = runtime
-        .credentials()
-        .get_auth_generation(&owner)
-        .await
-        .map_err(error)?
-        .ok_or_else(|| error("Enrolled generation missing"))?;
-    let ticket =
-        crate::browser_inventory::prepare_subscription(runtime.clone(), api, &owner, &actor)
-            .await
-            .map_err(error)?;
-    request_runtime::current(&owner, &runtime)?;
-    let previous = runtime
-        .mls_context()
-        .request_value("subscriptionCursor", &actor)
         .map_err(error)?;
-    let fence = CursorFence {
-        owner: owner.clone(),
-        actor: actor.clone(),
-        generation,
-        session: ticket.inventory_session_id,
-        connection: uuid::Uuid::new_v4().to_string(),
-        cursor: ticket.event_cursor.clone(),
-    };
-    let encoded = serde_json::to_vec(&fence).map_err(error)?;
-    if !runtime
-        .mls_context()
-        .request_value_cas("subscriptionCursor", &actor, previous.as_deref(), &encoded)
-        .map_err(error)?
-    {
-        return Err(error("Concurrent subscription installation"));
-    }
+    request_runtime::current(&owner, &runtime)?;
+
+    let fence = runtime
+        .initialize_subscription_cursor(&ticket)
+        .await
+        .map_err(error)?;
+
     let mut url = reqwest::Url::parse(&ticket.endpoint).map_err(error)?;
     url.query_pairs_mut()
         .append_pair("ticket", &ticket.ticket)
         .append_pair("cursor", &ticket.event_cursor);
+
     let ws = WebSocket::new(url.as_str())?;
     let consumer = Rc::new(Consumer {
         runtime,
         session_epoch: crate::browser_session::generation(),
         owner,
-        actor,
-        generation,
+        connection_id: fence.connection,
         selected,
-        fence: RefCell::new((fence, encoded)),
         ws: ws.clone(),
         queue: RefCell::new(VecDeque::new()),
         running: Cell::new(false),
@@ -341,11 +247,13 @@ pub(crate) async fn connect(
         on_event,
         on_status,
     });
+
     let c = consumer.clone();
     let open = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
         c.status("connected");
     });
     ws.set_onopen(Some(open.as_ref().unchecked_ref()));
+
     let c = consumer.clone();
     let message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         if let Some(raw) = event.data().as_string() {
@@ -355,12 +263,15 @@ pub(crate) async fn connect(
         }
     });
     ws.set_onmessage(Some(message.as_ref().unchecked_ref()));
+
     let c = consumer.clone();
     let err = Closure::<dyn FnMut(ErrorEvent)>::new(move |_| c.stop("error"));
     ws.set_onerror(Some(err.as_ref().unchecked_ref()));
+
     let c = consumer.clone();
     let close = Closure::<dyn FnMut(CloseEvent)>::new(move |_| c.stop("closed"));
     ws.set_onclose(Some(close.as_ref().unchecked_ref()));
+
     Ok(CanonicalSubscription {
         consumer,
         _open: open,
@@ -370,32 +281,18 @@ pub(crate) async fn connect(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wasm_bindgen_test::*;
-    #[wasm_bindgen_test]
-    fn durable_event_chain_rejects_gap_duplicate_unknown_and_typing_cursor() {
-        let raw = r#"{"$type":"blue.catbird.chat.defs#eventEnvelope","previousCursor":"a","cursor":"b","createdAt":"2026-09-19T00:00:00.000Z","payload":{"$type":"blue.catbird.chat.defs#watermarkEvent","issuedAt":"2026-09-19T00:00:00.000Z"}}"#;
-        let parsed = decode(raw).unwrap();
-        assert_eq!(next_cursor("a", &parsed).unwrap(), Some("b".into()));
-        assert!(next_cursor("x", &parsed).is_err());
-        assert!(next_cursor("b", &parsed).is_err());
-        assert!(decode(&raw.replace("watermarkEvent", "futureEvent")).is_err());
-        assert!(
-            decode(&raw.replace("\"cursor\":\"b\"", "\"cursor\":\"b\",\"cursor\":\"c\"")).is_err()
-        );
-    }
-}
-
 #[cfg(all(test, feature = "inventory-worker-tests"))]
 mod custody_tests {
     use super::*;
     use crate::request_runtime::tests::{
         enqueue, initialize, installRequestFacadeFixture, Restore,
     };
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use serde_json::json;
     use wasm_bindgen_test::*;
+    // Crate-wide runner for the `inventory-worker-tests` feature (OPFS needs a worker).
+    wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
     #[wasm_bindgen(inline_js = r#"
     let previousSocket;
     export function installSocketFixture() {
@@ -413,26 +310,31 @@ mod custody_tests {
         fn restoreSocketFixture();
         async fn yieldSocketFixture();
     }
+
     struct SocketRestore;
     impl Drop for SocketRestore {
         fn drop(&mut self) {
             restoreSocketFixture();
         }
     }
+
     fn ticket() {
         enqueue(
             "getSubscriptionTicket",
             json!({"ticket":"t".repeat(32),"endpoint":"wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents","expiresAt":"2099-01-01T00:00:00.000Z","inventoryScope":{"supportedProtocolVersions":["1","2"],"scopeDigest":B64.encode([7u8;32])}}),
         );
     }
+
     fn pages() {
         let page = json!({"items":[],"hasMore":false,"inventorySessionId":"s".repeat(32),"snapshotEventCursor":"cursor","snapshotExpiresAt":"2099-01-01T00:00:00.000Z","inventoryScope":{"supportedProtocolVersions":["1","2"],"scopeDigest":B64.encode([7u8;32])}});
         enqueue("getPendingWelcomes", page.clone());
         enqueue("getLeafRecoveryInbox", page);
     }
+
     fn frame(previous: &str, next: &str) -> String {
         json!({"$type":"blue.catbird.chat.defs#eventEnvelope","previousCursor":previous,"cursor":next,"createdAt":"2026-09-19T00:00:00.000Z","payload":{"$type":"blue.catbird.chat.defs#watermarkEvent","issuedAt":"2026-09-19T00:00:00.000Z"}}).to_string()
     }
+
     async fn socket() -> CanonicalSubscription {
         let noop = js_sys::Function::new_no_args("");
         connect(
@@ -444,6 +346,7 @@ mod custody_tests {
         .await
         .unwrap()
     }
+
     #[wasm_bindgen_test]
     async fn exact_inventory_subscription_queue_preserves_protected_cursor_on_failure_and_restart()
     {
@@ -467,18 +370,14 @@ mod custody_tests {
             yieldSocketFixture().await;
         }
         assert!(!c.closed.get());
-        assert_eq!(c.fence.borrow().0.cursor, "third");
-        let ctx = c.runtime.mls_context();
-        let durable = ctx
-            .request_value("subscriptionCursor", &c.actor)
+        let current = c
+            .runtime
+            .current_subscription_cursor()
+            .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<CursorFence>(&durable)
-                .unwrap()
-                .cursor,
-            "third"
-        );
+        assert_eq!(current.cursor, "third");
+
         c.enqueue(frame("gap", "fourth"));
         for _ in 0..100 {
             if !c.running.get() {
@@ -487,32 +386,32 @@ mod custody_tests {
             yieldSocketFixture().await;
         }
         assert!(c.closed.get());
-        assert_eq!(
-            ctx.request_value("subscriptionCursor", &c.actor)
-                .unwrap()
-                .unwrap(),
-            durable
-        );
-        let actor = c.actor.clone();
+        let current = c
+            .runtime
+            .current_subscription_cursor()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.cursor, "third");
+
         drop(subscription);
         STATE.with(|s| *s.borrow_mut() = None);
         initialize(&path, owner).await;
         let (_, runtime) = request_runtime::current_engine().unwrap();
-        assert_eq!(
-            runtime
-                .mls_context()
-                .request_value("subscriptionCursor", &actor)
-                .unwrap()
-                .unwrap(),
-            durable
-        );
+        let restored = runtime
+            .current_subscription_cursor()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.cursor, "third");
+
         ticket();
         let first = socket().await;
         ticket();
         let second = socket().await;
         assert!(first.consumer.current().await.is_err());
         assert!(second.consumer.current().await.is_ok());
-        let exact = second.consumer.fence.borrow().1.clone();
+
         second
             .consumer
             .enqueue(frame("cursor", "second").replace("watermarkEvent", "unknownEvent"));
@@ -523,13 +422,46 @@ mod custody_tests {
             yieldSocketFixture().await;
         }
         assert!(second.consumer.closed.get());
-        assert_eq!(
-            runtime
-                .mls_context()
-                .request_value("subscriptionCursor", &actor)
+        let retained = runtime.current_subscription_cursor().await.unwrap().unwrap();
+        assert_eq!(retained.cursor, "cursor");
+        assert_eq!(retained.connection, second.consumer.connection_id);
+    }
+
+    #[wasm_bindgen_test]
+    async fn protected_page_manifest_survives_reopen_and_rejects_substitution() {
+        installRequestFacadeFixture("{}");
+        let _restore = Restore;
+        let owner = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let path = format!("inventory-{}", uuid::Uuid::new_v4());
+        initialize(&path, owner).await;
+        pages();
+        let (_, runtime) = request_runtime::current_engine().unwrap();
+        let applied = runtime.synchronize_authenticated_inventory(false).await.unwrap();
+        drop(runtime);
+
+        // Reopen the protected OPFS store. No welcome/recovery pages are queued,
+        // so a network fetch would fail: success proves protected replay.
+        STATE.with(|s| *s.borrow_mut() = None);
+        initialize(&path, owner).await;
+        let (_, runtime) = request_runtime::current_engine().unwrap();
+        let restored = runtime.synchronize_authenticated_inventory(false).await.unwrap();
+        assert_eq!(restored.inventory_session_id(), applied.inventory_session_id());
+        assert_eq!(restored.event_cursor(), applied.event_cursor());
+
+        let actor = runtime.require_actor_device_id().await.unwrap();
+        let ctx = runtime.mls_context();
+        let journal: serde_json::Value = serde_json::from_slice(
+            &ctx.request_value(&format!("inventory:{owner}"), &actor)
                 .unwrap()
                 .unwrap(),
-            exact
-        );
+        )
+        .unwrap();
+        let id = journal["welcomes"][0]["id"].as_str().unwrap();
+        let pages_ns = format!("inventoryPages:{owner}");
+        let exact = ctx.request_value(&pages_ns, id).unwrap().unwrap();
+        assert!(ctx
+            .request_value_cas(&pages_ns, id, Some(&exact), b"substituted page")
+            .unwrap());
+        assert!(runtime.synchronize_authenticated_inventory(false).await.is_err());
     }
 }

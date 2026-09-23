@@ -32,7 +32,6 @@
 mod api_client;
 mod browser_enrollment;
 mod browser_exports;
-mod browser_inventory;
 mod browser_session;
 mod browser_subscription;
 mod browser_transport;

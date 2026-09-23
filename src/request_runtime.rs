@@ -89,14 +89,8 @@ pub(crate) async fn synchronize(
     runtime: &Arc<BrowserOrchestrator>,
     fresh: bool,
 ) -> Result<(), JsValue> {
-    let api = with_state(|s| Ok(s.api_client.clone()))?;
-    let actor = runtime
-        .credentials()
-        .get_device_uuid(did)
-        .await
-        .map_err(err)?
-        .ok_or_else(|| err("Enrolled actor missing"))?;
-    crate::browser_inventory::synchronize_inventory(runtime.clone(), api, did, &actor, fresh)
+    runtime
+        .synchronize_authenticated_inventory(fresh)
         .await
         .map_err(err)?;
     current(did, runtime)

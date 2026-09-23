@@ -56,6 +56,35 @@ impl From<crate::sqlite_conn::WasmSqliteError> for MLSError {
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 const BUCKET_SIZES: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 
+/// The delivery service validates every KeyPackage leaf against a closed
+/// "clean leaf" profile: MLS 1.0 only, the XWING suite only, no extensions, no
+/// proposals, Basic credentials only (`mls-ds/server/src/chat_protocol/wire.rs`
+/// `validate_clean_leaf_shape`). OpenMLS' default `Capabilities` advertises
+/// every version/suite, so the profile must be set explicitly — the native
+/// key-package paths do the same (`catbird-mls/src/api.rs`,
+/// `orchestrator/direct_request_shared_crypto.rs`).
+fn clean_leaf_capabilities() -> Capabilities {
+    Capabilities::new(
+        Some(&[ProtocolVersion::Mls10]),
+        Some(&[CIPHERSUITE]),
+        Some(&[]),
+        Some(&[]),
+        Some(&[CredentialType::Basic]),
+    )
+}
+
+/// Fresh 29-day key-package lifetime starting one minute in the past, matching
+/// the native request package builder and the service's remaining-lifetime and
+/// maximum-lifetime bounds.
+fn key_package_lifetime() -> Result<Lifetime, MLSError> {
+    let now = chrono::Utc::now().timestamp();
+    if now < 0 {
+        return Err(MLSError::OpenMLS("system clock before epoch".into()));
+    }
+    let now = now as u64;
+    Ok(Lifetime::init(now.saturating_sub(60), now + 29 * 86400))
+}
+
 // ---------------------------------------------------------------------------
 // OpenMLS provider: LibcruxCrypto + WasmSqliteStorage
 // ---------------------------------------------------------------------------
@@ -1475,6 +1504,8 @@ impl WasmMLSContext {
         };
 
         let bundle = KeyPackage::builder()
+            .key_package_lifetime(key_package_lifetime()?)
+            .leaf_node_capabilities(clean_leaf_capabilities())
             .build(CIPHERSUITE, &self.provider, signer.as_ref(), cred_with_key)
             .map_err(|e| MLSError::OpenMLS(format!("KeyPackage::builder: {e:?}")))?;
         let key_package = bundle.key_package().clone();

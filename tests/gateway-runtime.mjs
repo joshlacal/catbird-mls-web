@@ -76,7 +76,10 @@ function allowedRemote(url,method='GET',websocket=false) {
 function allowedLocal(url,method){return url.origin===manifest.corsOrigin&&['GET','HEAD'].includes(method)&&(url.pathname==='/'||/^\/(src|node_modules|@vite|@id|@fs|\.svelte-kit|_app)\//.test(url.pathname)||/^\/(favicon|logo|catmos)[^/]*\.(svg|png|ico)$/.test(url.pathname));}
 // A certificate using a different untrusted SPKI must fail before HTTP.
 const wrongKey=join(out,'negative-leaf.key'),wrongCert=join(out,'negative-leaf.pem');
-execFileSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',wrongKey,'-out',wrongCert,'-days','1','-subj',`/CN=${new URL(manifest.origin).hostname}`,'-addext',`subjectAltName=DNS:${new URL(manifest.origin).hostname}`],{stdio:'pipe'});
+// X.509 CN is bounded at 64 bytes; the synthetic gateway hostname exceeds it. The
+// exact hostname still travels in the SAN, so this certificate fails on the pinned
+// SPKI (the property under test), not on a name mismatch.
+execFileSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',wrongKey,'-out',wrongCert,'-days','1','-subj','/CN=negative-leaf.request-fixture.catbird.blue','-addext',`subjectAltName=DNS:${new URL(manifest.origin).hostname}`],{stdio:'pipe'});
 let wrongLeafHttp=0;
 const wrongServer=createTlsServer({key:await readFile(wrongKey),cert:await readFile(wrongCert)},(_request,response)=>{wrongLeafHttp++;response.end('must not be reached');});
 await new Promise(resolve=>wrongServer.listen(0,'127.0.0.1',resolve));

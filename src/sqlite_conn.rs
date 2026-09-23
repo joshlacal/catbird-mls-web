@@ -68,11 +68,68 @@ pub struct SqliteConn {
 
 thread_local! {
     static OPEN_DATABASES: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    static OPFS_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Origin-wide exclusive owner of the persistent SAH pool. The pool itself does
+/// not exclude other Workers or tabs: on a cold directory each context creates
+/// its own backing files for the same database name (split brain). The Web Lock
+/// is held until this Worker's global is destroyed (terminate, reload, close).
+async fn acquire_opfs_owner() -> Result<(), WasmSqliteError> {
+    use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+    if OPFS_OWNER.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    let unavailable = |detail: &str| WasmSqliteError::Sqlite {
+        code: SQLITE_CANTOPEN,
+        message: format!("Protected storage owner lock unavailable: {detail}"),
+    };
+    let navigator = js_sys::Reflect::get(&js_sys::global(), &"navigator".into())
+        .map_err(|_| unavailable("no navigator"))?;
+    let locks = js_sys::Reflect::get(&navigator, &"locks".into())
+        .ok()
+        .filter(|value| value.is_object())
+        .ok_or_else(|| unavailable("Web Locks API missing"))?;
+    let request: js_sys::Function = js_sys::Reflect::get(&locks, &"request".into())
+        .ok()
+        .and_then(|value| value.dyn_into().ok())
+        .ok_or_else(|| unavailable("Web Locks API missing"))?;
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(&options, &"ifAvailable".into(), &JsValue::TRUE)
+        .map_err(|_| unavailable("options"))?;
+    let mut granted_resolve = None;
+    let granted = js_sys::Promise::new(&mut |resolve, _| granted_resolve = Some(resolve));
+    let granted_resolve = granted_resolve.ok_or_else(|| unavailable("promise"))?;
+    let callback = Closure::once_into_js(move |lock: JsValue| -> JsValue {
+        let _ = granted_resolve.call1(&JsValue::UNDEFINED, &JsValue::from_bool(!lock.is_null()));
+        if lock.is_null() {
+            JsValue::UNDEFINED
+        } else {
+            // Never settles: the lock lives exactly as long as this Worker.
+            js_sys::Promise::new(&mut |_, _| {}).into()
+        }
+    });
+    request
+        .call3(&locks, &"catbird-mls-web:opfs-sahpool-owner".into(), &options, &callback)
+        .map_err(|_| unavailable("request rejected"))?;
+    let owned = wasm_bindgen_futures::JsFuture::from(granted)
+        .await
+        .map_err(|_| unavailable("request failed"))?;
+    if owned.as_bool() != Some(true) {
+        return Err(WasmSqliteError::Sqlite {
+            code: SQLITE_BUSY,
+            message: "Protected OPFS storage is owned by another Worker or tab".into(),
+        });
+    }
+    OPFS_OWNER.with(|owner| owner.set(true));
+    Ok(())
 }
 impl SqliteConn {
     /// Register persistent OPFS storage in a dedicated Worker. A locked or
     /// unavailable pool is an error; never fall back to the default RAM VFS.
+    /// Exactly one Worker per origin may own the pool at a time.
     pub async fn initialize_opfs() -> Result<(), WasmSqliteError> {
+        acquire_opfs_owner().await?;
         let pool = sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(
             &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
             false,

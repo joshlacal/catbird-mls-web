@@ -2190,4 +2190,43 @@ impl MlsCryptoContext for WasmMLSContext {
         .map_err(|e| MLSError::Internal(format!("derive metadata key from pending: {e:?}")))?;
         Ok(key.to_vec())
     }
+    fn export_canonical_metadata_key(
+        &self,
+        group_id: Vec<u8>,
+        coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.ensure_loaded(&group_id)?;
+        let groups = self.groups.borrow();
+        let group = groups
+            .get(&group_id)
+            .ok_or_else(|| MLSError::Internal("group not loaded".into()))?;
+        Ok(catbird_mls::orchestrator::direct_request_bootstrap::request_metadata_key(
+            group,
+            &self.provider,
+            coordinates,
+        )?
+        .to_vec())
+    }
+    fn export_canonical_metadata_key_from_pending(
+        &self,
+        group_id: Vec<u8>,
+        coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.ensure_loaded(&group_id)?;
+        let groups = self.groups.borrow();
+        let group = groups
+            .get(&group_id)
+            .ok_or_else(|| MLSError::Internal("group not loaded".into()))?;
+        let staged = group
+            .pending_commit()
+            .ok_or_else(|| MLSError::Internal("no pending commit".into()))?;
+        Ok(
+            catbird_mls::orchestrator::direct_request_bootstrap::request_metadata_key_from_staged(
+                staged,
+                self.provider.crypto(),
+                coordinates,
+            )?
+            .to_vec(),
+        )
+    }
 }

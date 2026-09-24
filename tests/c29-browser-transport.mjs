@@ -40,6 +40,7 @@ onmessage=async({data:{id,method,args}})=>{
  catch(error){ postMessage({id,error:String(error.message ?? error)}); }
 };`;
 
+const preparations = [];
 const traffic = [];
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, 'http://local.invalid');
@@ -69,9 +70,12 @@ const server = createServer(async (request, response) => {
     if (nsid.endsWith('.getConversations')) {
       response.end(JSON.stringify({ items: [], hasMore: false, inventorySessionId: 's'.repeat(32), snapshotEventCursor: 'fixture-cursor', snapshotExpiresAt: '2099-01-01T00:00:00.000Z', inventoryScope: { supportedProtocolVersions: ['1', '2'], scopeDigest: Buffer.alloc(32, 7).toString('base64') } })); return;
     }
+    if (nsid.endsWith('.prepareDirectRequest')) {
+      preparations.push(raw);
+      response.writeHead(503).end(JSON.stringify({ error: 'FixtureOffline' })); return;
+    }
     response.writeHead(503).end(JSON.stringify({ error: 'FixtureOffline' })); return;
   }
-  response.setHeader('content-type', 'text/html');
   response.end('<title>C29 Browser draft transport boundary test</title>');
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -127,34 +131,49 @@ try {
   assert.equal(typed.input.text, 'Hello from browser draft composer');
   assert.equal(traffic.length, setupTrafficCount, 'Composer typing must emit ZERO transport calls');
 
-  // Step 3: Attachment-first rejection
-  // An unaccepted direct request conversation ID has send_allowed = false.
-  // Attempting to send an image on it via catbird_mls_send_image must be rejected by require_ordinary_access.
-  const unacceptedCid = randomUUID();
+  // Step 3: Attachment-first rejection on a REAL pending direct request conversation
+  // Start a direct request to establish an actual pending conversation on the device.
+  const startResult = await call('catbird_mls_start_direct_request', typingInput);
+  assert.equal(startResult.type, 'outcomeUnknown');
+  assert.ok(preparations.length >= 1, 'prepareDirectRequest was called');
+  const realPendingCid = JSON.parse(preparations[0]).signedRequest.body.conversationId;
+  assert.ok(realPendingCid, 'A real conversation ID exists for the pending direct request');
+  console.log('Real pending conversation ID:', realPendingCid);
+
+  // Attempting to send an image on the real pending conversation must be rejected by require_ordinary_access.
+  const beforeImageAttempt = traffic.length;
   let imageSendError = null;
   try {
-    await call('catbird_mls_send_image', unacceptedCid, 'image caption', new Uint8Array([137, 80, 78, 71]), 'image/png', 100, 100, 'alt');
+    await call('catbird_mls_send_image', realPendingCid, 'image caption', new Uint8Array([137, 80, 78, 71]), 'image/png', 100, 100, 'alt');
   } catch (e) {
     imageSendError = e.message;
   }
-  assert.ok(imageSendError, 'send_image on unaccepted conversation must throw');
+  assert.ok(imageSendError, 'send_image on real pending conversation must throw');
   assert.match(imageSendError, /Conversation consent or device readiness does not allow this action/);
-  console.log('Attachment-first rejection error:', imageSendError);
+  console.log('Attachment-first rejection error on real pending conversation:', imageSendError);
 
-  // Step 4: Draft cancellation -> archives draft locally
+  // Filter for forbidden upload / conversation / send endpoints during attachment attempt:
+  const uploadForbidden = ['uploadBlob', 'prepareBlobUpload', 'sendMessage', 'createConversation'];
+  const attachTraffic = traffic.slice(beforeImageAttempt).filter(t => uploadForbidden.some(f => t.nsid.endsWith(f)));
+  assert.equal(attachTraffic.length, 0, `Attachment attempt must emit zero upload/send calls: ${JSON.stringify(attachTraffic)}`);
+
+  // Step 4: Draft cancellation on a separate draft -> archives draft locally with 0 remote calls
+  const secondDraftId = randomUUID();
+  const secondInput = { draftId: secondDraftId, recipientDid: peer, text: 'Second local draft', invitation: null };
+  await call('catbird_mls_request_command', 'save_request_draft', { ownerDid: alice, input: secondInput, recipientLabel: 'Peer' });
   const beforeCancel = traffic.length;
-  const cancelled = await call('catbird_mls_request_command', 'cancel_request_draft', { ownerDid: alice, draftId });
+  const cancelled = await call('catbird_mls_request_command', 'cancel_request_draft', { ownerDid: alice, draftId: secondDraftId });
   assert.equal(cancelled.archived, true);
   assert.equal(traffic.length, beforeCancel, 'Draft cancel must emit ZERO transport calls');
 
-  // Step 5: Verify workspace state shows draft is archived locally
+  // Step 5: Verify workspace state shows second draft is archived locally
   const workspace = await call('catbird_mls_request_command', 'get_request_workspace', { ownerDid: alice });
-  const foundDraft = workspace.drafts.find(d => d.input.draftId === draftId);
+  const foundDraft = workspace.drafts.find(d => d.input.draftId === secondDraftId);
   assert.ok(foundDraft);
   assert.equal(foundDraft.archived, true);
 
-  // Remote conversation / upload / request endpoints that must NEVER be called
-  const remoteForbidden = ['createConversation', 'uploadBlob', 'sendMessage', 'prepareDirectRequest', 'publishDirectRequest'];
+  // Remote conversation / upload / request endpoints that must NEVER be called outside the explicit start
+  const remoteForbidden = ['createConversation', 'uploadBlob', 'prepareBlobUpload', 'sendMessage', 'publishDirectRequest'];
   const forbiddenTraffic = traffic.filter(t => remoteForbidden.some(f => t.nsid.endsWith(f)));
   assert.equal(forbiddenTraffic.length, 0, `No remote conversation/upload/request calls allowed: ${JSON.stringify(forbiddenTraffic)}`);
 

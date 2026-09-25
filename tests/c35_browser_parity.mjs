@@ -29,10 +29,10 @@ const jsSha256 = crypto.createHash('sha256').update(jsBytes).digest('hex');
 console.log(`Loaded WASM artifact sha256: ${wasmSha256}`);
 console.log(`Loaded JS artifact sha256: ${jsSha256}`);
 
-if (wasmSha256 !== "36c86a01cd6989da850f6f0c65df13d571fc134c05c8ff0be9e140c394f0d59a") {
+if (wasmSha256 !== "1fe050883e0d33b3a6ac6de2206bdf440be526872db7c240b4c62d6c0b772dec") {
   throw new Error(`WASM artifact hash mismatch: got ${wasmSha256}`);
 }
-if (jsSha256 !== "07ba2fc79750e20239c410ed6dab4bb8daae28abea145cb64b8d1dcd723b7061") {
+if (jsSha256 !== "dea1cf13208a2fa6bacd5bebdb0f948c27654630606acdd72a2d34eadf73e80a") {
   throw new Error(`JS artifact hash mismatch: got ${jsSha256}`);
 }
 

@@ -234,6 +234,41 @@ if (digestB !== expectedDigestB) {
   throw new Error(`Stage B digest mismatch: expected ${expectedDigestB}, got ${digestB}`);
 }
 
+// Counterfactual Stage B: Corrupting a row in the database before reopen changes only the Stage B digest
+{
+  const corruptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'c35-browser-corrupt-'));
+  const corruptDbPath = path.join(corruptDir, 'c35_corrupt.sqlite');
+  const cDb = new DatabaseSync(corruptDbPath);
+  cDb.exec(`
+    CREATE TABLE mls_direct_request_projection (
+      conversation_id TEXT PRIMARY KEY,
+      view_json TEXT NOT NULL,
+      consent TEXT NOT NULL,
+      state_version INTEGER NOT NULL
+    );
+  `);
+  const insert = cDb.prepare('INSERT INTO mls_direct_request_projection VALUES (?, ?, ?, ?)');
+  for (const view of projectedViews) {
+    insert.run(view.conversationId, JSON.stringify(view), view.consent, view.stateVersion);
+  }
+  const corruptedView0 = JSON.parse(JSON.stringify(projectedViews[0]));
+  corruptedView0.preview.text += " [STAGE_B_MUTATED]";
+  cDb.prepare('UPDATE mls_direct_request_projection SET view_json = ? WHERE conversation_id = ?').run(
+    JSON.stringify(corruptedView0),
+    corruptedView0.conversationId
+  );
+  cDb.close();
+
+  const reopenedCorrupt = new DatabaseSync(corruptDbPath, { readOnly: true });
+  const cRows = reopenedCorrupt.prepare('SELECT view_json FROM mls_direct_request_projection ORDER BY conversation_id').all();
+  reopenedCorrupt.close();
+  fs.rmSync(corruptDir, { recursive: true, force: true });
+  const cViews = cRows.map(r => JSON.parse(r.view_json));
+  const cDigestB = sha256Hex(canonicalJsonBytes(cViews));
+  console.log(`C35 BROWSER WASM Counterfactual Stage B Mutated Digest: ${cDigestB}`);
+  assert.notEqual(cDigestB, expectedDigestB, "Corrupting persisted row on disk must change Stage B digest");
+}
+
 // =========================================================================
 // Stage C: Consent State Transitions & Fencing
 // =========================================================================

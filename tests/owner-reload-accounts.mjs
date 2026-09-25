@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises';
 import { createECDH, createHash, randomUUID } from 'node:crypto';
 import { chromium } from '../../catmos/node_modules/@playwright/test/index.mjs';
 
-const pkgDir = new URL(`../${process.env.PKG_DIR ?? 'pkg'}/`, import.meta.url);
+const pkgDir = process.env.PKG_DIR ? (process.env.PKG_DIR.startsWith('/') ? new URL(`file://${process.env.PKG_DIR}/`) : new URL(process.env.PKG_DIR, import.meta.url)) : new URL('../pkg/', import.meta.url);
 const key = createECDH('prime256v1');
 key.setPrivateKey(Buffer.alloc(32, 41));
 const publicKey = key.getPublicKey(null, 'compressed');

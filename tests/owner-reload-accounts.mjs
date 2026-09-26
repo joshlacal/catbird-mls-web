@@ -281,11 +281,21 @@ try {
   assert.equal(opfs.hits, 0, 'pending text never appears in OPFS bytes');
   record('C30 encrypted OPFS', { wrongKey: wrongKey.error, opfsFilesScanned: opfs.files, opfsBytesScanned: opfs.bytes, plaintextHits: 0 });
 
+  // Record loaded wasm hash from the page (the HTTP response body evaluated inside Chromium)
+  const pageWasmSha256 = await page.evaluate(async () => {
+    const res = await fetch('/pkg/catbird_mls_web_bg.wasm');
+    const buf = await res.arrayBuffer();
+    const digest = await crypto.subtle.digest('SHA-256', buf);
+    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+  });
   const loaded = [...new Set(wasmServed)];
   assert.equal(loaded.length, 1, 'one wasm artifact served to every Worker');
+  assert.equal(pageWasmSha256, loaded[0], 'page-fetched wasm response body sha256 matches server-served wasm');
   console.log(JSON.stringify({
     result: 'PASS', kind: 'generated-package-real-chromium-workers-tabs-reload-local-http-fixture',
-    wasmSha256Loaded: loaded[0], wasmLoads: wasmServed.length, pkgDir: pkgDir.pathname,
+    wasmSha256Loaded: loaded[0],
+    pageResponseWasmSha256: pageWasmSha256,
+    wasmLoads: wasmServed.length, pkgDir: pkgDir.pathname,
     transport: traffic.reduce((all, n) => ({ ...all, [n]: (all[n] ?? 0) + 1 }), {}),
     assertions,
   }, null, 2));

@@ -1136,12 +1136,9 @@ pub fn catbird_mls_list_conversations(
         let (owner, runtime) = request_runtime::current_engine()?;
         request_runtime::synchronize(&owner, &runtime, true).await?;
         let views = runtime
-            .conversations()
-            .lock()
+            .conversation_display_snapshot(&owner)
             .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+            .map_err(|e| js_err!("{}", e))?;
         let storage = with_state(|s| Ok(s.storage.clone()))?;
         let requests = runtime
             .list_direct_request_views()

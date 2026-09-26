@@ -93,6 +93,18 @@ pub(crate) async fn synchronize(
         .synchronize_authenticated_inventory(fresh)
         .await
         .map_err(err)?;
+    if let Ok(views) = runtime.list_direct_request_views().await {
+        for view in views {
+            if matches!(
+                view.consent,
+                RequestConsent::IncomingPending | RequestConsent::OutgoingPending
+            ) {
+                if let Err(error) = runtime.refresh_request_preview(&view.conversation_id).await {
+                    tracing::warn!(conversation_id=%view.conversation_id, %error, "Request sync refresh deferred");
+                }
+            }
+        }
+    }
     current(did, runtime)
 }
 pub(crate) async fn replenish() -> Result<JsValue, JsValue> {

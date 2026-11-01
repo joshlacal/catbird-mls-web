@@ -1799,6 +1799,7 @@ pub fn catbird_mls_update_group_metadata(
             description: description.clone().unwrap_or_default(),
             avatar_blob_locator: avatar_blob_locator.clone(),
             avatar_content_type: avatar_content_type.clone(),
+            space_avatar: None,
         };
 
         let ciphertext = metadata::encrypt_metadata_blob(
@@ -2156,6 +2157,7 @@ pub fn wasm_republish_metadata_after_reset(
             description: description.clone(),
             avatar_blob_locator: avatar_blob_locator.clone(),
             avatar_content_type: avatar_content_type.clone(),
+            space_avatar: None,
         };
 
         // 4. Encrypt + upload metadata blob (under fresh epoch's key).

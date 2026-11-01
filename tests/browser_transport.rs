@@ -1,4 +1,5 @@
 #![cfg(target_arch = "wasm32")]
+#![allow(dead_code)]
 
 use base64::Engine as _;
 use js_sys::{Function, Uint8Array};

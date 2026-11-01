@@ -105,5 +105,4 @@ async fn browser_key_package_leaf_matches_closed_service_profile() {
         lifetime.not_after().saturating_sub(lifetime.not_before()) <= 30 * 24 * 60 * 60 + 60 * 60,
         "service rejects lifetimes over 30 days + 1 hour"
     );
-
 }

@@ -1175,78 +1175,11 @@ impl WasmMLSContext {
 
     pub(crate) fn create_external_commit(
         &self,
-        group_info_bytes: Vec<u8>,
-        identity_bytes: Vec<u8>,
+        _group_info_bytes: Vec<u8>,
+        _identity_bytes: Vec<u8>,
     ) -> Result<ExternalCommitResult, MLSError> {
-        let (msg_in, _) = MlsMessageIn::tls_deserialize_bytes(&group_info_bytes)
-            .map_err(|e| MLSError::OpenMLS(format!("GroupInfo deserialize: {e:?}")))?;
-
-        let verifiable_group_info = match msg_in.extract() {
-            MlsMessageBodyIn::GroupInfo(gi) => gi,
-            _ => {
-                return Err(MLSError::invalid_input(
-                    "expected GroupInfo for external commit",
-                ))
-            }
-        };
-
-        // Any request journal entry owns its exact crypto, including terminal
-        // records. External joining must not overwrite that group underneath
-        // a retained request/artifact binding, or publish it into the live cache.
-        let group_id = hex::encode(verifiable_group_info.group_id().as_slice());
-        if self.provider.storage().conn().exists(
-            "SELECT 1 FROM direct_request_journal_v2 WHERE group_id = ?1 UNION ALL SELECT 1 FROM direct_request_live_v2 WHERE group_id = ?1 UNION ALL SELECT 1 FROM direct_request_import_ownership_v2 WHERE group_id = ?1",
-            &[(1, &group_id)],
-        )? {
-            return Err(MLSError::OperationNotSupported {
-                reason: "external joining cannot replace a request-owned group".into(),
-            });
-        }
-
-        let config = Self::default_config();
-        let signer = self.get_or_create_signer(&identity_bytes)?;
-
-        let credential = BasicCredential::new(identity_bytes.clone());
-        let cred_with_key = CredentialWithKey {
-            credential: credential.into(),
-            signature_key: signer.public().into(),
-        };
-
-        let join_config = Self::make_join_config(&config);
-
-        let (group, commit_msg, group_info_out) = MlsGroup::join_by_external_commit(
-            &self.provider,
-            signer.as_ref(),
-            None,
-            verifiable_group_info,
-            &join_config,
-            None,
-            None,
-            b"",
-            cred_with_key,
-        )
-        .map_err(|e| MLSError::OpenMLS(format!("join_by_external_commit: {e:?}")))?;
-
-        let commit_data = commit_msg
-            .tls_serialize_detached()
-            .map_err(|e| MLSError::OpenMLS(format!("commit serialize: {e:?}")))?;
-
-        let group_info = group_info_out
-            .as_ref()
-            .map(|gi| {
-                gi.tls_serialize_detached()
-                    .map_err(|e| MLSError::OpenMLS(format!("GroupInfo serialize: {e:?}")))
-            })
-            .transpose()?;
-
-        let group_id = group.group_id().as_slice().to_vec();
-        self.groups.borrow_mut().insert(group_id.clone(), group);
-        self.signers.borrow_mut().insert(identity_bytes, signer);
-
-        Ok(ExternalCommitResult {
-            commit_data,
-            group_id,
-            group_info,
+        Err(MLSError::OperationNotSupported {
+            reason: "I3: external joins are forbidden; use Welcome or ResetGroup".into(),
         })
     }
 
@@ -2200,12 +2133,14 @@ impl MlsCryptoContext for WasmMLSContext {
         let group = groups
             .get(&group_id)
             .ok_or_else(|| MLSError::Internal("group not loaded".into()))?;
-        Ok(catbird_mls::orchestrator::direct_request_bootstrap::request_metadata_key(
-            group,
-            &self.provider,
-            coordinates,
-        )?
-        .to_vec())
+        Ok(
+            catbird_mls::orchestrator::direct_request_bootstrap::request_metadata_key(
+                group,
+                &self.provider,
+                coordinates,
+            )?
+            .to_vec(),
+        )
     }
     fn export_canonical_metadata_key_from_pending(
         &self,

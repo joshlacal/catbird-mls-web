@@ -53,7 +53,12 @@ impl Consumer {
             return Err(error("Subscription closed"));
         }
         request_runtime::current(&self.owner, &self.runtime)?;
-        match self.runtime.current_subscription_cursor().await.map_err(error)? {
+        match self
+            .runtime
+            .current_subscription_cursor()
+            .await
+            .map_err(error)?
+        {
             Some(fence) if fence.connection == self.connection_id => Ok(()),
             _ => Err(error("Subscription was superseded")),
         }
@@ -95,9 +100,10 @@ impl Consumer {
                     .into_iter()
                     .filter(|m| m.conversation_id == self.selected)
                 {
-                    let _ = self
-                        .on_message
-                        .call1(&JsValue::NULL, &to_js(&ui_message_from_orchestrator(message))?);
+                    let _ = self.on_message.call1(
+                        &JsValue::NULL,
+                        &to_js(&ui_message_from_orchestrator(message))?,
+                    );
                 }
                 let event = serde_json::json!({
                     "type": "fetchNeeded",
@@ -132,8 +138,7 @@ impl Consumer {
                 let _ = self.on_event.call1(&JsValue::NULL, &to_js(&event)?);
             }
             SubscriptionDispatchOutcome::OtherEvent {
-                conversation_id,
-                ..
+                conversation_id, ..
             } => {
                 let event = serde_json::json!({
                     "type": "fetchNeeded",
@@ -216,10 +221,7 @@ pub(crate) async fn connect(
 ) -> Result<CanonicalSubscription, JsValue> {
     canonical_uuid_string(&selected, "subscription conversation").map_err(error)?;
     let (owner, runtime) = request_runtime::current_engine()?;
-    let ticket = runtime
-        .prepare_subscription()
-        .await
-        .map_err(error)?;
+    let ticket = runtime.prepare_subscription().await.map_err(error)?;
     request_runtime::current(&owner, &runtime)?;
 
     let fence = runtime
@@ -422,7 +424,11 @@ mod custody_tests {
             yieldSocketFixture().await;
         }
         assert!(second.consumer.closed.get());
-        let retained = runtime.current_subscription_cursor().await.unwrap().unwrap();
+        let retained = runtime
+            .current_subscription_cursor()
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(retained.cursor, "cursor");
         assert_eq!(retained.connection, second.consumer.connection_id);
     }
@@ -436,7 +442,10 @@ mod custody_tests {
         initialize(&path, owner).await;
         pages();
         let (_, runtime) = request_runtime::current_engine().unwrap();
-        let applied = runtime.synchronize_authenticated_inventory(false).await.unwrap();
+        let applied = runtime
+            .synchronize_authenticated_inventory(false)
+            .await
+            .unwrap();
         drop(runtime);
 
         // Reopen the protected OPFS store. No welcome/recovery pages are queued,
@@ -444,8 +453,14 @@ mod custody_tests {
         STATE.with(|s| *s.borrow_mut() = None);
         initialize(&path, owner).await;
         let (_, runtime) = request_runtime::current_engine().unwrap();
-        let restored = runtime.synchronize_authenticated_inventory(false).await.unwrap();
-        assert_eq!(restored.inventory_session_id(), applied.inventory_session_id());
+        let restored = runtime
+            .synchronize_authenticated_inventory(false)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.inventory_session_id(),
+            applied.inventory_session_id()
+        );
         assert_eq!(restored.event_cursor(), applied.event_cursor());
 
         let actor = runtime.require_actor_device_id().await.unwrap();
@@ -462,6 +477,9 @@ mod custody_tests {
         assert!(ctx
             .request_value_cas(&pages_ns, id, Some(&exact), b"substituted page")
             .unwrap());
-        assert!(runtime.synchronize_authenticated_inventory(false).await.is_err());
+        assert!(runtime
+            .synchronize_authenticated_inventory(false)
+            .await
+            .is_err());
     }
 }

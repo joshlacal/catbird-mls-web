@@ -475,14 +475,18 @@ fn is_safe_public_host(raw_host: &str) -> bool {
 
 fn did_web_to_document_url(did: &str) -> Result<String> {
     if did.contains('#') || did.contains('?') || did.contains('@') {
-        return Err(OrchestratorError::Credential("invalid did:web syntax".into()));
+        return Err(OrchestratorError::Credential(
+            "invalid did:web syntax".into(),
+        ));
     }
     let method_specific = did
         .strip_prefix("did:web:")
         .ok_or_else(|| OrchestratorError::Credential("expected did:web identifier".into()))?;
     let parts: Vec<&str> = method_specific.split(':').collect();
     if parts.is_empty() || parts[0].is_empty() {
-        return Err(OrchestratorError::Credential("empty authority in did:web".into()));
+        return Err(OrchestratorError::Credential(
+            "empty authority in did:web".into(),
+        ));
     }
     let raw_authority = parts[0];
     let (raw_host, port) = if let Some(idx) = raw_authority.to_lowercase().find("%3a") {
@@ -492,7 +496,9 @@ fn did_web_to_document_url(did: &str) -> Result<String> {
             .parse()
             .map_err(|_| OrchestratorError::Credential("invalid port in did:web".into()))?;
         if p == 0 {
-            return Err(OrchestratorError::Credential("invalid port 0 in did:web".into()));
+            return Err(OrchestratorError::Credential(
+                "invalid port 0 in did:web".into(),
+            ));
         }
         (h, Some(p))
     } else {
@@ -507,7 +513,9 @@ fn did_web_to_document_url(did: &str) -> Result<String> {
         || raw_host.contains('\\')
         || raw_host.contains('@')
     {
-        return Err(OrchestratorError::Credential("invalid host in did:web".into()));
+        return Err(OrchestratorError::Credential(
+            "invalid host in did:web".into(),
+        ));
     }
     if !is_safe_public_host(raw_host) {
         return Err(OrchestratorError::Credential(
@@ -525,24 +533,29 @@ fn did_web_to_document_url(did: &str) -> Result<String> {
             || seg.contains('?')
             || seg.contains('#')
         {
-            return Err(OrchestratorError::Credential("invalid path segment in did:web".into()));
+            return Err(OrchestratorError::Credential(
+                "invalid path segment in did:web".into(),
+            ));
         }
-        let decoded = percent_decode_str(seg)
-            .map_err(|_| OrchestratorError::Credential("invalid percent encoding in did:web".into()))?;
+        let decoded = percent_decode_str(seg).map_err(|_| {
+            OrchestratorError::Credential("invalid percent encoding in did:web".into())
+        })?;
         if decoded.is_empty()
             || decoded == "."
             || decoded == ".."
             || decoded.contains('/')
             || decoded.contains('\\')
         {
-            return Err(OrchestratorError::Credential("illegal path segment in did:web".into()));
+            return Err(OrchestratorError::Credential(
+                "illegal path segment in did:web".into(),
+            ));
         }
         path_segments.push(*seg);
     }
 
     let path = if path_segments.is_empty() {
         "/.well-known/did.json".to_string()
-     } else {
+    } else {
         format!("/{}/did.json", path_segments.join("/"))
     };
 
@@ -572,7 +585,9 @@ fn is_valid_bare_did(did: &str) -> bool {
     }
     let method = parts[1];
     if method.is_empty()
-        || !method.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        || !method
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
         return false;
     }
@@ -587,11 +602,12 @@ fn is_valid_bare_did(did: &str) -> bool {
 fn did_to_document_url(did: &str) -> Result<String> {
     if did.starts_with("did:web:") {
         did_web_to_document_url(did)
-    } else if did.starts_with("did:plc:") {
+    } else if let Some(specific) = did.strip_prefix("did:plc:") {
         if did.contains('#') || did.contains('?') || did.contains('/') || did.contains('@') {
-            return Err(OrchestratorError::Credential("invalid did:plc syntax".into()));
+            return Err(OrchestratorError::Credential(
+                "invalid did:plc syntax".into(),
+            ));
         }
-        let specific = &did["did:plc:".len()..];
         if specific.is_empty() || !specific.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err(OrchestratorError::Credential(
                 "invalid did:plc identifier characters".into(),
@@ -645,7 +661,9 @@ fn validate_pds_endpoint(raw: &str) -> Result<String> {
             .parse()
             .map_err(|_| OrchestratorError::Credential("invalid port in PDS endpoint".into()))?;
         if p == 0 {
-            return Err(OrchestratorError::Credential("invalid port 0 in PDS endpoint".into()));
+            return Err(OrchestratorError::Credential(
+                "invalid port 0 in PDS endpoint".into(),
+            ));
         }
         (h, Some(p))
     } else {
@@ -707,7 +725,9 @@ async fn safe_browser_fetch(url: &str) -> Result<(u16, Vec<u8>)> {
         .as_bool()
         .unwrap_or(false);
     if redirected {
-        return Err(OrchestratorError::Credential("redirects are prohibited".into()));
+        return Err(OrchestratorError::Credential(
+            "redirects are prohibited".into(),
+        ));
     }
 
     if let Some(resp_url) = js_field(&response, "url")?.as_string() {
@@ -718,9 +738,7 @@ async fn safe_browser_fetch(url: &str) -> Result<(u16, Vec<u8>)> {
         }
     }
 
-    let status = js_field(&response, "status")?
-        .as_f64()
-        .unwrap_or(0.0) as u16;
+    let status = js_field(&response, "status")?.as_f64().unwrap_or(0.0) as u16;
 
     let stream = js_field(&response, "body")?;
     if stream.is_undefined() || stream.is_null() {
@@ -789,7 +807,9 @@ async fn fetch_receipt_authority_document(expected_authority_did: &str) -> Resul
 /// Resolve verified account-home chat declaration for a user DID from authenticated PDS.
 async fn fetch_chat_declaration_authority(user_did: &str) -> Result<Option<String>> {
     if !is_valid_bare_did(user_did) {
-        return Err(OrchestratorError::Credential("invalid bare user DID".into()));
+        return Err(OrchestratorError::Credential(
+            "invalid bare user DID".into(),
+        ));
     }
     let did_doc_url = did_to_document_url(user_did)?;
     let (status, bytes) = safe_browser_fetch(&did_doc_url).await?;
@@ -801,9 +821,10 @@ async fn fetch_chat_declaration_authority(user_did: &str) -> Result<Option<Strin
     let doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
         OrchestratorError::Credential(format!("user DID document JSON invalid: {e}"))
     })?;
-    let id = doc.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
-        OrchestratorError::Credential("user DID document missing id".into())
-    })?;
+    let id = doc
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| OrchestratorError::Credential("user DID document missing id".into()))?;
     if id != user_did {
         return Err(OrchestratorError::Credential(format!(
             "user DID document id mismatch: expected {user_did}, got {id}"

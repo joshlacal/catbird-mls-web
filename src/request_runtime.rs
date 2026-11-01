@@ -1,7 +1,6 @@
 //! Browser UI adapter around the shared request engine. Drafts are protected
 //! local input; the shared intent/projection journals remain protocol authority.
 use crate::*;
-use catbird_mls::orchestrator::mls_provider::MlsCryptoContext;
 use catbird_mls::orchestrator::{
     DirectRequestInput, DirectRequestOutcome, MLSOrchestrator, RequestConsent,
 };

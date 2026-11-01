@@ -566,10 +566,7 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         self.inner.write_psk(psk_id, psk).map_err(map_kv_err)
     }
 
-    fn psk<
-        PskBundle: traits::PskBundle<CURRENT_VERSION>,
-        PskId: traits::PskId<CURRENT_VERSION>,
-    >(
+    fn psk<PskBundle: traits::PskBundle<CURRENT_VERSION>, PskId: traits::PskId<CURRENT_VERSION>>(
         &self,
         psk_id: &PskId,
     ) -> Result<Option<PskBundle>, Self::Error> {
@@ -872,11 +869,7 @@ impl WasmUnifiedStorage {
             .timestamp_millis_opt(raw.updated_at_ms)
             .single()
             .unwrap_or_else(Utc::now);
-        let cached_meta = self
-            .conn
-            .get_group_metadata(conversation_id)
-            .ok()
-            .flatten();
+        let cached_meta = self.conn.get_group_metadata(conversation_id).ok().flatten();
         let meta_title = raw
             .title
             .or_else(|| cached_meta.as_ref().and_then(|m| m.title.clone()));
@@ -948,7 +941,7 @@ impl WasmUnifiedStorage {
             .view
             .canonical_state
             .as_ref()
-            .map(|s| s.coordinates.generation as i64)
+            .map(|s| s.coordinates.generation)
             .unwrap_or(0);
         let epoch = env.view.epoch as i64;
         let join_method = join_method_str(env.join_method);
@@ -1139,7 +1132,7 @@ impl WasmUnifiedStorage {
             env.view
                 .canonical_state
                 .as_ref()
-                .map(|s| s.coordinates.state_version as i64)
+                .map(|s| s.coordinates.state_version)
         }))
     }
 
@@ -1185,7 +1178,10 @@ impl WasmUnifiedStorage {
             for (cid, env) in envelopes {
                 if cid == group_or_convo_id
                     || env.group_id_str == group_or_convo_id
-                    || env.historical_group_ids.iter().any(|g| g == group_or_convo_id)
+                    || env
+                        .historical_group_ids
+                        .iter()
+                        .any(|g| g == group_or_convo_id)
                 {
                     return cid;
                 }
@@ -1321,16 +1317,18 @@ impl WasmUnifiedStorage {
         else {
             return Ok(None);
         };
-        let meta: StoredMetadataJson = serde_json::from_str(&row.metadata_json).map_err(|e| {
-            format!("corrupt metadata_json for {key}: {e}")
-        })?;
+        let meta: StoredMetadataJson = serde_json::from_str(&row.metadata_json)
+            .map_err(|e| format!("corrupt metadata_json for {key}: {e}"))?;
         let Some(b64) = meta.avatar_bytes_b64 else {
             return Ok(None);
         };
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&b64)
             .map_err(|e| format!("decode avatar bytes: {e}"))?;
-        Ok(Some((bytes, meta.avatar_content_type.or(row.avatar_mime_type))))
+        Ok(Some((
+            bytes,
+            meta.avatar_content_type.or(row.avatar_mime_type),
+        )))
     }
 
     #[allow(clippy::type_complexity)]
@@ -1355,7 +1353,12 @@ impl WasmUnifiedStorage {
             return Ok((None, None, None, None));
         };
         let avatar = self.get_metadata_avatar(conversation_id)?;
-        Ok((row.title, row.description, avatar, Some(row.metadata_version)))
+        Ok((
+            row.title,
+            row.description,
+            avatar,
+            Some(row.metadata_version),
+        ))
     }
 
     pub fn upsert_conversation_mapping(
@@ -1367,7 +1370,9 @@ impl WasmUnifiedStorage {
         let env = if let Some(mut existing) = self.load_envelope(conversation_id)? {
             if !existing.group_id_str.is_empty()
                 && existing.group_id_str != group_id
-                && !existing.historical_group_ids.contains(&existing.group_id_str)
+                && !existing
+                    .historical_group_ids
+                    .contains(&existing.group_id_str)
             {
                 existing
                     .historical_group_ids
@@ -1428,7 +1433,9 @@ impl WasmUnifiedStorage {
             }
             if !existing.group_id_str.is_empty()
                 && existing.group_id_str != group_id
-                && !existing.historical_group_ids.contains(&existing.group_id_str)
+                && !existing
+                    .historical_group_ids
+                    .contains(&existing.group_id_str)
             {
                 existing
                     .historical_group_ids
@@ -1496,7 +1503,8 @@ impl WasmUnifiedStorage {
         let Some(pending) = self.load_reset_pending(conversation_id)? else {
             return Ok(false);
         };
-        if pending.reset_generation != expected_generation || pending.new_group_id_hex != new_group_id
+        if pending.reset_generation != expected_generation
+            || pending.new_group_id_hex != new_group_id
         {
             return Ok(false);
         }
@@ -1646,8 +1654,8 @@ impl WasmUnifiedStorage {
             reset_generation,
             notified_at_ms,
         };
-        let json = serde_json::to_string(&payload)
-            .map_err(|e| format!("serialize reset_pending: {e}"))?;
+        let json =
+            serde_json::to_string(&payload).map_err(|e| format!("serialize reset_pending: {e}"))?;
         self.put_pending_op(OP_RESET_PENDING, conversation_id, &json, notified_at_ms)?;
 
         let prev_high = self.load_reset_high_water(conversation_id)?.unwrap_or(0);
@@ -2444,24 +2452,24 @@ impl MLSStorageBackend for WasmUnifiedStorage {
             .map_err(sql_to_orch_err)?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows.into_iter().rev() {
-            let (text, payload_json, delivery_status, timestamp) =
-                if let Ok(env) = serde_json::from_str::<StoredMessageEnvelope>(&row.plaintext_json)
-                {
-                    let ts = DateTime::parse_from_rfc3339(&env.timestamp_rfc3339)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| {
-                            Utc.timestamp_millis_opt(row.created_at_ms)
-                                .single()
-                                .unwrap_or_else(Utc::now)
-                        });
-                    (env.text, env.payload_json, env.delivery_status, ts)
-                } else {
-                    let ts = Utc
-                        .timestamp_millis_opt(row.created_at_ms)
-                        .single()
-                        .unwrap_or_else(Utc::now);
-                    (row.plaintext_json, None, None, ts)
-                };
+            let (text, payload_json, delivery_status, timestamp) = if let Ok(env) =
+                serde_json::from_str::<StoredMessageEnvelope>(&row.plaintext_json)
+            {
+                let ts = DateTime::parse_from_rfc3339(&env.timestamp_rfc3339)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| {
+                        Utc.timestamp_millis_opt(row.created_at_ms)
+                            .single()
+                            .unwrap_or_else(Utc::now)
+                    });
+                (env.text, env.payload_json, env.delivery_status, ts)
+            } else {
+                let ts = Utc
+                    .timestamp_millis_opt(row.created_at_ms)
+                    .single()
+                    .unwrap_or_else(Utc::now);
+                (row.plaintext_json, None, None, ts)
+            };
             out.push(Message {
                 id: row.message_id,
                 conversation_id: row.conversation_id,
@@ -2581,11 +2589,7 @@ impl MLSStorageBackend for WasmUnifiedStorage {
                 "INSERT OR REPLACE INTO sequencer_receipts \
                  (conversation_id, epoch, seq, entry_id, receipt_json) \
                  VALUES (?1, ?2, 0, ?3, ?4)",
-                &[
-                    (1, &receipt.convo_id),
-                    (3, &entry_id),
-                    (4, &json),
-                ],
+                &[(1, &receipt.convo_id), (3, &entry_id), (4, &json)],
                 &[(2, i64::from(receipt.epoch))],
                 &[],
             )
@@ -2720,10 +2724,7 @@ impl MLSStorageBackend for WasmUnifiedStorage {
             .map_err(sql_to_orch_err)?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
-            let scope_key = row
-                .first()
-                .and_then(|v| v.clone())
-                .unwrap_or_default();
+            let scope_key = row.first().and_then(|v| v.clone()).unwrap_or_default();
             let failed_rejoin_count = row
                 .get(1)
                 .and_then(|v| v.as_deref())

@@ -1,7 +1,6 @@
 //! Synchronous JS entry points capture session authority before creating a
 //! Promise. Internal Rust functions return an already-fenced future, so neither
 //! direct package calls nor queued Worker calls can adopt a replacement session.
-use crate::browser_subscription;
 use js_sys::Array;
 use wasm_bindgen::prelude::*;
 

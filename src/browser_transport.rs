@@ -253,8 +253,7 @@ pub fn catbird_mls_prepare_unsigned_request(
     parse_generated_request(operation, request_json.as_bytes()).map_err(js_error)?;
     let route = canonical_route(operation);
     let (method, path, body) = if is_read(operation) {
-        let value: serde_json::Value =
-            serde_json::from_str(&request_json).map_err(|error| js_error(error))?;
+        let value: serde_json::Value = serde_json::from_str(&request_json).map_err(js_error)?;
         let object = value
             .as_object()
             .ok_or_else(|| js_error("generated read request must be an object"))?;
@@ -308,8 +307,7 @@ pub fn catbird_mls_prepare_unsigned_request(
         path,
         body,
     };
-    serde_wasm_bindgen::to_value(&BrowserPreparedRequest::from(prepared))
-        .map_err(|error| js_error(error))
+    serde_wasm_bindgen::to_value(&BrowserPreparedRequest::from(prepared)).map_err(js_error)
 }
 
 pub fn catbird_mls_prepare_signed_request(
@@ -353,8 +351,7 @@ pub fn catbird_mls_prepare_signed_request(
         // `verify_authority` parity — fail closed on a bad signer callback).
         verify_signature(&signer.public_key, &projection.transcript, &signature)?;
         let prepared = finish_signed_request(projection, signature).map_err(js_error)?;
-        serde_wasm_bindgen::to_value(&BrowserPreparedRequest::from(prepared))
-            .map_err(|error| js_error(error))
+        serde_wasm_bindgen::to_value(&BrowserPreparedRequest::from(prepared)).map_err(js_error)
     })
 }
 

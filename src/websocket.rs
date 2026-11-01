@@ -612,10 +612,10 @@ fn handle_frame(data: &[u8], convo_id: &str) -> Result<Option<FrameOutput>, Stri
                                         // messages. Dispatch them before the
                                         // display filter would discard them.
                                         if payload.message_type == MLSMessageType::Reaction {
-                                            let reaction =
-                                                payload.reaction.as_ref().ok_or_else(|| {
-                                                    "reaction payload is missing its body"
-                                                });
+                                            let reaction = payload
+                                                .reaction
+                                                .as_ref()
+                                                .ok_or("reaction payload is missing its body");
                                             match reaction {
                                                 Ok(reaction) => {
                                                     decrypted_reaction = Some(ReactionEvent {
@@ -1323,15 +1323,15 @@ impl WsSubscription {
 /// Connect to a conversation WebSocket and return a live [`WsSubscription`].
 ///
 /// # Parameters
-/// - `convo_id`    — The MLS conversation/group ID to subscribe to.
-/// - `base_url`    — XRPC service base URL, e.g. `"https://mls.catbird.blue"`.
-/// - `auth_token`  — Bearer token used to obtain the subscription ticket.
-/// - `on_message`  — JS callback invoked with a JSON-serialized [`UiMessage`]
-///                   on every text, system, or encrypted-placeholder frame.
-/// - `on_event`    — JS callback invoked with `{type: string, data: any}` for
-///                   reaction, read-receipt, and group-refresh events.
-/// - `on_status`   — JS callback invoked with a plain string:
-///                   `"connected"`, `"disconnected"`, or `"error"`.
+/// - `convo_id` — The MLS conversation/group ID to subscribe to.
+/// - `base_url` — XRPC service base URL, e.g. `"https://mls.catbird.blue"`.
+/// - `auth_token` — Bearer token used to obtain the subscription ticket.
+/// - `on_message` — JS callback invoked with a JSON-serialized [`UiMessage`]
+///   on every text, system, or encrypted-placeholder frame.
+/// - `on_event` — JS callback invoked with `{type: string, data: any}` for
+///   reaction, read-receipt, and group-refresh events.
+/// - `on_status` — JS callback invoked with a plain string:
+///   `"connected"`, `"disconnected"`, or `"error"`.
 ///
 /// # Errors
 /// Returns `Err(JsValue)` when the ticket HTTP request fails, the ticket

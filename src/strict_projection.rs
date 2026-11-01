@@ -1333,11 +1333,10 @@ pub(crate) fn parse_generated_request(
         EnrollDeviceRequestBody, GetConversationStateRequestBody, GetDeviceKeyRequestBody,
         GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody, GetOwnDevicesRequestBody,
         GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody, PublishTypingRequestBody,
-        RegisterPushGatewayRequestBody, RejectWelcomeRequestBody,
-        RelaySpaceCredentialRequestBody, RelaySpaceReadRequestBody,
-        ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
-        RequestResetRequestBody, RevokeDeviceRequestBody, SendMessageRequestBody,
-        SubmitTransitionRequestBody, SubscribeEventsRequestBody,
+        RegisterPushGatewayRequestBody, RejectWelcomeRequestBody, RelaySpaceCredentialRequestBody,
+        RelaySpaceReadRequestBody, ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody,
+        RequestLeaveRequestBody, RequestResetRequestBody, RevokeDeviceRequestBody,
+        SendMessageRequestBody, SubmitTransitionRequestBody, SubscribeEventsRequestBody,
     };
     match operation {
         CanonicalOperation::PrepareDirectRequest

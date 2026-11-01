@@ -1,6 +1,7 @@
 //! Real encrypted OPFS custody with a deterministic HTTP response-loss fixture.
 //! The fixture validates transport retry identity, not delivery-service authorization.
 #![cfg(target_arch = "wasm32")]
+#![allow(clippy::arc_with_non_send_sync)]
 use catbird_mls::orchestrator::{credentials::CredentialStore, mls_provider::MlsCryptoContext};
 use std::{rc::Rc, sync::Arc};
 use wasm_bindgen::prelude::*;

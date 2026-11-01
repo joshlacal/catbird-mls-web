@@ -25,6 +25,7 @@
 //! inside Web Workers.
 
 #![cfg(target_arch = "wasm32")]
+#![allow(dead_code, clippy::arc_with_non_send_sync, clippy::type_complexity)]
 // This crate has no native implementation. Keeping the entire adapter behind
 // the target gate lets `cargo test --lib` provide a lightweight host smoke
 // check without compiling browser-only OPFS SQLite or native Opus support.
@@ -40,6 +41,7 @@ pub mod mls_storage;
 mod request_runtime;
 pub mod sqlite_conn;
 mod strict_projection;
+pub mod wasm_client;
 mod wasm_mls_context;
 mod websocket;
 
@@ -55,7 +57,6 @@ use api_client::WasmApiClient;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
-use catbird_mls::orchestrator::api_client::MLSAPIClient;
 use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator::storage::MLSStorageBackend;
 use credentials::SqliteCredentialStore;
@@ -78,6 +79,7 @@ pub use browser_transport::{
 pub use credentials::SqliteCredentialStore as SqliteCredentialStoreExport;
 pub use mls_storage::{WasmSqliteStorage, WasmStorageBackend as WasmStorageBackendExport};
 pub use sqlite_conn::{SqliteConn, WasmSqliteError};
+pub use wasm_client::WasmMlsClient;
 pub use wasm_mls_context::WasmMLSContext as WasmMLSContextExport;
 
 // ---------------------------------------------------------------------------
@@ -301,7 +303,7 @@ fn resolve_conversation_identity(identifier: &str) -> Result<(String, String), J
     }
 
     let group_id = decode_group_id(identifier)
-        .map(|bytes| hex::encode(bytes))
+        .map(hex::encode)
         .ok_or_else(|| {
             js_err!(
                 "conversation identifier is neither a canonical UUID nor a valid MLS group id: {}",
@@ -529,7 +531,7 @@ struct AppState {
 }
 
 thread_local! {
-    static STATE: RefCell<Option<AppState>> = RefCell::new(None);
+    static STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
     /// Cache of server-side epoch per conversation ID.
     /// The server's `current_epoch` is an incrementing counter that may diverge
     /// from the OpenMLS group epoch.  After external commit (or any commit the
@@ -553,7 +555,7 @@ thread_local! {
     /// Count of key packages published by THIS web device in the current session.
     /// Server stats are per-DID (include iOS key packages) so we track locally
     /// to know when this device actually needs to publish more.
-    static LOCAL_KP_COUNT: RefCell<u32> = RefCell::new(0);
+    static LOCAL_KP_COUNT: RefCell<u32> = const { RefCell::new(0) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,7 +1028,7 @@ fn parse_create_response(
     let response_group_id = parse_response_group_id(Some(group_value))
         .ok_or_else(|| "create coordinates groupId is not an exact 16-byte group id".to_string())?;
     let proposed_group_id = decode_group_coordinate(proposed_group_id)
-        .map(|bytes| hex::encode(bytes))
+        .map(hex::encode)
         .ok_or_else(|| "proposed group id is not an exact 16-byte group id".to_string())?;
     let epoch = coordinates
         .get("epoch")
@@ -1701,7 +1703,7 @@ pub fn catbird_mls_update_group_metadata(
 
         let (resolved_convo_id, group_id_hex) = resolve_conversation_identity(&conversation_id)?;
         request_runtime::require_ordinary_access(&resolved_convo_id).await?;
-        let (api_client, storage, user_did) = with_state(|s| {
+        let (api_client, storage, _user_did) = with_state(|s| {
             let user_did = s
                 .user_did
                 .clone()
@@ -1901,7 +1903,7 @@ pub fn wasm_bootstrap_group_metadata(
         let (stable_id, _) = resolve_conversation_identity(&group_id_hex)?;
         request_runtime::require_ordinary_access(&stable_id).await?;
 
-        let (api_client, storage, user_did) = with_state(|s| {
+        let (api_client, storage, _user_did) = with_state(|s| {
             let user_did = s
                 .user_did
                 .clone()

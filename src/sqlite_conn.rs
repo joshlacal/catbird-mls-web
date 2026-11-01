@@ -108,7 +108,11 @@ async fn acquire_opfs_owner() -> Result<(), WasmSqliteError> {
         }
     });
     request
-        .call2(&locks, &"catbird-mls-web:opfs-sahpool-owner".into(), &callback)
+        .call2(
+            &locks,
+            &"catbird-mls-web:opfs-sahpool-owner".into(),
+            &callback,
+        )
         .map_err(|_| unavailable("request rejected"))?;
     let owned = wasm_bindgen_futures::JsFuture::from(granted)
         .await
@@ -1099,7 +1103,8 @@ impl catbird_mls::storage::openmls_kv::KvBackend for SqliteConn {
         scope: &str,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, catbird_mls::storage::openmls_kv::OpenMlsKvError> {
-        self.kv_get_scoped(version, scope, key).map_err(map_wasm_kv_err)
+        self.kv_get_scoped(version, scope, key)
+            .map_err(map_wasm_kv_err)
     }
 
     fn kv_put(

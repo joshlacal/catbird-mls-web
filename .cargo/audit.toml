@@ -1,0 +1,19 @@
+# Risk-accepted upstream-pinned advisories for `catbird-mls-web` (tracked in `docs/DECISIONS.md`).
+# Semver-patchable advisories (`crossbeam-epoch 0.9.21`, `ctutils 0.4.5`, `rustls 0.23.46`,
+# `rustls-webpki 0.103.16`, `webpki-roots 1.0.11`) were upgraded in `Cargo.lock`.
+[advisories]
+ignore = [
+    # OpenMLS 0.9.0-rc.3 / `jacquard 0.13` transitive pin on `elliptic-curve 0.13` -> `crypto-bigint 0.5.5`.
+    "RUSTSEC-2026-0387",
+    # OpenMLS 0.9.0-rc.3 `openmls_libcrux_crypto 0.4.0-rc.3` pins `libcrux-hmac-drbg 0.0.1` and `libcrux-kem 0.0.9`.
+    "RUSTSEC-2026-0329",
+    "RUSTSEC-2026-0330",
+    "RUSTSEC-2026-0331",
+    # `quinn-proto 0.11.15` pinned via `n0-future`/`iroh` tilde constraint in `jacquard-common 0.13.0`
+    # (QUIC is never compiled or executed on `wasm32-unknown-unknown` browser fetch/WebSocket transport).
+    "RUSTSEC-2026-0338",
+    "RUSTSEC-2026-0339",
+    "RUSTSEC-2026-0340",
+    "RUSTSEC-2026-0341",
+    "RUSTSEC-2026-0342",
+]

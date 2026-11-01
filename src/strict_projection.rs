@@ -36,8 +36,6 @@ const ACCEPT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-ACCEPT\0";
 const MESSAGE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-MESSAGE\0";
 const METADATA_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-METADATA\0";
 const TYPING_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-TYPING\0";
-const BLOB_PREPARE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-BLOB-PREPARE\0";
-const BLOB_DELETE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-BLOB-DELETE\0";
 const RESET_REQUEST_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-RESET-REQUEST\0";
 const RESET_ACTIVATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-RESET-ACTIVATE\0";
 const LEAF_RECOVERY_REQUEST_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\0";
@@ -1054,19 +1052,9 @@ fn signed_request_spec(
             body_type: "blue.catbird.chat.defs#creationBody",
             variant: None,
         },
-        CanonicalOperation::DeleteBlob => SignedRequestSpec {
-            domain: BLOB_DELETE_SIGNATURE_DOMAIN,
-            body_type: "blue.catbird.chat.defs#blobDeletionBody",
-            variant: None,
-        },
         CanonicalOperation::SendMessage => SignedRequestSpec {
             domain: MESSAGE_SIGNATURE_DOMAIN,
             body_type: "blue.catbird.chat.defs#applicationSendBody",
-            variant: None,
-        },
-        CanonicalOperation::PrepareBlobUpload => SignedRequestSpec {
-            domain: BLOB_PREPARE_SIGNATURE_DOMAIN,
-            body_type: "blue.catbird.chat.defs#blobUploadPreparationBody",
             variant: None,
         },
         CanonicalOperation::PublishTyping => SignedRequestSpec {
@@ -1339,16 +1327,17 @@ pub(crate) fn parse_generated_request(
         get_conversations::GetConversations, get_entries::GetEntries,
     };
     use catbird_mls::orchestrator::canonical_transport::{
-        AcceptConversationRequestBody, AcknowledgeWelcomeRequestBody, ActivateResetRequestBody,
-        CancelLeafRecoveryRequestBody, CancelLeaveRequestBody, CloseConversationRequestBody,
-        CreateConversationRequestBody, DeleteBlobRequestBody, EnrollDeviceRequestBody,
-        GetBlobRequestBody, GetBlobUsageRequestBody, GetConversationStateRequestBody,
-        GetDeviceKeyRequestBody, GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody,
-        GetOwnDevicesRequestBody, GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody,
-        PrepareBlobUploadRequestBody, PublishTypingRequestBody, RejectWelcomeRequestBody,
+        AcceptConversationRequestBody, AcknowledgeEntriesRequestBody,
+        AcknowledgeWelcomeRequestBody, ActivateResetRequestBody, CancelLeafRecoveryRequestBody,
+        CancelLeaveRequestBody, CloseConversationRequestBody, CreateConversationRequestBody,
+        EnrollDeviceRequestBody, GetConversationStateRequestBody, GetDeviceKeyRequestBody,
+        GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody, GetOwnDevicesRequestBody,
+        GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody, PublishTypingRequestBody,
+        RegisterPushGatewayRequestBody, RejectWelcomeRequestBody,
+        RelaySpaceCredentialRequestBody, RelaySpaceReadRequestBody,
         ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
         RequestResetRequestBody, RevokeDeviceRequestBody, SendMessageRequestBody,
-        SubmitTransitionRequestBody, SubscribeEventsRequestBody, UploadBlobRequestBody,
+        SubmitTransitionRequestBody, SubscribeEventsRequestBody,
     };
     match operation {
         CanonicalOperation::PrepareDirectRequest
@@ -1361,6 +1350,9 @@ pub(crate) fn parse_generated_request(
         ),
         CanonicalOperation::AcceptConversation => {
             parse!(AcceptConversationRequestBody, AcceptConversation)
+        }
+        CanonicalOperation::AcknowledgeEntries => {
+            parse!(AcknowledgeEntriesRequestBody, AcknowledgeEntries)
         }
         CanonicalOperation::AcknowledgeWelcome => {
             parse!(AcknowledgeWelcomeRequestBody, AcknowledgeWelcome)
@@ -1377,10 +1369,7 @@ pub(crate) fn parse_generated_request(
         CanonicalOperation::CreateConversation => {
             parse!(CreateConversationRequestBody, CreateConversation)
         }
-        CanonicalOperation::DeleteBlob => parse!(DeleteBlobRequestBody, DeleteBlob),
         CanonicalOperation::SendMessage => parse!(SendMessageRequestBody, SendMessage),
-        CanonicalOperation::GetBlob => parse!(GetBlobRequestBody, GetBlob),
-        CanonicalOperation::GetBlobUsage => parse!(GetBlobUsageRequestBody, GetBlobUsage),
         CanonicalOperation::GetConversationState => {
             parse!(GetConversationStateRequestBody, GetConversationState)
         }
@@ -1397,11 +1386,17 @@ pub(crate) fn parse_generated_request(
         CanonicalOperation::GetSubscriptionTicket => {
             parse!(GetSubscriptionTicketRequestBody, GetSubscriptionTicket)
         }
-        CanonicalOperation::PrepareBlobUpload => {
-            parse!(PrepareBlobUploadRequestBody, PrepareBlobUpload)
-        }
         CanonicalOperation::PublishTyping => parse!(PublishTypingRequestBody, PublishTyping),
+        CanonicalOperation::RegisterPushGateway => {
+            parse!(RegisterPushGatewayRequestBody, RegisterPushGateway)
+        }
         CanonicalOperation::RejectWelcome => parse!(RejectWelcomeRequestBody, RejectWelcome),
+        CanonicalOperation::RelaySpaceCredential => {
+            parse!(RelaySpaceCredentialRequestBody, RelaySpaceCredential)
+        }
+        CanonicalOperation::RelaySpaceRead => {
+            parse!(RelaySpaceReadRequestBody, RelaySpaceRead)
+        }
         CanonicalOperation::ReplenishKeyPackages => {
             parse!(ReplenishKeyPackagesRequestBody, ReplenishKeyPackages)
         }
@@ -1416,7 +1411,6 @@ pub(crate) fn parse_generated_request(
             parse!(SubmitTransitionRequestBody, SubmitTransition)
         }
         CanonicalOperation::SubscribeEvents => parse!(SubscribeEventsRequestBody, SubscribeEvents),
-        CanonicalOperation::UploadBlob => parse!(UploadBlobRequestBody, UploadBlob),
     }
 }
 

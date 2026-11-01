@@ -185,8 +185,6 @@ fn read_query_whitelist(operation: CanonicalOperation) -> &'static [&'static str
             "pageCursor",
             "supportedProtocolVersions",
         ],
-        CanonicalOperation::GetBlob => &["actorDeviceId", "blobId"],
-        CanonicalOperation::GetBlobUsage => &["actorDeviceId"],
         CanonicalOperation::GetConversationState => &["actorDeviceId", "conversationId"],
         CanonicalOperation::GetDevices => &["actorDeviceId", "userDids"],
         CanonicalOperation::GetDeviceKey => &["actorDeviceId", "ownerDid", "deviceId", "keyId"],
@@ -214,8 +212,6 @@ fn is_read(operation: CanonicalOperation) -> bool {
     matches!(
         operation,
         CanonicalOperation::GetConversations
-            | CanonicalOperation::GetBlob
-            | CanonicalOperation::GetBlobUsage
             | CanonicalOperation::GetConversationState
             | CanonicalOperation::GetDevices
             | CanonicalOperation::GetDeviceKey
@@ -387,6 +383,7 @@ fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {
             return Err("browser direct-request lifecycle is unavailable".into());
         }
         "acceptConversation" => CanonicalOperation::AcceptConversation,
+        "acknowledgeEntries" => CanonicalOperation::AcknowledgeEntries,
         "acknowledgeWelcome" => CanonicalOperation::AcknowledgeWelcome,
         "activateReset" => CanonicalOperation::ActivateReset,
         "cancelLeafRecovery" => CanonicalOperation::CancelLeafRecovery,
@@ -394,10 +391,7 @@ fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {
         "closeConversation" => CanonicalOperation::CloseConversation,
         "getConversations" => CanonicalOperation::GetConversations,
         "createConversation" => CanonicalOperation::CreateConversation,
-        "deleteBlob" => CanonicalOperation::DeleteBlob,
         "sendMessage" => CanonicalOperation::SendMessage,
-        "getBlob" => CanonicalOperation::GetBlob,
-        "getBlobUsage" => CanonicalOperation::GetBlobUsage,
         "getConversationState" => CanonicalOperation::GetConversationState,
         "getDevices" => CanonicalOperation::GetDevices,
         "getDeviceKey" => CanonicalOperation::GetDeviceKey,
@@ -406,9 +400,11 @@ fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {
         "getOwnDevices" => CanonicalOperation::GetOwnDevices,
         "getPendingWelcomes" => CanonicalOperation::GetPendingWelcomes,
         "getSubscriptionTicket" => CanonicalOperation::GetSubscriptionTicket,
-        "prepareBlobUpload" => CanonicalOperation::PrepareBlobUpload,
         "publishTyping" => CanonicalOperation::PublishTyping,
+        "registerPushGateway" => CanonicalOperation::RegisterPushGateway,
         "rejectWelcome" => CanonicalOperation::RejectWelcome,
+        "relaySpaceCredential" => CanonicalOperation::RelaySpaceCredential,
+        "relaySpaceRead" => CanonicalOperation::RelaySpaceRead,
         "replenishKeyPackages" => CanonicalOperation::ReplenishKeyPackages,
         "requestLeafRecovery" => CanonicalOperation::RequestLeafRecovery,
         "enrollDevice" => CanonicalOperation::EnrollDevice,
@@ -417,7 +413,6 @@ fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {
         "revokeDevice" => CanonicalOperation::RevokeDevice,
         "submitTransition" => CanonicalOperation::SubmitTransition,
         "subscribeEvents" => CanonicalOperation::SubscribeEvents,
-        "uploadBlob" => CanonicalOperation::UploadBlob,
         _ => return Err(format!("unsupported clean-chat operation: {value}")),
     };
     Ok(operation)
@@ -431,6 +426,7 @@ fn operation_name(operation: CanonicalOperation) -> &'static str {
         CanonicalOperation::GetDirectRequestOutcome => "getDirectRequestOutcome",
         CanonicalOperation::PublishDirectRequestKeys => "publishDirectRequestKeys",
         CanonicalOperation::AcceptConversation => "acceptConversation",
+        CanonicalOperation::AcknowledgeEntries => "acknowledgeEntries",
         CanonicalOperation::AcknowledgeWelcome => "acknowledgeWelcome",
         CanonicalOperation::ActivateReset => "activateReset",
         CanonicalOperation::CancelLeafRecovery => "cancelLeafRecovery",
@@ -438,10 +434,7 @@ fn operation_name(operation: CanonicalOperation) -> &'static str {
         CanonicalOperation::CloseConversation => "closeConversation",
         CanonicalOperation::GetConversations => "getConversations",
         CanonicalOperation::CreateConversation => "createConversation",
-        CanonicalOperation::DeleteBlob => "deleteBlob",
         CanonicalOperation::SendMessage => "sendMessage",
-        CanonicalOperation::GetBlob => "getBlob",
-        CanonicalOperation::GetBlobUsage => "getBlobUsage",
         CanonicalOperation::GetConversationState => "getConversationState",
         CanonicalOperation::GetDevices => "getDevices",
         CanonicalOperation::GetDeviceKey => "getDeviceKey",
@@ -450,9 +443,11 @@ fn operation_name(operation: CanonicalOperation) -> &'static str {
         CanonicalOperation::GetOwnDevices => "getOwnDevices",
         CanonicalOperation::GetPendingWelcomes => "getPendingWelcomes",
         CanonicalOperation::GetSubscriptionTicket => "getSubscriptionTicket",
-        CanonicalOperation::PrepareBlobUpload => "prepareBlobUpload",
         CanonicalOperation::PublishTyping => "publishTyping",
+        CanonicalOperation::RegisterPushGateway => "registerPushGateway",
         CanonicalOperation::RejectWelcome => "rejectWelcome",
+        CanonicalOperation::RelaySpaceCredential => "relaySpaceCredential",
+        CanonicalOperation::RelaySpaceRead => "relaySpaceRead",
         CanonicalOperation::ReplenishKeyPackages => "replenishKeyPackages",
         CanonicalOperation::RequestLeafRecovery => "requestLeafRecovery",
         CanonicalOperation::EnrollDevice => "enrollDevice",
@@ -461,6 +456,5 @@ fn operation_name(operation: CanonicalOperation) -> &'static str {
         CanonicalOperation::RevokeDevice => "revokeDevice",
         CanonicalOperation::SubmitTransition => "submitTransition",
         CanonicalOperation::SubscribeEvents => "subscribeEvents",
-        CanonicalOperation::UploadBlob => "uploadBlob",
     }
 }

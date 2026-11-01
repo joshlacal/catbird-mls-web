@@ -39,7 +39,6 @@ mod credentials;
 pub mod mls_storage;
 mod request_runtime;
 pub mod sqlite_conn;
-mod storage;
 mod strict_projection;
 mod wasm_mls_context;
 mod websocket;
@@ -60,7 +59,7 @@ use catbird_mls::orchestrator::api_client::MLSAPIClient;
 use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator::storage::MLSStorageBackend;
 use credentials::SqliteCredentialStore;
-use storage::WasmStorageBackend;
+use mls_storage::WasmStorageBackend;
 use wasm_mls_context::WasmMLSContext;
 
 const MAX_CONVERSATION_PAGES: usize = 100;
@@ -77,9 +76,8 @@ pub use browser_transport::{
     catbird_mls_set_signer_bridge,
 };
 pub use credentials::SqliteCredentialStore as SqliteCredentialStoreExport;
-pub use mls_storage::WasmSqliteStorage;
+pub use mls_storage::{WasmSqliteStorage, WasmStorageBackend as WasmStorageBackendExport};
 pub use sqlite_conn::{SqliteConn, WasmSqliteError};
-pub use storage::WasmStorageBackend as WasmStorageBackendExport;
 pub use wasm_mls_context::WasmMLSContext as WasmMLSContextExport;
 
 // ---------------------------------------------------------------------------

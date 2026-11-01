@@ -140,6 +140,7 @@ async fn unknown_publication_multisecret_import_ratchet_and_retirement_reopen() 
         publication_request: publication.clone(),
         actor_signature_public_key: ap.signature_public_key,
         published_receipt: proof.clone(),
+        receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: authority_key.clone(),
         preparation_request_digest: input.preparation_request_digest,
     };
@@ -192,6 +193,7 @@ async fn unknown_publication_multisecret_import_ratchet_and_retirement_reopen() 
             .identity_public_key(actor.as_bytes().to_vec())
             .unwrap(),
         published_receipt: poisoned_receipt,
+        receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: authority_key.clone(),
         preparation_request_digest: input.preparation_request_digest,
     };

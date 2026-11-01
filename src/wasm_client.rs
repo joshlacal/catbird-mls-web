@@ -110,6 +110,30 @@ impl WasmMlsClient {
         })
     }
 
+    /// Initialize persistent OPFS storage (`multipleciphers-opfs-sahpool`) in this Dedicated Worker
+    /// before opening `catbird-mls/<did_hash>.db` (`I8`).
+    #[wasm_bindgen(js_name = openAsync)]
+    pub async fn open_async(
+        account_did: String,
+        device_id: String,
+        home_ds_did: String,
+        home_ds_endpoint: String,
+        pds_endpoint: String,
+        db_key_hex: String,
+    ) -> Result<WasmMlsClient, JsValue> {
+        SqliteConn::initialize_opfs().await.map_err(|e| {
+            JsValue::from_str(&format!("Persistent encrypted storage unavailable: {e}"))
+        })?;
+        Self::open(
+            account_did,
+            device_id,
+            home_ds_did,
+            home_ds_endpoint,
+            pds_endpoint,
+            db_key_hex,
+        )
+    }
+
     fn require_db(&self) -> Result<&WasmAccountDb<Rc<SqliteConn>>, JsValue> {
         self.db
             .as_ref()

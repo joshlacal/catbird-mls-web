@@ -132,6 +132,9 @@ impl SqliteConn {
     /// Exactly one Worker per origin may own the pool at a time.
     pub async fn initialize_opfs() -> Result<(), WasmSqliteError> {
         acquire_opfs_owner().await?;
+        if unsafe { !sqlite3_vfs_find(c"multipleciphers-opfs-sahpool".as_ptr()).is_null() } {
+            return Ok(());
+        }
         let pool = sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(
             &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
             false,

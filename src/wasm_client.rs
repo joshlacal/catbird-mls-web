@@ -1,5 +1,6 @@
-//! Browser WASM `#[wasm_bindgen]` wrapper around unified `catbird_mls::client` + `WasmAccountDb` (`Spec §6.3`, `G2`, `D3`, `D4`, `I8`, `I15`, `I16`).
+//! Browser WASM `#[wasm_bindgen]` wrapper around unified `catbird_mls::client` + `WasmAccountDb` (`Spec §6.3`, `G2`, `D3`, `D4`, `I6`, `I8`, `I15`, `I16`).
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use openmls::prelude::tls_codec::Serialize as TlsSerialize;
@@ -14,27 +15,21 @@ use catbird_mls::client::{
     personal_mailbox_space_uri, verify_recovery_code_vdevice, EnrollmentReceipt,
     LabyrinthBackupStatus, SpacesEligibilityInput,
 };
-use catbird_mls::groups::lifecycle::{enforce_admin_removal_policy, MemberRole};
-use catbird_mls::messaging::receive::PrivateMessagePlaintextEnvelope;
-use catbird_mls::metadata::{
-    derive_metadata_key_from_group, encrypt_metadata_snapshot_with_nonce, GroupMetadataV1,
-};
+use catbird_mls::groups::lifecycle::MemberRole;
 use catbird_mls::requests::c33::{
     validate_direct_request_key_package_lifetime, DIRECT_REQUEST_KP_MIN_LIFETIME_SECS,
     RECOVERY_KP_MAX_LIFETIME_SECS,
 };
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend};
-use catbird_mls::storage::{
-    ConversationRow, GroupMetadataRow, LabyrinthQueueRow, MessageRow, MutationJournalRow,
-    OpenMlsKvProvider,
-};
+use catbird_mls::storage::{MutationJournalRow, OpenMlsKvProvider};
 use catbird_mls::MLSError;
 
 use crate::sqlite_conn::SqliteConn;
 
-const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+pub(crate) const CIPHERSUITE: Ciphersuite =
+    Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 
-fn mls_to_js_err(err: MLSError) -> JsValue {
+pub(crate) fn mls_to_js_err(err: MLSError) -> JsValue {
     JsValue::from_str(&err.to_string())
 }
 
@@ -42,32 +37,31 @@ fn to_js_val<T: serde::Serialize>(val: &T) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(val).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0).max(0.0) as u64
 }
 
 /// Unified browser WASM MLS client backed by per-account `catbird-mls/<did_hash>.db` on OPFS (`sqlite3mc` ChaCha20).
 #[wasm_bindgen]
 pub struct WasmMlsClient {
-    account_did: String,
-    account_did_hash: String,
-    device_id: String,
-    home_ds_did: String,
-    home_ds_endpoint: String,
-    pds_endpoint: String,
-    db: Option<WasmAccountDb<Rc<SqliteConn>>>,
+    pub(crate) account_did: String,
+    pub(crate) account_did_hash: String,
+    pub(crate) device_id: String,
+    pub(crate) home_ds_did: String,
+    pub(crate) home_ds_endpoint: String,
+    pub(crate) pds_endpoint: String,
+    pub(crate) auth_token: RefCell<Option<String>>,
+    pub(crate) http: reqwest::Client,
+    pub(crate) db: Option<WasmAccountDb<Rc<SqliteConn>>>,
 }
 
 #[wasm_bindgen]
 impl WasmMlsClient {
     /// Open or create `catbird-mls/<did_hash>.db` inside the Dedicated Worker's OPFS SAH pool (`I8`).
-    ///
-    /// Note: caller must hold the awaited `navigator.locks` Worker mutex (`tab-lock.ts`) and pass
-    /// the 64-hex key unwrapped from IndexedDB's non-extractable `CryptoKey` (`webcrypto-keystore.ts`).
     #[wasm_bindgen(constructor)]
     pub fn open(
         account_did: String,
@@ -106,6 +100,8 @@ impl WasmMlsClient {
             home_ds_did,
             home_ds_endpoint,
             pds_endpoint,
+            auth_token: RefCell::new(None),
+            http: reqwest::Client::new(),
             db: Some(db),
         })
     }
@@ -138,6 +134,12 @@ impl WasmMlsClient {
         self.db
             .as_ref()
             .ok_or_else(|| JsValue::from_str("WasmMlsClient handle is closed"))
+    }
+
+    /// Inject or refresh the `nest` BFF / OAuth bearer session token for live XRPC dispatches.
+    #[wasm_bindgen(js_name = setAuthToken)]
+    pub fn set_auth_token(&self, token: Option<String>) {
+        *self.auth_token.borrow_mut() = token.filter(|s| !s.trim().is_empty());
     }
 
     #[wasm_bindgen(js_name = accountDid)]
@@ -185,9 +187,11 @@ impl WasmMlsClient {
     }
 
     /// Enroll this Web Worker device after enforcing `I15` Spaces gate, minting `X-Wing`
-    /// KeyPackages (`C33` >= 35d direct-request + <= 30d recovery), and initializing Labyrinth (`D4`).
+    /// KeyPackages (`C33` >= 35d direct-request + <= 30d recovery), publishing `ADR-009`
+    /// `blue.catbird.chat.device` + `blue.catbird.chat.declaration` + `mls-ds` `enrollDevice`
+    /// outside `WasmAccountDb::write_tx` (`I6`), and initializing Labyrinth (`D4`).
     #[wasm_bindgen(js_name = enrollDevice)]
-    pub fn enroll_device(
+    pub async fn enroll_device(
         &self,
         pds_supports_spaces: bool,
         granted_scopes_js: JsValue,
@@ -279,6 +283,12 @@ impl WasmMlsClient {
             })
             .map_err(mls_to_js_err)?;
 
+        if let Some((session_token, canonical_dev_id)) = self.live_session() {
+            self.enroll_device_live(&session_token, &canonical_dev_id, &signer)
+                .await
+                .map_err(mls_to_js_err)?;
+        }
+
         let receipt = EnrollmentReceipt {
             account_did: self.account_did.clone(),
             account_did_hash: self.account_did_hash.clone(),
@@ -290,6 +300,13 @@ impl WasmMlsClient {
             labyrinth_backup_enabled: true,
         };
         to_js_val(&receipt)
+    }
+
+    #[wasm_bindgen(js_name = replenishKeyPackages)]
+    pub async fn replenish_key_packages(&self, count: u32) -> Result<u32, JsValue> {
+        self.replenish_key_packages_impl(count)
+            .await
+            .map_err(mls_to_js_err)
     }
 
     #[wasm_bindgen(js_name = listConversations)]
@@ -331,6 +348,14 @@ impl WasmMlsClient {
         to_js_val(&rows)
     }
 
+    #[wasm_bindgen(js_name = listMembers)]
+    pub fn list_members(&self, conversation_id: String) -> Result<JsValue, JsValue> {
+        let members = self
+            .list_members_impl(&conversation_id)
+            .map_err(mls_to_js_err)?;
+        to_js_val(&members)
+    }
+
     #[wasm_bindgen(js_name = getGroupMetadata)]
     pub fn get_group_metadata(&self, conversation_id: String) -> Result<JsValue, JsValue> {
         let row = self
@@ -342,198 +367,69 @@ impl WasmMlsClient {
     }
 
     #[wasm_bindgen(js_name = createGroup)]
-    pub fn create_group(
+    pub async fn create_group(
         &self,
         conversation_id: String,
         sequencer_did: String,
+        member_dids_js: JsValue,
         title: Option<String>,
         description: Option<String>,
     ) -> Result<JsValue, JsValue> {
-        let db = self.require_db()?;
-        let ts = now_ms();
-        let mut group_id_bytes = [0u8; 32];
-        getrandom::getrandom(&mut group_id_bytes)
-            .map_err(|e| JsValue::from_str(&format!("getrandom: {e}")))?;
+        let member_dids: Vec<String> = if member_dids_js.is_null() || member_dids_js.is_undefined()
+        {
+            Vec::new()
+        } else {
+            serde_wasm_bindgen::from_value(member_dids_js)
+                .map_err(|e| JsValue::from_str(&format!("invalid member_dids array: {e}")))?
+        };
+        let convo = self
+            .create_group_impl(
+                conversation_id,
+                sequencer_did,
+                member_dids,
+                title,
+                description,
+            )
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&convo)
+    }
 
-        let convo = db
-            .write_tx(|tx| {
-                let signer_raw = tx
-                    .get_labyrinth_state("device_signer_json")?
-                    .ok_or_else(|| MLSError::InvalidState("device not enrolled".to_string()))?;
-                let signer: SignatureKeyPair = serde_json::from_slice(&signer_raw)
-                    .map_err(|e| MLSError::Internal(format!("deser signer: {e}")))?;
-
-                let provider =
-                    OpenMlsKvProvider::new(catbird_mls::storage::OpenMlsKvStorage::new(tx))?;
-                let cred_with_key = CredentialWithKey {
-                    credential: BasicCredential::new(
-                        format!("{}#{}", self.account_did, self.device_id).into_bytes(),
-                    )
-                    .into(),
-                    signature_key: signer.public().into(),
-                };
-                let create_cfg = MlsGroupCreateConfig::builder()
-                    .ciphersuite(CIPHERSUITE)
-                    .use_ratchet_tree_extension(true)
-                    .max_past_epochs(5)
-                    .build();
-                let mut group = MlsGroup::new_with_group_id(
-                    &provider,
-                    &signer,
-                    &create_cfg,
-                    GroupId::from_slice(&group_id_bytes),
-                    cred_with_key,
-                )
-                .map_err(|e| MLSError::Cryptography(format!("create group: {e:?}")))?;
-
-                let epoch = group.epoch().as_u64();
-                let space_uri = format!(
-                    "at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-0"
-                );
-                let row = ConversationRow {
-                    conversation_id: conversation_id.clone(),
-                    group_id: group_id_bytes.to_vec(),
-                    generation: 0,
-                    epoch: epoch as i64,
-                    last_seq: 0,
-                    sequencer_did: sequencer_did.clone(),
-                    space_uri: Some(space_uri),
-                    title: title.clone(),
-                    unread_count: 0,
-                    updated_at_ms: ts,
-                };
-                tx.upsert_conversation(&row)?;
-
-                if title.is_some() || description.is_some() {
-                    let meta_v1 = GroupMetadataV1 {
-                        version: 1,
-                        title: title.clone().unwrap_or_default(),
-                        description: description.clone().unwrap_or_default(),
-                        avatar_blob_locator: None,
-                        avatar_content_type: None,
-                        space_avatar: None,
-                    };
-                    let meta_key = derive_metadata_key_from_group(
-                        &mut group,
-                        provider.crypto(),
-                        provider.storage(),
-                        &group_id_bytes,
-                        epoch,
-                    )
-                    .map_err(|e| MLSError::Cryptography(format!("derive meta key: {e}")))?;
-                    let mut nonce = [0u8; 12];
-                    let _ = getrandom::getrandom(&mut nonce);
-                    let _ct = encrypt_metadata_snapshot_with_nonce(
-                        &meta_key,
-                        &group_id_bytes,
-                        epoch,
-                        1,
-                        &nonce,
-                        &meta_v1,
-                    )
-                    .map_err(|e| MLSError::Cryptography(format!("encrypt meta: {e}")))?;
-                    tx.upsert_group_metadata(&GroupMetadataRow {
-                        conversation_id: conversation_id.clone(),
-                        metadata_version: 1,
-                        epoch: epoch as i64,
-                        title,
-                        description,
-                        avatar_setter_did: None,
-                        avatar_blob_cid: None,
-                        avatar_sym_key: None,
-                        avatar_sha256: None,
-                        avatar_mime_type: None,
-                        metadata_json: serde_json::to_string(&meta_v1)
-                            .map_err(|e| MLSError::Internal(e.to_string()))?,
-                        updated_at_ms: ts,
-                    })?;
-                }
-                Ok(row)
-            })
+    #[wasm_bindgen(js_name = addGroupMembers)]
+    pub async fn add_group_members(
+        &self,
+        conversation_id: String,
+        member_dids_js: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let member_dids: Vec<String> = serde_wasm_bindgen::from_value(member_dids_js)
+            .map_err(|e| JsValue::from_str(&format!("invalid member_dids array: {e}")))?;
+        let convo = self
+            .add_group_members_impl(&conversation_id, member_dids)
+            .await
             .map_err(mls_to_js_err)?;
         to_js_val(&convo)
     }
 
     #[wasm_bindgen(js_name = sendMessage)]
-    pub fn send_message(
+    pub async fn send_message(
         &self,
         conversation_id: String,
         message_id: String,
         text: String,
     ) -> Result<JsValue, JsValue> {
-        let db = self.require_db()?;
-        let ts = now_ms();
-        let mut frame_nonce = [0u8; 32];
-        getrandom::getrandom(&mut frame_nonce)
-            .map_err(|e| JsValue::from_str(&format!("getrandom: {e}")))?;
-        let payload_json = serde_json::json!({ "text": text }).to_string();
-        let (inner_pt, aad) = PrivateMessagePlaintextEnvelope::seal_with_aad(
-            frame_nonce,
-            payload_json.clone().into_bytes(),
-        )
-        .map_err(mls_to_js_err)?;
-
-        let msg_row = db
-            .write_tx(|tx| {
-                let mut convo = tx.get_conversation(&conversation_id)?.ok_or_else(|| {
-                    MLSError::group_not_found(format!("missing {conversation_id}"))
-                })?;
-                let signer_raw = tx
-                    .get_labyrinth_state("device_signer_json")?
-                    .ok_or_else(|| MLSError::InvalidState("device not enrolled".to_string()))?;
-                let signer: SignatureKeyPair = serde_json::from_slice(&signer_raw)
-                    .map_err(|e| MLSError::Internal(format!("deser signer: {e}")))?;
-                let provider =
-                    OpenMlsKvProvider::new(catbird_mls::storage::OpenMlsKvStorage::new(tx))?;
-                let mut group =
-                    MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
-                        .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
-                        .ok_or_else(|| MLSError::group_not_found("missing MlsGroup"))?;
-                group.set_aad(aad);
-                let msg_out = group
-                    .create_message(&provider, &signer, &inner_pt)
-                    .map_err(|e| MLSError::Cryptography(format!("create_message: {e:?}")))?;
-                let ct_bytes = msg_out
-                    .tls_serialize_detached()
-                    .map_err(|e| MLSError::Internal(format!("ser msg: {e:?}")))?;
-
-                let next_seq = convo.last_seq + 1;
-                let row = MessageRow {
-                    message_id: message_id.clone(),
-                    conversation_id: conversation_id.clone(),
-                    group_id: convo.group_id.clone(),
-                    epoch: group.epoch().as_u64() as i64,
-                    seq: next_seq,
-                    sender_did: self.account_did.clone(),
-                    sender_device_id: self.device_id.clone(),
-                    plaintext_json: payload_json,
-                    created_at_ms: ts,
-                    is_own: true,
-                };
-                tx.insert_message(&row)?;
-                tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                    item_id: message_id,
-                    conversation_id: conversation_id.clone(),
-                    group_id_hex: hex::encode(&convo.group_id),
-                    seq: next_seq,
-                    payload_bytes: ct_bytes,
-                    created_at_ms: ts,
-                })?;
-                convo.last_seq = next_seq;
-                convo.updated_at_ms = ts;
-                tx.upsert_conversation(&convo)?;
-                Ok(row)
-            })
+        let row = self
+            .send_message_impl(&conversation_id, &message_id, &text)
+            .await
             .map_err(mls_to_js_err)?;
-        to_js_val(&msg_row)
+        to_js_val(&row)
     }
 
-    /// Enforce `D3` (`M-F01`) admin-only member removal.
+    /// Enforce `D3` (`M-F01`) admin-only member removal and dispatch `#commitTransitionBody` on live sessions.
     #[wasm_bindgen(js_name = removeGroupMember)]
-    pub fn remove_group_member(
+    pub async fn remove_group_member(
         &self,
         is_admin: bool,
-        _conversation_id: String,
+        conversation_id: String,
         target_did: String,
     ) -> Result<(), JsValue> {
         let role = if is_admin {
@@ -541,8 +437,49 @@ impl WasmMlsClient {
         } else {
             MemberRole::Member
         };
-        enforce_admin_removal_policy(&self.account_did, role, std::slice::from_ref(&target_did))
+        self.remove_group_member_impl(role, &conversation_id, &target_did)
+            .await
             .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = updateGroupMetadata)]
+    pub async fn update_group_metadata(
+        &self,
+        conversation_id: String,
+        title: String,
+        description: String,
+    ) -> Result<JsValue, JsValue> {
+        let row = self
+            .update_group_metadata_impl(&conversation_id, title, description)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&row)
+    }
+
+    #[wasm_bindgen(js_name = acceptDirectRequest)]
+    pub async fn accept_direct_request(&self, request_id: String) -> Result<(), JsValue> {
+        self.accept_direct_request_impl(&request_id)
+            .await
+            .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = declineDirectRequest)]
+    pub async fn decline_direct_request(&self, request_id: String) -> Result<(), JsValue> {
+        self.decline_direct_request_impl(&request_id)
+            .await
+            .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = flushLabyrinthQueue)]
+    pub async fn flush_labyrinth_queue(&self) -> Result<u32, JsValue> {
+        self.flush_labyrinth_queue_impl()
+            .await
+            .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub async fn sync(&self) -> Result<u32, JsValue> {
+        self.sync_impl().await.map_err(mls_to_js_err)
     }
 
     #[wasm_bindgen(js_name = labyrinthStatus)]

@@ -1443,12 +1443,21 @@ impl catbird_mls::storage::driver_wasm::WasmSqlBackend for SqliteConn {
         consent_filter: Option<&str>,
     ) -> Result<Vec<catbird_mls::storage::RequestRow>, catbird_mls::MLSError> {
         let rows = if let Some(filter) = consent_filter {
-            self.query_text(
-                "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                 FROM requests WHERE consent = ?1 ORDER BY updated_at_ms DESC",
-                &[(1, filter)],
-                10,
-            )
+            if filter == "pending" {
+                self.query_text(
+                    "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
+                     FROM requests WHERE consent IN ('pending', 'incomingPending', 'outgoingPending') ORDER BY updated_at_ms DESC",
+                    &[],
+                    10,
+                )
+            } else {
+                self.query_text(
+                    "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
+                     FROM requests WHERE consent = ?1 ORDER BY updated_at_ms DESC",
+                    &[(1, filter)],
+                    10,
+                )
+            }
         } else {
             self.query_text(
                 "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \

@@ -42,6 +42,8 @@ mod request_runtime;
 pub mod sqlite_conn;
 mod strict_projection;
 pub mod wasm_client;
+mod wasm_client_mutations;
+mod wasm_client_sync;
 mod wasm_mls_context;
 mod websocket;
 

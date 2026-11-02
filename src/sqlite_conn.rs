@@ -1208,7 +1208,7 @@ impl catbird_mls::storage::driver_wasm::WasmSqlBackend for SqliteConn {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10) \
              ON CONFLICT(conversation_id) DO UPDATE SET \
                 group_id = excluded.group_id, generation = excluded.generation, epoch = excluded.epoch, \
-                last_seq = excluded.last_seq, sequencer_did = excluded.sequencer_did, \
+                last_seq = MAX(conversations.last_seq, excluded.last_seq), sequencer_did = excluded.sequencer_did, \
                 space_uri = excluded.space_uri, title = excluded.title, \
                 unread_count = excluded.unread_count, updated_at_ms = excluded.updated_at_ms",
             &[
@@ -1443,20 +1443,37 @@ impl catbird_mls::storage::driver_wasm::WasmSqlBackend for SqliteConn {
         consent_filter: Option<&str>,
     ) -> Result<Vec<catbird_mls::storage::RequestRow>, catbird_mls::MLSError> {
         let rows = if let Some(filter) = consent_filter {
-            if filter == "pending" {
-                self.query_text(
+            match filter {
+                "pending" => self.query_text(
                     "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                     FROM requests WHERE consent IN ('pending', 'incomingPending', 'outgoingPending') ORDER BY updated_at_ms DESC",
+                     FROM requests WHERE consent IN ('pending', 'incomingPending', 'outgoingPending', 'incoming_pending', 'outgoing_pending') ORDER BY updated_at_ms DESC",
                     &[],
                     10,
-                )
-            } else {
-                self.query_text(
+                ),
+                "incomingPending" | "incoming_pending" => self.query_text(
+                    "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
+                     FROM requests WHERE consent IN ('incomingPending', 'incoming_pending') ORDER BY updated_at_ms DESC",
+                    &[],
+                    10,
+                ),
+                "outgoingPending" | "outgoing_pending" => self.query_text(
+                    "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
+                     FROM requests WHERE consent IN ('outgoingPending', 'outgoing_pending') ORDER BY updated_at_ms DESC",
+                    &[],
+                    10,
+                ),
+                "declined" | "closed" => self.query_text(
+                    "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
+                     FROM requests WHERE consent IN ('declined', 'closed') ORDER BY updated_at_ms DESC",
+                    &[],
+                    10,
+                ),
+                _ => self.query_text(
                     "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
                      FROM requests WHERE consent = ?1 ORDER BY updated_at_ms DESC",
                     &[(1, filter)],
                     10,
-                )
+                ),
             }
         } else {
             self.query_text(

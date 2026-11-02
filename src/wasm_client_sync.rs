@@ -28,7 +28,8 @@ use catbird_mls::orchestrator::direct_request_bootstrap::{
 use catbird_mls::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend};
 use catbird_mls::storage::{
-    ConversationRow, GroupMetadataRow, LabyrinthQueueRow, MessageRow, OpenMlsKvProvider, RequestRow,
+    ConversationRow, KvWriteOverlay, LabyrinthQueueRow, MessageRow, OpenMlsKvProvider,
+    OpenMlsKvStorage, RequestRow,
 };
 use catbird_mls::MLSError;
 
@@ -187,7 +188,7 @@ impl WasmMlsClient {
         operation: CanonicalOperation,
         body_value: &Value,
         signer: &SignatureKeyPair,
-    ) -> Result<Option<Value>, MLSError> {
+    ) -> Result<Value, MLSError> {
         let prepared = chat_wire::sign_clean_chat_mutation(
             &self.account_did,
             device_id,
@@ -203,12 +204,14 @@ impl WasmMlsClient {
         let bytes = self
             .ds_post_json(session_token, nsid, prepared.body.unwrap_or_default())
             .await?;
-        if chat_wire::is_offline_mock_stub_response(&bytes) {
-            return Ok(None);
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err(MLSError::Internal(format!(
+                "POST {nsid} returned empty response body"
+            )));
         }
         let val: Value = serde_json::from_slice(&bytes)
             .map_err(|e| MLSError::Internal(format!("parse {operation:?} JSON: {e}")))?;
-        Ok(Some(val))
+        Ok(val)
     }
 
     pub(crate) async fn ds_signed_get(
@@ -218,7 +221,7 @@ impl WasmMlsClient {
         nsid: &str,
         query_pairs: &[(&str, &str)],
         signer: &SignatureKeyPair,
-    ) -> Result<Option<Value>, MLSError> {
+    ) -> Result<Value, MLSError> {
         let jwt = self.mint_ds_auth_token(session_token, nsid).await?;
         let canonical_query = chat_wire::canonical_query_string(query_pairs);
         let url = if canonical_query.is_empty() {
@@ -254,12 +257,14 @@ impl WasmMlsClient {
                 String::from_utf8_lossy(&bytes)
             )));
         }
-        if chat_wire::is_offline_mock_stub_response(&bytes) {
-            return Ok(None);
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err(MLSError::Internal(format!(
+                "GET {nsid} returned empty response body"
+            )));
         }
         let val: Value = serde_json::from_slice(&bytes)
             .map_err(|e| MLSError::Internal(format!("parse {nsid} JSON: {e}")))?;
-        Ok(Some(val))
+        Ok(val)
     }
 
     pub(crate) async fn pds_post_json(
@@ -307,7 +312,7 @@ impl WasmMlsClient {
         {
             if resp.status().is_success() {
                 if let Ok(bytes) = resp.bytes().await {
-                    if !chat_wire::is_offline_mock_stub_response(&bytes) {
+                    if !bytes.is_empty() {
                         if let Ok(doc) = chat_wire::extract_did_doc_from_resolve_response(&bytes) {
                             return Ok(Some(doc));
                         }
@@ -331,7 +336,7 @@ impl WasmMlsClient {
             if let Ok(resp) = self.http.get(&wk_url).send().await {
                 if resp.status().is_success() {
                     if let Ok(bytes) = resp.bytes().await {
-                        if !chat_wire::is_offline_mock_stub_response(&bytes) {
+                        if !bytes.is_empty() {
                             if let Ok(doc) =
                                 chat_wire::extract_did_doc_from_resolve_response(&bytes)
                             {
@@ -791,6 +796,56 @@ impl WasmMlsClient {
         Ok(flushed)
     }
 
+    pub(crate) async fn acknowledge_entries_up_to_impl(
+        &self,
+        conversation_id: &str,
+        up_to_seq: i64,
+    ) -> Result<(), MLSError> {
+        let cid = conversation_id.trim();
+        if cid.is_empty() || up_to_seq < 1 {
+            return Ok(());
+        }
+        let db = self.require_db_mls()?;
+        let ts = now_ms();
+        let generation = db.write_tx(|tx| {
+            let meta_key = format!("acked_seq:{cid}");
+            let prev = tx
+                .get_account_meta(&meta_key)?
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let next_wm = prev.max(up_to_seq);
+            tx.put_account_meta(&meta_key, &next_wm.to_string(), ts)?;
+            Ok(tx
+                .get_conversation(cid)?
+                .map(|c| c.generation.max(0))
+                .unwrap_or(0))
+        })?;
+        if let Some((session_token, canonical_dev_id)) = self.live_session() {
+            if uuid::Uuid::parse_str(cid)
+                .ok()
+                .filter(|u| u.get_version_num() == 4)
+                .is_some()
+            {
+                let (signer, auth_gen) = self.load_enrolled_signer_and_auth_gen()?;
+                let ack_bytes = chat_wire::build_acknowledge_entries_request(
+                    cid,
+                    generation,
+                    &canonical_dev_id,
+                    auth_gen,
+                    up_to_seq,
+                    &signer,
+                )?;
+                self.ds_post_json(
+                    &session_token,
+                    "blue.catbird.chat.acknowledgeEntries",
+                    ack_bytes,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn sync_impl(&self) -> Result<u32, MLSError> {
         let Some((session_token, canonical_dev_id)) = self.live_session() else {
             return Ok(0);
@@ -853,7 +908,7 @@ impl WasmMlsClient {
         signer: &SignatureKeyPair,
         auth_gen: i64,
     ) -> Result<(u32, Option<String>), MLSError> {
-        let Some(resp) = self
+        let resp = self
             .ds_signed_get(
                 session_token,
                 canonical_dev_id,
@@ -866,10 +921,7 @@ impl WasmMlsClient {
                 ],
                 signer,
             )
-            .await?
-        else {
-            return Ok((0, None));
-        };
+            .await?;
         let inventory_session_id = resp
             .get("inventorySessionId")
             .and_then(|v| v.as_str())
@@ -981,7 +1033,7 @@ impl WasmMlsClient {
         cid: &str,
         sequencer_did_fallback: &str,
     ) -> Result<bool, MLSError> {
-        let Some(entries_val) = self
+        let entries_val = self
             .ds_signed_get(
                 session_token,
                 canonical_dev_id,
@@ -994,10 +1046,7 @@ impl WasmMlsClient {
                 ],
                 signer,
             )
-            .await?
-        else {
-            return Ok(false);
-        };
+            .await?;
         let Some(entries) = entries_val.get("entries").and_then(|v| v.as_array()) else {
             return Ok(false);
         };
@@ -1299,7 +1348,7 @@ impl WasmMlsClient {
         canonical_dev_id: &str,
         signer: &SignatureKeyPair,
     ) -> Result<Option<String>, MLSError> {
-        let Some(resp) = self
+        let resp = self
             .ds_signed_get(
                 session_token,
                 canonical_dev_id,
@@ -1312,10 +1361,7 @@ impl WasmMlsClient {
                 ],
                 signer,
             )
-            .await?
-        else {
-            return Ok(None);
-        };
+            .await?;
         Ok(resp
             .get("inventorySessionId")
             .and_then(|v| v.as_str())
@@ -1346,7 +1392,7 @@ impl WasmMlsClient {
             ("supportedProtocolVersions", "1"),
             ("supportedProtocolVersions", "2"),
         ]);
-        let Some(resp) = self
+        let resp = self
             .ds_signed_get(
                 session_token,
                 canonical_dev_id,
@@ -1354,10 +1400,7 @@ impl WasmMlsClient {
                 &query_pairs,
                 signer,
             )
-            .await?
-        else {
-            return Ok(0);
-        };
+            .await?;
         let Some(welcomes) = resp
             .get("items")
             .or_else(|| resp.get("welcomes"))
@@ -1461,12 +1504,11 @@ impl WasmMlsClient {
             chat_wire::collect_dids_from_json(raw_item, &mut candidate_dids);
             candidate_dids.insert(self.account_did.clone(), ());
 
-            // Peek member DIDs inside an explicitly rolled-back transaction so one-time KeyPackageBundle
-            // in `openmls_kv` is NOT consumed before `I4` PDS key fetch!
-            if db.backend().begin_immediate().is_ok() {
-                if let Ok(provider) = OpenMlsKvProvider::new(
-                    catbird_mls::storage::OpenMlsKvStorage::new(db.backend()),
-                ) {
+            // Peek member DIDs over KvWriteOverlay so OpenMLS's one-time KeyPackageBundle deletion
+            // during `StagedWelcome::new_from_welcome` never mutates `openmls_kv` before `I4` PDS key fetch!
+            {
+                let overlay = KvWriteOverlay::new(db.backend());
+                if let Ok(provider) = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay)) {
                     if let Ok(msg_in) = MlsMessageIn::tls_deserialize_exact(&welcome_bytes) {
                         if let MlsMessageBodyIn::Welcome(w_peek) = msg_in.extract() {
                             if let Ok(staged_peek) = StagedWelcome::new_from_welcome(
@@ -1497,17 +1539,14 @@ impl WasmMlsClient {
                         }
                     }
                 }
-                let _ = db.backend().rollback_tx();
             }
 
             let mut peer_map: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();
             for did in candidate_dids.keys() {
-                if let Ok(pairs) = self
+                let pairs = self
                     .verify_peer_device_keys_via_pds(session_token, did)
-                    .await
-                {
-                    peer_map.insert(did.clone(), pairs);
-                }
+                    .await?;
+                peer_map.insert(did.clone(), pairs);
             }
 
             let coords_canon = chat_wire::canonicalize_wire_coordinate(coords, Some(cid))?;
@@ -1517,8 +1556,7 @@ impl WasmMlsClient {
             let ts = now_ms();
 
             db.write_tx(|tx| {
-                let provider =
-                    OpenMlsKvProvider::new(catbird_mls::storage::OpenMlsKvStorage::new(tx))?;
+                let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
                 let msg_in = MlsMessageIn::tls_deserialize_exact(&welcome_bytes)
                     .map_err(|e| MLSError::Cryptography(format!("deserialize Welcome: {e:?}")))?;
                 let MlsMessageBodyIn::Welcome(welcome) = msg_in.extract() else {
@@ -1551,23 +1589,10 @@ impl WasmMlsClient {
                     if let Some((m_epoch, m_ver, meta)) =
                         chat_wire::try_decrypt_group_metadata_snapshot(&mut group, &provider, snap)
                     {
-                        decrypted_title = (!meta.title.is_empty()).then(|| meta.title.clone());
-                        tx.upsert_group_metadata(&GroupMetadataRow {
-                            conversation_id: cid.to_string(),
-                            metadata_version: m_ver,
-                            epoch: m_epoch,
-                            title: decrypted_title.clone(),
-                            description: (!meta.description.is_empty())
-                                .then(|| meta.description.clone()),
-                            avatar_setter_did: None,
-                            avatar_blob_cid: None,
-                            avatar_sym_key: None,
-                            avatar_sha256: None,
-                            avatar_mime_type: None,
-                            metadata_json: serde_json::to_string(&meta)
-                                .map_err(|e| MLSError::Internal(e.to_string()))?,
-                            updated_at_ms: ts,
-                        })?;
+                        let row =
+                            chat_wire::group_metadata_row_from_v1(cid, m_ver, m_epoch, &meta, ts)?;
+                        decrypted_title = row.title.clone();
+                        tx.upsert_group_metadata(&row)?;
                     }
                     if let Ok(snap_s) = serde_json::to_string(snap) {
                         tx.put_account_meta(&format!("metadata_snapshot_json:{cid}"), &snap_s, ts)?;
@@ -1647,7 +1672,7 @@ impl WasmMlsClient {
             ("supportedProtocolVersions", "1"),
             ("supportedProtocolVersions", "2"),
         ]);
-        let Some(resp) = self
+        let resp = self
             .ds_signed_get(
                 session_token,
                 canonical_dev_id,
@@ -1655,10 +1680,7 @@ impl WasmMlsClient {
                 &query_pairs,
                 signer,
             )
-            .await?
-        else {
-            return Ok(0);
-        };
+            .await?;
         let Some(requests) = resp
             .get("items")
             .or_else(|| resp.get("requests"))
@@ -1759,122 +1781,104 @@ impl WasmMlsClient {
             let welcome_id = uuid::Uuid::new_v4().to_string();
             let ts = now_ms();
 
-            let built = db.write_tx(|tx| {
-                let Some(convo) = tx.get_conversation(cid)? else {
-                    return Ok(None);
-                };
-                let provider =
-                    OpenMlsKvProvider::new(catbird_mls::storage::OpenMlsKvStorage::new(tx))?;
-                let validated_kp = kp_in
-                    .validate(provider.crypto(), ProtocolVersion::Mls10)
-                    .map_err(|e| MLSError::Cryptography(format!("validate recovery KP: {e:?}")))?;
-                let Some(mut group) =
-                    MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
-                        .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
-                else {
-                    return Ok(None);
-                };
-                let aad_prior = chat_wire::build_aad_prior_coordinate(
-                    &convo_uuid,
-                    &convo.group_id,
-                    prior_gen,
-                    prior_sv,
-                    prior_epoch as i64,
-                    &prior_gch,
-                    &prior_ctag,
-                );
-                let commit_aad_val = json!({
-                    "protocolVersion": "1",
-                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
-                    "generation": prior_gen,
-                    "transitionId": STANDARD.encode(transition_uuid.as_bytes()),
-                    "prior": aad_prior,
-                });
-                let commit_aad_bytes =
-                    canonical_commit_aad_bytes(&commit_aad_val).map_err(|e| {
-                        MLSError::Cryptography(format!("canonical_commit_aad_bytes: {e}"))
-                    })?;
-                group.set_aad(commit_aad_bytes);
-                let (commit_out, welcome_out, _) = group
-                    .add_members(&provider, signer, &[validated_kp])
-                    .map_err(|e| MLSError::Cryptography(format!("recovery add_members: {e:?}")))?;
-                group
-                    .merge_pending_commit(&provider)
-                    .map_err(|e| MLSError::Cryptography(format!("merge recovery commit: {e:?}")))?;
-                group.set_aad(Vec::new());
-                let commit_bytes = commit_out
-                    .tls_serialize_detached()
-                    .map_err(|e| MLSError::Internal(format!("serialize commit: {e:?}")))?;
-                let welcome_bytes = welcome_out
-                    .tls_serialize_detached()
-                    .map_err(|e| MLSError::Internal(format!("serialize welcome: {e:?}")))?;
-                let next_epoch = group.epoch().as_u64();
-                let (next_gch, next_ctag) =
-                    chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                let meta_row = tx.get_group_metadata(cid)?;
-                let meta_ver = meta_row
-                    .as_ref()
-                    .map(|m| m.metadata_version.max(1) as u64)
-                    .unwrap_or(1);
-                let title_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.title.clone())
-                    .unwrap_or_default();
-                let desc_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.description.clone())
-                    .unwrap_or_default();
-                let meta_key = derive_metadata_key_from_group(
-                    &mut group,
-                    provider.crypto(),
-                    provider.storage(),
-                    &convo.group_id,
-                    next_epoch,
-                )
-                .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
-                let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json(
-                    &meta_key,
-                    &convo.group_id,
-                    &convo_uuid,
-                    prior_gen,
-                    next_epoch,
-                    &next_gch,
-                    &next_ctag,
-                    &transition_id,
-                    meta_ver,
-                    1,
-                    &self.account_did,
-                    canonical_dev_id,
-                    auth_gen,
-                    signer.public(),
-                    &title_s,
-                    &desc_s,
-                )?;
-                Ok(Some((
-                    convo.group_id,
-                    commit_aad_val,
-                    commit_bytes,
-                    welcome_bytes,
-                    next_epoch,
-                    next_gch,
-                    next_ctag,
-                    carried_snap,
-                )))
-            })?;
-
-            let Some((
-                group_id,
-                commit_aad_val,
-                commit_bytes,
-                welcome_bytes,
-                next_epoch,
-                next_gch,
-                next_ctag,
-                carried_snap,
-            )) = built
+            // Stage `add_members` + `merge_pending_commit` over `KvWriteOverlay` before HTTP (`I6`)
+            // so an HTTP 409 / network failure never forks local OpenMLS epoch state!
+            let Some(convo) = db.backend().get_conversation(cid)? else {
+                continue;
+            };
+            let meta_row = db.backend().get_group_metadata(cid)?;
+            let overlay = KvWriteOverlay::new(db.backend());
+            let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
+            let validated_kp = kp_in
+                .validate(provider.crypto(), ProtocolVersion::Mls10)
+                .map_err(|e| MLSError::Cryptography(format!("validate recovery KP: {e:?}")))?;
+            let Some(mut group) =
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                    .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
             else {
                 continue;
             };
+            let aad_prior = chat_wire::build_aad_prior_coordinate(
+                &convo_uuid,
+                &convo.group_id,
+                prior_gen,
+                prior_sv,
+                prior_epoch as i64,
+                &prior_gch,
+                &prior_ctag,
+            );
+            let commit_aad_val = json!({
+                "protocolVersion": "1",
+                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+                "generation": prior_gen,
+                "transitionId": STANDARD.encode(transition_uuid.as_bytes()),
+                "prior": aad_prior,
+            });
+            let commit_aad_bytes = canonical_commit_aad_bytes(&commit_aad_val)
+                .map_err(|e| MLSError::Cryptography(format!("canonical_commit_aad_bytes: {e}")))?;
+            group.set_aad(commit_aad_bytes);
+            let (commit_out, welcome_out, _) = group
+                .add_members(&provider, signer, &[validated_kp])
+                .map_err(|e| MLSError::Cryptography(format!("recovery add_members: {e:?}")))?;
+            group
+                .merge_pending_commit(&provider)
+                .map_err(|e| MLSError::Cryptography(format!("merge recovery commit: {e:?}")))?;
+            group.set_aad(Vec::new());
+            let commit_bytes = commit_out
+                .tls_serialize_detached()
+                .map_err(|e| MLSError::Internal(format!("serialize commit: {e:?}")))?;
+            let welcome_bytes = welcome_out
+                .tls_serialize_detached()
+                .map_err(|e| MLSError::Internal(format!("serialize welcome: {e:?}")))?;
+            let next_epoch = group.epoch().as_u64();
+            let (next_gch, next_ctag) =
+                chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+            let meta_ver = meta_row
+                .as_ref()
+                .map(|m| m.metadata_version.max(1) as u64)
+                .unwrap_or(1);
+            let title_s = meta_row
+                .as_ref()
+                .and_then(|m| m.title.clone())
+                .unwrap_or_default();
+            let desc_s = meta_row
+                .as_ref()
+                .and_then(|m| m.description.clone())
+                .unwrap_or_default();
+            let avatar_opt = meta_row
+                .as_ref()
+                .and_then(chat_wire::space_avatar_from_metadata_row);
+            let meta_key = derive_metadata_key_from_group(
+                &mut group,
+                provider.crypto(),
+                provider.storage(),
+                &convo.group_id,
+                next_epoch,
+            )
+            .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
+            let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json(
+                &meta_key,
+                &convo.group_id,
+                &convo_uuid,
+                prior_gen,
+                next_epoch,
+                &next_gch,
+                &next_ctag,
+                &transition_id,
+                meta_ver,
+                1,
+                &self.account_did,
+                canonical_dev_id,
+                auth_gen,
+                signer.public(),
+                &title_s,
+                &desc_s,
+                avatar_opt,
+            )?;
+            drop(provider);
+            let kv_batch = overlay.into_batch();
+            let group_id = convo.group_id;
+
             let next_coords = json!({
                 "conversationId": cid,
                 "generation": prior_gen,
@@ -1933,7 +1937,7 @@ impl WasmMlsClient {
                 },
                 "metadataSnapshot": carried_snap,
             });
-            let _ = self
+            let submit_res = self
                 .submit_signed_chat_op(
                     session_token,
                     canonical_dev_id,
@@ -1942,15 +1946,39 @@ impl WasmMlsClient {
                     &fulfill_body,
                     signer,
                 )
-                .await?;
+                .await;
+            let resp_val = match submit_res {
+                Ok(v) => v,
+                Err(e) if e.to_string().contains("HTTP 409") => {
+                    // Competing device already fulfilled or rotated epoch; leave local `openmls_kv` untouched.
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let authoritative_seq = resp_val
+                .get("seq")
+                .or_else(|| resp_val.get("transitionSeq"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             let coords_str = serde_json::to_string(&next_coords)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
+            let carried_snap_str = serde_json::to_string(&carried_snap)
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
             db.write_tx(|tx| {
+                kv_batch.apply(tx)?;
                 if let Some(mut c) = tx.get_conversation(cid)? {
                     c.epoch = next_epoch as i64;
+                    if authoritative_seq == c.last_seq + 1 {
+                        c.last_seq = authoritative_seq;
+                    }
                     c.updated_at_ms = ts;
                     tx.upsert_conversation(&c)?;
                 }
+                tx.put_account_meta(
+                    &format!("metadata_snapshot_json:{cid}"),
+                    &carried_snap_str,
+                    ts,
+                )?;
                 tx.put_account_meta(&format!("conversation_coords:{cid}"), &coords_str, ts)
             })?;
             fulfilled = fulfilled.saturating_add(1);
@@ -1958,7 +1986,7 @@ impl WasmMlsClient {
         Ok(fulfilled)
     }
 
-    async fn sync_conversation_entries(
+    pub(crate) async fn sync_conversation_entries(
         &self,
         session_token: &str,
         canonical_dev_id: &str,
@@ -1966,6 +1994,7 @@ impl WasmMlsClient {
         auth_gen: i64,
         convo: &ConversationRow,
     ) -> Result<u32, MLSError> {
+        let _ = auth_gen;
         let cid = convo.conversation_id.as_str();
         if uuid::Uuid::parse_str(cid)
             .ok()
@@ -1974,32 +2003,56 @@ impl WasmMlsClient {
         {
             return Ok(0);
         }
-        let after_seq_str = convo.last_seq.max(0).to_string();
-        let Some(resp) = self
-            .ds_signed_get(
-                session_token,
-                canonical_dev_id,
-                "blue.catbird.chat.getEntries",
-                &[
-                    ("actorDeviceId", canonical_dev_id),
-                    ("afterSeq", &after_seq_str),
-                    ("conversationId", cid),
-                    ("limit", "100"),
-                ],
-                signer,
-            )
-            .await?
-        else {
-            return Ok(0);
-        };
-        let Some(raw_entries) = resp.get("entries").and_then(|v| v.as_array()) else {
-            return Ok(0);
-        };
-        if raw_entries.is_empty() {
+
+        // Paginate `blue.catbird.chat.getEntries` up to 50 pages of 100 entries (`I2`)
+        let mut cursor_after_seq = convo.last_seq.max(0);
+        let mut all_raw_entries: Vec<Value> = Vec::new();
+        for _page in 0..50 {
+            let after_seq_str = cursor_after_seq.to_string();
+            let resp = self
+                .ds_signed_get(
+                    session_token,
+                    canonical_dev_id,
+                    "blue.catbird.chat.getEntries",
+                    &[
+                        ("actorDeviceId", canonical_dev_id),
+                        ("afterSeq", &after_seq_str),
+                        ("conversationId", cid),
+                        ("limit", "100"),
+                    ],
+                    signer,
+                )
+                .await?;
+            let Some(page_entries) = resp.get("entries").and_then(|v| v.as_array()) else {
+                break;
+            };
+            if page_entries.is_empty() {
+                break;
+            }
+            let page_max_seq = page_entries
+                .iter()
+                .filter_map(|e| e.get("seq").and_then(|s| s.as_i64()))
+                .max()
+                .unwrap_or(cursor_after_seq);
+            all_raw_entries.extend(page_entries.iter().cloned());
+            let has_more = resp
+                .get("hasMore")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(page_entries.len() >= 100);
+            let next_after = resp
+                .get("nextAfterSeq")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(page_max_seq);
+            if !has_more || next_after <= cursor_after_seq {
+                break;
+            }
+            cursor_after_seq = next_after;
+        }
+        if all_raw_entries.is_empty() {
             return Ok(0);
         }
 
-        let mut sorted_entries: Vec<Value> = raw_entries.clone();
+        let mut sorted_entries = all_raw_entries;
         sorted_entries.sort_by_key(|e| e.get("seq").and_then(|s| s.as_i64()).unwrap_or(0));
 
         let db = self.require_db_mls()?;
@@ -2028,9 +2081,45 @@ impl WasmMlsClient {
             peer_map.insert(did.clone(), pairs);
         }
 
+        // Pre-resolve the conversation sequencer's ES256 receipt key (`I13`) outside `write_tx` (`I6`)
+        // whenever any non-pruned `applicationEntry` is present in the batch.
+        let mut receipt_sec1_opt: Option<Vec<u8>> = None;
+        for entry in &sorted_entries {
+            let et = entry
+                .get("$type")
+                .or_else(|| entry.get("entryKind"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sr = entry.get("signedRequest").unwrap_or(entry);
+            let b = sr.get("body").unwrap_or(sr);
+            let bt = b.get("$type").and_then(|v| v.as_str()).unwrap_or("");
+            let is_app = et.ends_with("applicationMessageEntry")
+                || et.ends_with("applicationEntry")
+                || bt.ends_with("applicationSendBody")
+                || b.get("applicationMessage").is_some()
+                || entry.get("applicationMessage").is_some();
+            let is_pruned = entry
+                .get("payloadPruned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if is_app && !is_pruned {
+                let rcpt_kid = entry
+                    .get("sequencerReceipt")
+                    .and_then(|r| r.get("kid").or_else(|| r.get("keyId")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#mls-receipt-1");
+                let sec1 = self
+                    .fetch_sequencer_receipt_key_sec1(session_token, &convo.sequencer_did, rcpt_kid)
+                    .await?;
+                receipt_sec1_opt = Some(sec1);
+                break;
+            }
+        }
+
         let mut max_seq = convo.last_seq;
         let mut applied_count = 0u32;
         let mut saw_c33_accept = false;
+        let mut was_kicked = false;
 
         for entry in &sorted_entries {
             let entry_seq = entry.get("seq").and_then(|v| v.as_i64()).unwrap_or(max_seq);
@@ -2121,16 +2210,17 @@ impl WasmMlsClient {
                     .get("next")
                     .or_else(|| entry.get("coordinates"))
                     .and_then(|c| chat_wire::canonicalize_wire_coordinate(c, Some(cid)).ok());
+                let own_leaf_identity =
+                    format!("{}#{canonical_dev_id}", self.account_did).into_bytes();
 
-                db.write_tx(|tx| {
+                let kicked_in_tx = db.write_tx(|tx| {
                     let Some(mut c) = tx.get_conversation(cid)? else {
-                        return Ok(());
+                        return Ok(false);
                     };
+                    let mut local_kicked = false;
                     if !is_own_echo {
                         if let Some(ref commit_bytes) = commit_bytes_opt {
-                            let provider = OpenMlsKvProvider::new(
-                                catbird_mls::storage::OpenMlsKvStorage::new(tx),
-                            )?;
+                            let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
                             if let Some(mut group) = MlsGroup::load(
                                 provider.storage(),
                                 &GroupId::from_slice(&c.group_id),
@@ -2149,17 +2239,28 @@ impl WasmMlsClient {
                                         group.process_message(&provider, proto).map_err(|e| {
                                             MLSError::Cryptography(format!("process Commit: {e:?}"))
                                         })?;
+                                    let commit_sender = processed.sender().clone();
                                     if let ProcessedMessageContent::StagedCommitMessage(staged) =
                                         processed.into_content()
                                     {
-                                        for add_p in staged.add_proposals() {
-                                            let ln = add_p.add_proposal().key_package().leaf_node();
-                                            chat_wire::verify_leaf_pds_map_i4(
-                                                ln.credential().serialized_content(),
-                                                ln.signature_key().as_slice(),
-                                                &peer_map,
-                                            )?;
-                                        }
+                                        chat_wire::verify_staged_commit_pds_map_i4(
+                                            &group,
+                                            &commit_sender,
+                                            &staged,
+                                            &peer_map,
+                                        )?;
+                                        let self_removed = staged.self_removed()
+                                            || staged.remove_proposals().any(|rp| {
+                                                let removed_idx = rp.remove_proposal().removed();
+                                                group
+                                                    .members()
+                                                    .find(|m| m.index == removed_idx)
+                                                    .map(|m| {
+                                                        m.credential.serialized_content()
+                                                            == own_leaf_identity.as_slice()
+                                                    })
+                                                    .unwrap_or(false)
+                                            });
                                         group.merge_staged_commit(&provider, *staged).map_err(
                                             |e| {
                                                 MLSError::Cryptography(format!(
@@ -2168,33 +2269,31 @@ impl WasmMlsClient {
                                             },
                                         )?;
                                         c.epoch = group.epoch().as_u64() as i64;
+                                        if self_removed {
+                                            local_kicked = true;
+                                        }
                                     }
                                 }
-                                if let Some(snap) = snap_opt {
-                                    if let Some((m_epoch, m_ver, meta)) =
-                                        chat_wire::try_decrypt_group_metadata_snapshot(
-                                            &mut group, &provider, snap,
-                                        )
-                                    {
-                                        let new_title =
-                                            (!meta.title.is_empty()).then(|| meta.title.clone());
-                                        tx.upsert_group_metadata(&GroupMetadataRow {
-                                            conversation_id: cid.to_string(),
-                                            metadata_version: m_ver,
-                                            epoch: m_epoch,
-                                            title: new_title.clone(),
-                                            description: (!meta.description.is_empty())
-                                                .then(|| meta.description.clone()),
-                                            avatar_setter_did: None,
-                                            avatar_blob_cid: None,
-                                            avatar_sym_key: None,
-                                            avatar_sha256: None,
-                                            avatar_mime_type: None,
-                                            metadata_json: serde_json::to_string(&meta)
-                                                .map_err(|e| MLSError::Internal(e.to_string()))?,
-                                            updated_at_ms: ts,
-                                        })?;
-                                        c.title = new_title;
+                                if !local_kicked {
+                                    if let Some(snap) = snap_opt {
+                                        if let Some((m_epoch, m_ver, meta)) =
+                                            chat_wire::try_decrypt_group_metadata_snapshot(
+                                                &mut group, &provider, snap,
+                                            )
+                                        {
+                                            let row = chat_wire::group_metadata_row_from_v1(
+                                                cid, m_ver, m_epoch, &meta, ts,
+                                            )?;
+                                            c.title = row.title.clone();
+                                            tx.upsert_group_metadata(&row)?;
+                                        }
+                                        if let Ok(snap_s) = serde_json::to_string(snap) {
+                                            tx.put_account_meta(
+                                                &format!("metadata_snapshot_json:{cid}"),
+                                                &snap_s,
+                                                ts,
+                                            )?;
+                                        }
                                     }
                                 }
                             }
@@ -2207,8 +2306,12 @@ impl WasmMlsClient {
                     }
                     c.last_seq = c.last_seq.max(entry_seq);
                     c.updated_at_ms = ts;
-                    tx.upsert_conversation(&c)
+                    tx.upsert_conversation(&c)?;
+                    Ok(local_kicked)
                 })?;
+                if kicked_in_tx {
+                    was_kicked = true;
+                }
                 max_seq = max_seq.max(entry_seq);
                 applied_count = applied_count.saturating_add(1);
                 continue;
@@ -2229,9 +2332,7 @@ impl WasmMlsClient {
                         return Ok(());
                     };
                     if let Some(snap) = snap_opt {
-                        let provider = OpenMlsKvProvider::new(
-                            catbird_mls::storage::OpenMlsKvStorage::new(tx),
-                        )?;
+                        let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
                         if let Some(mut group) =
                             MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
                                 .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
@@ -2241,26 +2342,19 @@ impl WasmMlsClient {
                                     &mut group, &provider, snap,
                                 )
                             {
-                                let new_title =
-                                    (!meta.title.is_empty()).then(|| meta.title.clone());
-                                tx.upsert_group_metadata(&GroupMetadataRow {
-                                    conversation_id: cid.to_string(),
-                                    metadata_version: m_ver,
-                                    epoch: m_epoch,
-                                    title: new_title.clone(),
-                                    description: (!meta.description.is_empty())
-                                        .then(|| meta.description.clone()),
-                                    avatar_setter_did: None,
-                                    avatar_blob_cid: None,
-                                    avatar_sym_key: None,
-                                    avatar_sha256: None,
-                                    avatar_mime_type: None,
-                                    metadata_json: serde_json::to_string(&meta)
-                                        .map_err(|e| MLSError::Internal(e.to_string()))?,
-                                    updated_at_ms: ts,
-                                })?;
-                                c.title = new_title;
+                                let row = chat_wire::group_metadata_row_from_v1(
+                                    cid, m_ver, m_epoch, &meta, ts,
+                                )?;
+                                c.title = row.title.clone();
+                                tx.upsert_group_metadata(&row)?;
                             }
+                        }
+                        if let Ok(snap_s) = serde_json::to_string(snap) {
+                            tx.put_account_meta(
+                                &format!("metadata_snapshot_json:{cid}"),
+                                &snap_s,
+                                ts,
+                            )?;
                         }
                     }
                     if let Some(ref nc) = next_opt {
@@ -2283,6 +2377,23 @@ impl WasmMlsClient {
                 || body.get("applicationMessage").is_some()
                 || entry.get("applicationMessage").is_some()
             {
+                let is_pruned = entry
+                    .get("payloadPruned")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_pruned {
+                    db.write_tx(|tx| {
+                        if let Some(mut c) = tx.get_conversation(cid)? {
+                            c.last_seq = c.last_seq.max(entry_seq);
+                            c.updated_at_ms = ts;
+                            tx.upsert_conversation(&c)?;
+                        }
+                        Ok(())
+                    })?;
+                    max_seq = max_seq.max(entry_seq);
+                    continue;
+                }
+
                 let msg_id = body
                     .get("messageId")
                     .or_else(|| entry.get("messageId"))
@@ -2318,12 +2429,27 @@ impl WasmMlsClient {
                             MLSError::invalid_input("applicationMessageEntry missing bytes")
                         })?,
                 )?;
+                let rcpt_val = entry.get("sequencerReceipt").ok_or_else(|| {
+                    MLSError::Cryptography(format!(
+                        "I13: applicationEntry seq={entry_seq} missing sequencerReceipt"
+                    ))
+                })?;
+                let expected_rcpt_entry_id = rcpt_val
+                    .get("entryId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(msg_id);
+                let rcpt_sec1 = receipt_sec1_opt.as_deref().ok_or_else(|| {
+                    MLSError::Cryptography(
+                        "I13: sequencer receipt public key was not pre-resolved".into(),
+                    )
+                })?;
+
                 db.write_tx(|tx| {
                     let Some(mut c) = tx.get_conversation(cid)? else {
                         return Ok(());
                     };
-                    let provider =
-                        OpenMlsKvProvider::new(catbird_mls::storage::OpenMlsKvStorage::new(tx))?;
+                    let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
                     let Some(mut group) =
                         MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
                             .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
@@ -2362,8 +2488,29 @@ impl WasmMlsClient {
                     else {
                         return Err(MLSError::Cryptography("expected ApplicationMessage".into()));
                     };
-                    let (_display_body, json_str, _commitment) =
+                    let (_display_body, json_str, verified_commitment_opt) =
                         extract_plaintext_body_and_verify_aad(&app_msg.into_bytes(), &aad_bytes)?;
+                    let verified_commitment = verified_commitment_opt.ok_or_else(|| {
+                        MLSError::Cryptography(
+                            "I13: applicationEntry missing verified AAD archiveCommitment".into(),
+                        )
+                    })?;
+                    let (rcpt_seq, _, _) = chat_wire::parse_and_verify_i13_sequencer_receipt(
+                        rcpt_val,
+                        rcpt_sec1,
+                        &c.sequencer_did,
+                        cid,
+                        &c.group_id,
+                        msg_epoch.max(0) as u64,
+                        expected_rcpt_entry_id,
+                        &verified_commitment,
+                    )?;
+                    if rcpt_seq as i64 != entry_seq {
+                        return Err(MLSError::Cryptography(format!(
+                            "I13: receipt seq {rcpt_seq} != entry seq {entry_seq}"
+                        )));
+                    }
+
                     tx.insert_message(&MessageRow {
                         message_id: msg_id.to_string(),
                         conversation_id: cid.to_string(),
@@ -2402,23 +2549,8 @@ impl WasmMlsClient {
         if saw_c33_accept {
             let _ = self.archive_accepted_opening_messages(cid).await;
         }
-        if max_seq >= 1 && applied_count > 0 {
-            if let Ok(ack_bytes) = chat_wire::build_acknowledge_entries_request(
-                cid,
-                convo.generation.max(0),
-                canonical_dev_id,
-                auth_gen,
-                max_seq,
-                signer,
-            ) {
-                let _ = self
-                    .ds_post_json(
-                        session_token,
-                        "blue.catbird.chat.acknowledgeEntries",
-                        ack_bytes,
-                    )
-                    .await;
-            }
+        if max_seq >= 1 && applied_count > 0 && !was_kicked {
+            self.acknowledge_entries_up_to_impl(cid, max_seq).await?;
         }
         Ok(applied_count)
     }

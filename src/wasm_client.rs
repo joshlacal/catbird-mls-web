@@ -482,6 +482,17 @@ impl WasmMlsClient {
         self.sync_impl().await.map_err(mls_to_js_err)
     }
 
+    #[wasm_bindgen(js_name = acknowledgeEntriesUpTo)]
+    pub async fn acknowledge_entries_up_to(
+        &self,
+        conversation_id: String,
+        up_to_seq: i64,
+    ) -> Result<(), JsValue> {
+        self.acknowledge_entries_up_to_impl(&conversation_id, up_to_seq)
+            .await
+            .map_err(mls_to_js_err)
+    }
+
     #[wasm_bindgen(js_name = labyrinthStatus)]
     pub fn labyrinth_status(&self) -> Result<JsValue, JsValue> {
         let raw_opt = self

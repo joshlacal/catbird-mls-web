@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with `c
 `catbird-mls-web` is the **browser WASM wrapper** around the shared `catbird-mls` MLS orchestrator. It compiles the same Rust core that powers Catbird iOS and catmos desktop into a `wasm32-unknown-unknown` `cdylib`, exposing a flat `#[wasm_bindgen]` API for any web app to consume.
 
 - Crate: `catbird-mls-web` (`crate-type = ["cdylib"]`), edition 2021.
-- Core dependency: `catbird_mls = { path = "../catbird-mls", default-features = false, features = ["browser"] }`. This crate is a **thin adapter** — it does NOT reimplement MLS. It provides browser-native implementations of the orchestrator's traits (storage, credentials, API client) and re-exports the orchestrator surface as WASM functions. For MLS internals (epoch handling, recovery policy, OpenMLS), see `../catbird-mls/AGENTS.md`.
+- Core dependency: `catbird_mls = { path = "../catbird-mls", default-features = false, features = ["browser"] }`. `browser` enables `labyrinth`; the deterministic-simulation features (`sim`, `plant_*`, `test-utils`) are never enabled here, so `buggify!` compiles to `false` and planted bugs cannot activate. This crate is a **thin adapter** — it does NOT reimplement MLS. It provides browser-native implementations of the orchestrator's traits (storage, credentials, API client) and re-exports the orchestrator surface as WASM functions. For MLS internals (epoch handling, recovery policy, OpenMLS), see `../catbird-mls/AGENTS.md`.
 - ATProto request/response types come from `catbird-atproto` (shared generated Jacquard types).
 
 Don't duplicate orchestrator logic here. If a behavior should be shared across iOS/desktop/web, it belongs in `catbird-mls`; this crate only owns the browser adapters and the JS-facing ABI.
@@ -60,6 +60,9 @@ Entry points are defined with `#[wasm_bindgen]` in `src/lib.rs` (~45 exports). G
 - **Realtime (WebSocket)**: `catbird_mls_subscribe(convo_id, on_message, on_event, on_status)` / `catbird_mls_unsubscribe`, plus lower-level `connect(...)` returning a `WsSubscription` handle (call `.close()` to disconnect).
 - **Key packages / recovery**: `catbird_mls_replenish_key_packages`, `catbird_mls_start_background_tasks(interval_ms)` / `catbird_mls_stop_background_tasks()` / `catbird_mls_background_tasks_running()` (crate-owned deferred-recovery timer — the default contract), `catbird_mls_run_deferred_recovery` (manual/on-demand tick; see Consumers).
 - **Field-level (envelope) crypto** (`js_name` camelCase): `setContentRootKey`, `clearContentRootKey`, `encryptMessagePayload`, `decryptMessagePayload`, `computeMessageHmac`, `verifyMessageHmac` — the per-conversation payload encryption layer, wire-compatible with catmos desktop.
+- **Clean-slate client** (`WasmMlsClient`, `src/wasm_client.rs`, `wasm_client_mutations.rs`, `wasm_client_sync.rs`): `openAsync`, `setAuthToken`, `evaluateSpacesEligibility(pdsSupportsSpaces, grantedScopes)`, `enrollDevice(pdsSupportsSpaces, grantedScopes)`, conversations/messages/requests/members, direct-request accept/decline, `acknowledgeEntriesUpTo`, and Labyrinth (`labyrinthStatus`, `flushLabyrinthQueue`, `setupRecoveryCode`, `restoreWithRecoveryCode`). Eligibility uses Rust `catbird_mls::REQUIRED_LABYRINTH_OAUTH_SCOPES`: sessions holding only the retired `space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete` / `space:blue.catbird.labyrinth.conversation?authority=*` scopes are ineligible and must re-authorize. `enrollDevice` is idempotent (keeps an enrolled signer; a retry after a lost response resumes from the DS's state). A C33 opening pruned before import is verified, recorded once with consent `C33_OPENING_UNAVAILABLE`, and never re-fetched; `acceptDirectRequest` on it fails with `OpeningUnavailable`.
+- `WasmMlsClient.createGroup`, `sendMessage`, `addGroupMembers` and `removeGroupMember` have no local-only or silent no-op path. A conversation, message or device ID that is not UUIDv4 fails with `Invalid input`, and so does an `addGroupMembers` call with no other account. A missing auth token fails with `Invalid state`. Both are checked before any local or DS effect. A conversation missing locally fails with `Group not found`. On remove, a target with no leaf fails with `Member not found` and an unenrolled device with `Invalid state`. A receiptless queued row is never written.
+- The `catbird_mls_*` functions are re-exported through `src/browser_exports.rs`, which captures the session before creating each Promise, so neither direct calls nor queued Worker calls can adopt a replacement session.
 
 ### Init ordering (load-bearing)
 
@@ -77,7 +80,7 @@ catbird_mls_start_background_tasks(30_000); // crate-owned deferred-recovery tim
 | `baseUrl` | — (required) | mls-ds base URL |
 | `storagePrefix` | `"catbird_mls"` | localStorage key prefix |
 | `dbPrefix` | `"catbird-mls"` | SQLite file prefix (`<dbPrefix>-app.db`) |
-| `proxyDid` | `did:web:mlschat.catbird.blue#atproto_mls` | ATProto proxy DID header |
+| `proxyDid` | `did:web:chat.catbird.blue#atproto_mls` (`api_client::DEFAULT_ATPROTO_PROXY_DID`) | ATProto proxy DID header |
 | `mlsDbKey` | localStorage-derived | hex 256-bit DB key. **REQUIRED in Worker mode** (localStorage is inaccessible there). |
 
 ## Architecture (browser adapters)
@@ -122,6 +125,8 @@ Browser apps **MUST** call `catbird_mls_start_background_tasks(interval_ms)` onc
 - **Voice/media not exposed.** No audio codecs in the WASM surface; `audiopus_sys` is not a dependency of this crate.
 - **getrandom triple-pin.** `Cargo.toml` declares `getrandom` 0.2 (`js`), 0.3 and 0.4 (`wasm_js`) under aliases so Cargo unifies WASM RNG features across semver-incompatible versions pulled by `hpke-rs`/`rand`. Don't remove these.
 - `wasm-opt` absence silently downgrades `build.sh` to a non-optimized release artifact — install binaryen for size-sensitive builds.
+- **Vendored contract artifacts.** `src/generated/blue.catbird.chat.defs.json` and the signing/contract vector fixtures are byte copies from `catbird-mls`, synced by `python3 scripts/sync-chat-artifacts.py --core-revision <rev>` (which also rewrites `tests/fixtures/chat-artifact-provenance.json`). `cargo test --test provenance` (native) fails on drift. On this branch the recorded revision is a provisional, unsealed Task 4 R1 commit; re-sync and rebuild `pkg/` after any further `catbird-mls` contract change.
+- **Known WASM failures.** The Task 4 R1 gate recorded three OPFS and two blob failures in the browser suite as pre-existing, not R1 regressions.
 
 ## Coding Style
 

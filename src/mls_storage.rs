@@ -913,7 +913,8 @@ impl WasmUnifiedStorage {
         let rows = self
             .conn
             .query_text(
-                "SELECT conversation_id FROM conversations ORDER BY updated_at_ms DESC",
+                "SELECT conversation_id FROM conversations \
+                 ORDER BY updated_at_ms DESC, conversation_id ASC",
                 &[],
                 1,
             )

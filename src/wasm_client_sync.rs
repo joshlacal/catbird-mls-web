@@ -24,6 +24,7 @@ use catbird_mls::orchestrator::canonical_transport::{
 };
 use catbird_mls::orchestrator::direct_request_bootstrap::{
     DirectRequestBootstrap, DirectRequestIntroductionResult, DirectRequestWelcomeInput,
+    C33_OPENING_UNAVAILABLE,
 };
 use catbird_mls::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend};
@@ -76,6 +77,17 @@ impl WasmMlsClient {
             self.effective_auth_token()?,
             self.canonical_uuid_v4_device_id()?,
         ))
+    }
+
+    /// Live session for sends and group creation; there is no local-only fallback.
+    pub(crate) fn require_live_session(&self) -> Result<(String, String), MLSError> {
+        let device = self
+            .canonical_uuid_v4_device_id()
+            .ok_or_else(|| MLSError::invalid_input("device_id must be a UUIDv4"))?;
+        let token = self
+            .effective_auth_token()
+            .ok_or_else(|| MLSError::InvalidState("not authenticated: call setAuthToken".into()))?;
+        Ok((token, device))
     }
 
     pub(crate) fn ds_base(&self) -> String {
@@ -521,6 +533,13 @@ impl WasmMlsClient {
             .list_requests(None)?
             .into_iter()
             .find(|r| r.request_id == request_id || r.conversation_id == request_id);
+        if req_opt
+            .as_ref()
+            .is_some_and(|r| r.consent == C33_OPENING_UNAVAILABLE)
+        {
+            // No signed opening survives to accept against: terminal, never re-requested.
+            return Err(MLSError::InvalidState("OpeningUnavailable".into()));
+        }
 
         if let (Some((session_token, canonical_dev_id)), Some(req)) =
             (self.live_session(), req_opt.as_ref())
@@ -960,6 +979,15 @@ impl WasmMlsClient {
             let has_local = db.backend().get_conversation(cid)?.is_some();
 
             if kind == "direct" && !has_local {
+                // A pruned opening's terminal state is recorded once; it is never re-fetched.
+                if db
+                    .backend()
+                    .list_requests(Some(C33_OPENING_UNAVAILABLE))?
+                    .iter()
+                    .any(|r| r.conversation_id == cid)
+                {
+                    continue;
+                }
                 if self
                     .import_incoming_c33_direct_request(
                         session_token,
@@ -1058,6 +1086,17 @@ impl WasmMlsClient {
         }) else {
             return Ok(false);
         };
+        if raw_dr_entry["payloadPruned"] == true
+            || (raw_dr_entry.get("directRequest").is_none()
+                && raw_dr_entry["$type"] == "blue.catbird.chat.defs#directRequestEntry"
+                && catbird_mls::orchestrator::direct_request_bootstrap::is_pruned_opening_entry(
+                    raw_dr_entry,
+                ))
+        {
+            return self
+                .record_pruned_c33_opening(session_token, cid, sequencer_did_fallback, raw_dr_entry)
+                .await;
+        }
 
         let pub_wrapper = raw_dr_entry
             .get("signedRequest")
@@ -1178,7 +1217,20 @@ impl WasmMlsClient {
                 &artifact["metadataSnapshot"]["ciphertext"],
             )?,
             initial_ciphertext: chat_wire::json_bytes(&artifact["initialCiphertext"])?,
+            archive_commitment: chat_wire::json_bytes(&vp["archiveCommitment"])?
+                .try_into()
+                .map_err(|_| {
+                    MLSError::Cryptography("C33 archiveCommitment must be 32 bytes".into())
+                })?,
+            opening: None,
         };
+        let sequencer_receipt_key = self
+            .fetch_sequencer_receipt_key_sec1(
+                session_token,
+                sequencer_did_fallback,
+                "#mls-receipt-1",
+            )
+            .await?;
         let welcome_input = DirectRequestWelcomeInput {
             bootstrap: bootstrap.clone(),
             publication_request: pub_norm_bytes.clone(),
@@ -1191,6 +1243,7 @@ impl WasmMlsClient {
             published_receipt: Vec::new(),
             receipt_authority_did: sequencer_did_fallback.to_string(),
             receipt_authority_key: Vec::new(),
+            sequencer_receipt_authority_key: sequencer_receipt_key,
         };
 
         let entry_seq = raw_dr_entry
@@ -1257,7 +1310,7 @@ impl WasmMlsClient {
             let epoch = group.epoch().as_u64() as i64;
             let intro_json =
                 match decrypt_introduction_with_provider(&provider, &mut group, &welcome_input)? {
-                    DirectRequestIntroductionResult::Ready { plaintext } => {
+                    DirectRequestIntroductionResult::Ready { plaintext, .. } => {
                         let intro_val =
                             dr_transcript::decode_direct_request_introduction(&plaintext)
                                 .map_err(|e| MLSError::Cryptography(format!("decode C33: {e}")))?;
@@ -1321,6 +1374,7 @@ impl WasmMlsClient {
                 group_id_hex: hex::encode(&group_id),
                 epoch,
                 seq: entry_seq,
+                expected_member_dids: crate::wasm_client_mutations::member_root_dids(&group)?,
                 sender_did: sender_did.to_string(),
                 sender_device_id: sender_device_id.to_string(),
                 sequencer_did: effective_seq_did,
@@ -1340,6 +1394,51 @@ impl WasmMlsClient {
             )
         })?;
         Ok(true)
+    }
+
+    /// An opening pruned before this device imported it keeps only its receipts: no Welcome,
+    /// preview or acceptance can follow. Verify them under the coordinator, then record the
+    /// declared terminal request state once; the history is reachable only via Spaces.
+    async fn record_pruned_c33_opening(
+        &self,
+        session_token: &str,
+        cid: &str,
+        sequencer_did: &str,
+        entry: &Value,
+    ) -> Result<bool, MLSError> {
+        let missing = |what: &str| MLSError::Cryptography(format!("C33 pruned opening: {what}"));
+        let document = self
+            .resolve_did_document(session_token, sequencer_did)
+            .await?
+            .ok_or_else(|| missing("receipt authority document"))?;
+        let receipt =
+            catbird_mls::orchestrator::direct_request_bootstrap::verify_pruned_opening_entry(
+                entry,
+                cid,
+                sequencer_did,
+                &document,
+            )?;
+        let row = RequestRow {
+            request_id: receipt["requestId"]
+                .as_str()
+                .ok_or_else(|| missing("requestId"))?
+                .to_string(),
+            conversation_id: cid.to_string(),
+            sender_did: receipt["actorDid"]
+                .as_str()
+                .ok_or_else(|| missing("actorDid"))?
+                .to_string(),
+            recipient_did: self.account_did.clone(),
+            consent: C33_OPENING_UNAVAILABLE.to_string(),
+            first_message_id: receipt["firstMessageId"].as_str().map(str::to_owned),
+            first_message_archived: false,
+            payload_json: json!({ "unavailable": "OpeningPruned" }).to_string(),
+            expires_at_ms: 0,
+            updated_at_ms: now_ms(),
+        };
+        self.require_db_mls()?
+            .write_tx(|tx| tx.upsert_request(&row))?;
+        Ok(false)
     }
 
     async fn acquire_inventory_session_id_wasm(

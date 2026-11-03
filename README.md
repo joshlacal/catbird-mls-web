@@ -24,6 +24,19 @@ amalgamation, native Opus, or its CMake dependency at all.
 
 Output lands in `pkg/`.
 
+## Clean-slate client and contract artifacts
+
+`WasmMlsClient` (`src/wasm_client*.rs`) is the clean-slate browser client: `openAsync`, `evaluateSpacesEligibility(pdsSupportsSpaces, grantedScopes)`, `enrollDevice(pdsSupportsSpaces, grantedScopes)`, conversation, message and request calls, and Labyrinth (`labyrinthStatus`, `flushLabyrinthQueue`, recovery-code restore). Eligibility uses Rust `catbird_mls::REQUIRED_LABYRINTH_OAUTH_SCOPES`. A session holding only the retired Labyrinth Space scopes (`space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete`, `space:blue.catbird.labyrinth.conversation?authority=*`) is ineligible, and `enrollDevice` refuses it until the user re-authorizes with the explicit `action=`/`collection=` scopes. `enrollDevice` is idempotent: an enrolled device keeps its signer, and a retry after a lost `enrollDevice` response resumes from what the DS already holds.
+
+The strict chat schema (`src/generated/blue.catbird.chat.defs.json`) and the signing/contract vector fixtures are copied verbatim from `catbird-mls`. `tests/fixtures/chat-artifact-provenance.json` records the source commit and hashes, and `cargo test --test provenance` fails on any drift from the sibling. After a `catbird-mls` contract change, re-sync and rebuild:
+
+```bash
+python3 scripts/sync-chat-artifacts.py --core-revision <catbird-mls revision>
+./build.sh
+```
+
+As of 2026-11-04 the provenance points at a provisional, unsealed Task 4 R1 `catbird-mls` commit, and the local `pkg/` is not a final artifact; re-sync and rebuild after any further `catbird-mls` change. The browser build uses `catbird_mls` with `default-features = false, features = ["browser"]` (Labyrinth on, `sim` off), so `buggify!` is `false` and planted bugs cannot activate.
+
 ## JS Integration: Recovery Loop
 
 Browser apps **MUST** start the crate-owned background task loop once after

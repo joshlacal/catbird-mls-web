@@ -39,7 +39,7 @@ fn sign_publication(
     let artifact = |v: &Vec<u8>, kind: &str| json!({"framing":"mlsMessage","contentType":kind,"bytes":STANDARD.encode(v),"sha256":STANDARD.encode(Sha256::digest(v))});
     let deliveries=b.expected_package_refs.iter().enumerate().map(|(i,r)|json!({"recipientDid":BOB,"recipientDeviceId":format!("00000000-0000-4000-8000-{:012}",i+1),"provenance":{"requestId":c["requestId"],"preparationDigest":c["preparationDigest"],"contextHash":STANDARD.encode(b.context_hash),"grantId":uuid::Uuid::new_v4().to_string(),"grantRevision":1,"keyPackageRef":STANDARD.encode(r),"importUntil":date(b.import_until)}})).collect::<Vec<_>>();
     let metadata = json!({"coordinate":metadata_coordinate(&b.coordinates).unwrap(),"originTransitionId":c["requestId"],"metadataVersion":1,"nonce":STANDARD.encode(&b.metadata_nonce),"ciphertext":STANDARD.encode(&b.metadata_ciphertext),"ciphertextSha256":STANDARD.encode(Sha256::digest(&b.metadata_ciphertext)),"ciphertextSize":b.metadata_ciphertext.len(),"authorProof":{"authorDid":ALICE,"authorDeviceId":ADEV,"authorKeyId":c["actorKeyId"],"signaturePublicKey":STANDARD.encode(public),"authGenerationAtOrigin":1,"originTransitionId":c["requestId"],"originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}});
-    let body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}","protocolVersion":"2","actorDid":ALICE,"actorDeviceId":ADEV,"keyId":c["actorKeyId"],"authGeneration":1,"requestId":c["requestId"],"firstMessageId":c["firstMessageId"],"conversationId":c["conversationId"],"recipientDid":BOB,"origin":c["origin"],"profile":"encryptedIntroduction1","preparationDigest":c["preparationDigest"],"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"contextHash":STANDARD.encode(b.context_hash),"next":b.coordinates,"importUntil":date(b.import_until),"artifacts":{"genesisGroupInfo":artifact(&b.genesis_group_info,"groupInfo"),"addCommit":artifact(&b.add_commit,"publicMessageCommit"),"finalGroupInfo":artifact(&b.final_group_info,"groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&b.welcome),"sha256":STANDARD.encode(Sha256::digest(&b.welcome)),"deliveries":deliveries},"metadataSnapshot":metadata,"initialCiphertext":STANDARD.encode(&b.initial_ciphertext)},"idempotencyKey":uuid::Uuid::new_v4().to_string(),"signedAt":date(chrono::Utc::now().timestamp() as u64)});
+    let body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}","protocolVersion":"2","actorDid":ALICE,"actorDeviceId":ADEV,"keyId":c["actorKeyId"],"authGeneration":1,"requestId":c["requestId"],"firstMessageId":c["firstMessageId"],"conversationId":c["conversationId"],"recipientDid":BOB,"origin":c["origin"],"profile":"encryptedIntroduction1","preparationDigest":c["preparationDigest"],"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"contextHash":STANDARD.encode(b.context_hash),"next":b.coordinates,"importUntil":date(b.import_until),"archiveCommitment":STANDARD.encode(b.archive_commitment),"artifacts":{"genesisGroupInfo":artifact(&b.genesis_group_info,"groupInfo"),"addCommit":artifact(&b.add_commit,"publicMessageCommit"),"finalGroupInfo":artifact(&b.final_group_info,"groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&b.welcome),"sha256":STANDARD.encode(Sha256::digest(&b.welcome)),"deliveries":deliveries},"metadataSnapshot":metadata,"initialCiphertext":STANDARD.encode(&b.initial_ciphertext)},"idempotencyKey":uuid::Uuid::new_v4().to_string(),"signedAt":date(chrono::Utc::now().timestamp() as u64)});
     let transcript = direct_request_signing_bytes(
         DirectRequestKind::Publish,
         &serde_json::to_vec(&body).unwrap(),
@@ -70,7 +70,7 @@ fn receipt(
         &serde_json::to_vec(&publication["signedRequest"]["body"]).unwrap(),
     )
     .unwrap();
-    let body = json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":direct_request_receipt_key_id(key.verifying_key().to_encoded_point(true).as_bytes()).unwrap(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":c["requestId"],"requestKind":"publish","actorDid":ALICE,"actorDeviceId":ADEV,"actorKeyId":c["actorKeyId"],"authGeneration":1,"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"requestDigest":STANDARD.encode(Sha256::digest(transcript)),"recordedAt":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"conversationId":c["conversationId"],"firstMessageId":c["firstMessageId"],"coordinates":b.coordinates}});
+    let body = json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":direct_request_receipt_key_id(key.verifying_key().to_encoded_point(true).as_bytes()).unwrap(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":c["requestId"],"requestKind":"publish","actorDid":ALICE,"actorDeviceId":ADEV,"actorKeyId":c["actorKeyId"],"authGeneration":1,"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"requestDigest":STANDARD.encode(Sha256::digest(transcript)),"recordedAt":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"conversationId":c["conversationId"],"firstMessageId":c["firstMessageId"],"coordinates":b.coordinates,"sequencerReceipt":sequencer_receipt(&publication["signedRequest"]["body"])}});
     let input = direct_request_signing_bytes(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&body).unwrap(),
@@ -78,6 +78,44 @@ fn receipt(
     .unwrap();
     let sig: p256::ecdsa::Signature = key.sign(&input);
     serde_json::to_vec(&json!({"body":body,"signature":STANDARD.encode(sig.normalize_s().unwrap_or(sig).to_bytes())})).unwrap()
+}
+/// I13 receipt over the signed opening, by the sequencer's `[19;32]` `#mls-receipt-1`
+/// key (mirrors catbird-mls `tests/fixtures/direct_request_i13.rs::receipt`, seq 1).
+fn sequencer_receipt(publication: &Value) -> Value {
+    use labyrinth_protocol::receipt::{
+        expected_receipt_key_id, sign_sequencer_receipt, SequencerReceiptPayload,
+    };
+    let key = p256::ecdsa::SigningKey::from_slice(&[19; 32]).unwrap();
+    let bytes = |v: &Value| STANDARD.decode(v.as_str().unwrap()).unwrap();
+    let payload = SequencerReceiptPayload {
+        sequencer_did: "did:web:chat.catbird.blue".into(),
+        conversation_id: publication["conversationId"].as_str().unwrap().into(),
+        group_id: bytes(&publication["next"]["groupId"]),
+        epoch: publication["next"]["epoch"].as_u64().unwrap(),
+        sender_device_did_url: format!("{ALICE}#{ADEV}"),
+        entry_id: publication["firstMessageId"].as_str().unwrap().into(),
+        archive_commitment: bytes(&publication["archiveCommitment"]).try_into().unwrap(),
+        seq: 1,
+        issued_at_ms: chrono::DateTime::parse_from_rfc3339(
+            publication["signedAt"].as_str().unwrap(),
+        )
+        .unwrap()
+        .timestamp_millis(),
+    };
+    let signed = sign_sequencer_receipt(
+        &key,
+        &expected_receipt_key_id(&payload.sequencer_did),
+        &payload,
+    )
+    .unwrap();
+    json!({
+        "sequencerDid":payload.sequencer_did,"conversationId":payload.conversation_id,
+        "generation":publication["next"]["generation"],"groupId":STANDARD.encode(&payload.group_id),
+        "epoch":payload.epoch,"senderDid":ALICE,"senderDeviceId":ADEV,
+        "entryId":payload.entry_id,"archiveCommitment":STANDARD.encode(payload.archive_commitment),
+        "seq":payload.seq,"issuedAtMs":payload.issued_at_ms,"kid":signed.key_id,
+        "signature":STANDARD.encode(signed.signature),
+    })
 }
 #[wasm_bindgen_test]
 async fn unknown_publication_multisecret_import_ratchet_and_retirement_reopen() {
@@ -103,7 +141,14 @@ async fn unknown_publication_multisecret_import_ratchet_and_retirement_reopen() 
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
-    let input=DirectRequestBootstrapInput{draft_id:uuid::Uuid::new_v4().to_string(),context_json:serde_json::to_vec(&json!({"protocolVersion":"2","requestId":uuid::Uuid::new_v4().to_string(),"firstMessageId":uuid::Uuid::new_v4().to_string(),"conversationId":uuid::Uuid::new_v4().to_string(),"origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},"actorDid":ALICE,"actorDeviceId":ADEV,"actorKeyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&ap.signature_public_key)),"recipientDid":BOB,"preparationDigest":STANDARD.encode([42;32])})).unwrap(),group_id:vec![37;32],generation:0,state_version:1,key_packages:vec![bp.key_package_data,sp.key_package_data],expected_package_refs:vec![bp.hash_ref.clone(),sp.hash_ref],authority_import_until:chrono::Utc::now().timestamp() as u64+20*86400,preparation_request_digest:[21;32],receipt_authority_key:authority_key.clone(),text:"Preview before consent".into(),invitation:None,metadata:catbird_mls::metadata::GroupMetadataV1{version:1,title:"Request".into(),description:String::new(),avatar_blob_locator:None,avatar_content_type:None,space_avatar:None}};
+    // The sequencer's separate `#mls-receipt-1` I13 key, pinned beside the request authority key.
+    let sequencer_key = p256::ecdsa::SigningKey::from_slice(&[19; 32])
+        .unwrap()
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+    let input=DirectRequestBootstrapInput{draft_id:uuid::Uuid::new_v4().to_string(),context_json:serde_json::to_vec(&json!({"protocolVersion":"2","requestId":uuid::Uuid::new_v4().to_string(),"firstMessageId":uuid::Uuid::new_v4().to_string(),"conversationId":uuid::Uuid::new_v4().to_string(),"origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},"actorDid":ALICE,"actorDeviceId":ADEV,"actorKeyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&ap.signature_public_key)),"recipientDid":BOB,"preparationDigest":STANDARD.encode([42;32])})).unwrap(),group_id:vec![37;32],generation:0,state_version:1,key_packages:vec![bp.key_package_data,sp.key_package_data],expected_package_refs:vec![bp.hash_ref.clone(),sp.hash_ref],authority_import_until:chrono::Utc::now().timestamp() as u64+20*86400,preparation_request_digest:[21;32],receipt_authority_key:authority_key.clone(),sequencer_did:"did:web:chat.catbird.blue".into(),sequencer_receipt_authority_key:sequencer_key.clone(),text:"Preview before consent".into(),invitation:None,metadata:catbird_mls::metadata::GroupMetadataV1{version:1,title:"Request".into(),description:String::new(),avatar_blob_locator:None,avatar_content_type:None,space_avatar:None}};
     let journal = alice.prepare_direct_request_bootstrap(&input).unwrap();
     let publication =
         sign_publication(&alice, &input, &journal.bootstrap, &ap.signature_public_key);
@@ -142,6 +187,7 @@ async fn unknown_publication_multisecret_import_ratchet_and_retirement_reopen() 
         published_receipt: proof.clone(),
         receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: authority_key.clone(),
+        sequencer_receipt_authority_key: sequencer_key.clone(),
         preparation_request_digest: input.preparation_request_digest,
     };
     bob.process_direct_request_welcome(&welcome).unwrap();
@@ -156,7 +202,7 @@ async fn unknown_publication_multisecret_import_ratchet_and_retirement_reopen() 
     let bob = open(&bobpath);
     bob.process_direct_request_welcome(&welcome).unwrap();
     let outcome = bob.decrypt_direct_request_introduction(&welcome).unwrap();
-    let DirectRequestIntroductionResult::Ready { plaintext } = &outcome else {
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } = &outcome else {
         panic!("preview unavailable")
     };
     let decoded =
@@ -195,6 +241,7 @@ async fn unknown_publication_multisecret_import_ratchet_and_retirement_reopen() 
         published_receipt: poisoned_receipt,
         receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: authority_key.clone(),
+        sequencer_receipt_authority_key: sequencer_key.clone(),
         preparation_request_digest: input.preparation_request_digest,
     };
     second

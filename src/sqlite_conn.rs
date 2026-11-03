@@ -1269,7 +1269,7 @@ impl catbird_mls::storage::driver_wasm::WasmSqlBackend for SqliteConn {
         let rows = self
             .query_text_int_blob(
                 "SELECT conversation_id, group_id, generation, epoch, last_seq, sequencer_did, space_uri, title, unread_count, updated_at_ms \
-                 FROM conversations WHERE updated_at_ms < ?1 ORDER BY updated_at_ms DESC LIMIT ?2",
+                 FROM conversations WHERE updated_at_ms < ?1 ORDER BY updated_at_ms DESC, conversation_id ASC LIMIT ?2",
                 &[],
                 &[(1, bound), (2, limit as i64)],
                 10,
@@ -1446,31 +1446,31 @@ impl catbird_mls::storage::driver_wasm::WasmSqlBackend for SqliteConn {
             match filter {
                 "pending" => self.query_text(
                     "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                     FROM requests WHERE consent IN ('pending', 'incomingPending', 'outgoingPending', 'incoming_pending', 'outgoing_pending') ORDER BY updated_at_ms DESC",
+                     FROM requests WHERE consent IN ('pending', 'incomingPending', 'outgoingPending', 'incoming_pending', 'outgoing_pending') ORDER BY updated_at_ms DESC, request_id ASC",
                     &[],
                     10,
                 ),
                 "incomingPending" | "incoming_pending" => self.query_text(
                     "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                     FROM requests WHERE consent IN ('incomingPending', 'incoming_pending') ORDER BY updated_at_ms DESC",
+                     FROM requests WHERE consent IN ('incomingPending', 'incoming_pending') ORDER BY updated_at_ms DESC, request_id ASC",
                     &[],
                     10,
                 ),
                 "outgoingPending" | "outgoing_pending" => self.query_text(
                     "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                     FROM requests WHERE consent IN ('outgoingPending', 'outgoing_pending') ORDER BY updated_at_ms DESC",
+                     FROM requests WHERE consent IN ('outgoingPending', 'outgoing_pending') ORDER BY updated_at_ms DESC, request_id ASC",
                     &[],
                     10,
                 ),
                 "declined" | "closed" => self.query_text(
                     "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                     FROM requests WHERE consent IN ('declined', 'closed') ORDER BY updated_at_ms DESC",
+                     FROM requests WHERE consent IN ('declined', 'closed') ORDER BY updated_at_ms DESC, request_id ASC",
                     &[],
                     10,
                 ),
                 _ => self.query_text(
                     "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                     FROM requests WHERE consent = ?1 ORDER BY updated_at_ms DESC",
+                     FROM requests WHERE consent = ?1 ORDER BY updated_at_ms DESC, request_id ASC",
                     &[(1, filter)],
                     10,
                 ),
@@ -1478,7 +1478,7 @@ impl catbird_mls::storage::driver_wasm::WasmSqlBackend for SqliteConn {
         } else {
             self.query_text(
                 "SELECT request_id, conversation_id, sender_did, recipient_did, consent, first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                 FROM requests ORDER BY updated_at_ms DESC",
+                 FROM requests ORDER BY updated_at_ms DESC, request_id ASC",
                 &[],
                 10,
             )

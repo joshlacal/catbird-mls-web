@@ -147,6 +147,14 @@ async fn external_join_cannot_overwrite_request_candidate_after_reopen() {
         authority_import_until: now + 20 * 86400,
         preparation_request_digest: [21; 32],
         receipt_authority_key: vec![2; 33],
+        sequencer_did: "did:web:chat.catbird.blue".into(),
+        // The sequencer's real `#mls-receipt-1` P-256 SEC1 key.
+        sequencer_receipt_authority_key: p256::ecdsa::SigningKey::from_slice(&[19; 32])
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec(),
         text: "retained encrypted introduction".into(),
         invitation: None,
         metadata: catbird_mls::metadata::GroupMetadataV1 {

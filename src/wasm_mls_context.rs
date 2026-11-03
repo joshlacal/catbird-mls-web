@@ -1943,7 +1943,10 @@ impl MlsCryptoContext for WasmMLSContext {
             reason: "browser self-remove proposal unavailable".into(),
         })
     }
-    fn commit_pending_proposals(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+    fn commit_pending_proposals(
+        &self,
+        _group_id: Vec<u8>,
+    ) -> Result<catbird_mls::RemoveMembersResult, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "browser proposal commit unavailable".into(),
         })

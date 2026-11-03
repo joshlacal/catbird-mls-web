@@ -190,6 +190,10 @@ impl WasmMlsClient {
     /// KeyPackages (`C33` >= 35d direct-request + <= 30d recovery), publishing `ADR-009`
     /// `blue.catbird.chat.device` + `blue.catbird.chat.declaration` + `mls-ds` `enrollDevice`
     /// outside `WasmAccountDb::write_tx` (`I6`), and initializing Labyrinth (`D4`).
+    ///
+    /// Idempotent, like catbird-mls `enroll_device`: an enrolled device keeps its signer and
+    /// archive status. Its MLS leaves and the `mls-ds` device row are bound to that key, and
+    /// `mls-ds` has no key rotation: a new signing key is a new device ID.
     #[wasm_bindgen(js_name = enrollDevice)]
     pub async fn enroll_device(
         &self,
@@ -213,9 +217,6 @@ impl WasmMlsClient {
         }
 
         let db = self.require_db()?;
-        let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
-            .map_err(|e| JsValue::from_str(&format!("SignatureKeyPair::new: {e:?}")))?;
-        let pub_key = signer.public().to_vec();
         let cred_identity = format!("{}#{}", self.account_did, self.device_id);
 
         let now_s = now_secs();
@@ -228,8 +229,15 @@ impl WasmMlsClient {
         let mailbox_uri = personal_mailbox_space_uri(&self.account_did);
         let ts = now_ms();
 
-        let (dr_kp_bytes, rec_kp_bytes) = db
+        let (signer, dr_kp_bytes, rec_kp_bytes) = db
             .write_tx(|tx| {
+                let signer = match tx.get_labyrinth_state("device_signer_json")? {
+                    Some(raw) => serde_json::from_slice::<SignatureKeyPair>(&raw).map_err(|e| {
+                        MLSError::Internal(format!("deserialize device_signer_json: {e}"))
+                    })?,
+                    None => SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
+                        .map_err(|e| MLSError::Internal(format!("SignatureKeyPair::new: {e:?}")))?,
+                };
                 let provider =
                     OpenMlsKvProvider::new(catbird_mls::storage::OpenMlsKvStorage::new(tx))?;
                 signer
@@ -237,7 +245,7 @@ impl WasmMlsClient {
                     .map_err(|e| MLSError::Internal(format!("store signer: {e:?}")))?;
                 let cred_with_key = CredentialWithKey {
                     credential: BasicCredential::new(cred_identity.as_bytes().to_vec()).into(),
-                    signature_key: pub_key.clone().into(),
+                    signature_key: signer.public().into(),
                 };
                 let caps = Capabilities::builder()
                     .ciphersuites(vec![CIPHERSUITE])
@@ -266,22 +274,26 @@ impl WasmMlsClient {
                     .map_err(|e| MLSError::Internal(format!("ser signer: {e}")))?;
                 tx.put_labyrinth_state("device_signer_json", &signer_json, ts)?;
 
-                let status = LabyrinthBackupStatus {
-                    backup_enabled: true,
-                    mailbox_space_uri: mailbox_uri.clone(),
-                    has_recovery_code: false,
-                    has_passkey_prf: false,
-                    epoch_seq: 1,
-                    active_device_ids: vec![self.device_id.clone()],
-                };
-                tx.put_labyrinth_state(
-                    "status_json",
-                    &serde_json::to_vec(&status).map_err(|e| MLSError::Internal(e.to_string()))?,
-                    ts,
-                )?;
-                Ok((dr_bytes, rec_bytes))
+                if tx.get_labyrinth_state("status_json")?.is_none() {
+                    let status = LabyrinthBackupStatus {
+                        backup_enabled: true,
+                        mailbox_space_uri: mailbox_uri.clone(),
+                        has_recovery_code: false,
+                        has_passkey_prf: false,
+                        epoch_seq: 1,
+                        active_device_ids: vec![self.device_id.clone()],
+                    };
+                    tx.put_labyrinth_state(
+                        "status_json",
+                        &serde_json::to_vec(&status)
+                            .map_err(|e| MLSError::Internal(e.to_string()))?,
+                        ts,
+                    )?;
+                }
+                Ok((signer, dr_bytes, rec_bytes))
             })
             .map_err(mls_to_js_err)?;
+        let pub_key = signer.public().to_vec();
 
         if let Some((session_token, canonical_dev_id)) = self.live_session() {
             self.enroll_device_live(&session_token, &canonical_dev_id, &signer)

@@ -35,7 +35,7 @@ python3 scripts/sync-chat-artifacts.py --core-revision <catbird-mls revision>
 ./build.sh
 ```
 
-As of 2026-11-04 the provenance points at a provisional, unsealed Task 4 R1 `catbird-mls` commit, and the local `pkg/` is not a final artifact; re-sync and rebuild after any further `catbird-mls` change. The browser build uses `catbird_mls` with `default-features = false, features = ["browser"]` (Labyrinth on, `sim` off), so `buggify!` is `false` and planted bugs cannot activate.
+The current unsealed Task 4 R2 artifact candidate records exact `catbird-mls` revision `b3c40d05baf512c5093db8615abe66bbb90941ee`; its local `pkg/` was rebuilt with `catbird-atproto` `a6986331eee54f3f0ce16e7ea07dda63ab581dd7` and `labyrinth` `c8a6f6c76fd3ffe84137b5508a20a8258496f2ba`. This is not a published or release-qualified artifact; re-sync and rebuild after any source change. The browser build uses `catbird_mls` with `default-features = false, features = ["browser"]` (Labyrinth on, `sim` off), so `buggify!` is `false` and planted bugs cannot activate.
 
 ## JS Integration: Recovery Loop
 

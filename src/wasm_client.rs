@@ -16,6 +16,7 @@ use catbird_mls::client::{
     LabyrinthBackupStatus, SpacesEligibilityInput,
 };
 use catbird_mls::groups::lifecycle::MemberRole;
+use catbird_mls::orchestrator::canonical_transport::derive_key_id;
 use catbird_mls::requests::c33::{
     validate_direct_request_key_package_lifetime, DIRECT_REQUEST_KP_MIN_LIFETIME_SECS,
     RECOVERY_KP_MAX_LIFETIME_SECS,
@@ -43,6 +44,11 @@ pub(crate) fn now_ms() -> i64 {
 
 pub(crate) fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0).max(0.0) as u64
+}
+
+pub(crate) fn uuid_v4(value: &str) -> Option<uuid::Uuid> {
+    let uuid = uuid::Uuid::parse_str(value.trim()).ok()?;
+    (uuid.get_version_num() == 4 && uuid.get_variant() == uuid::Variant::RFC4122).then_some(uuid)
 }
 
 /// Unified browser WASM MLS client backed by per-account `catbird-mls/<did_hash>.db` on OPFS (`sqlite3mc` ChaCha20).
@@ -217,7 +223,54 @@ impl WasmMlsClient {
         }
 
         let db = self.require_db()?;
-        let cred_identity = format!("{}#{}", self.account_did, self.device_id);
+        let canonical_device_uuid = uuid_v4(&self.device_id)
+            .ok_or_else(|| JsValue::from_str("device_id must be a UUIDv4"))?;
+        let canonical_device_id = canonical_device_uuid.hyphenated().to_string();
+        let cred_identity = format!("{}#{canonical_device_id}", self.account_did);
+        if db
+            .backend()
+            .get_account_meta("auth_generation")
+            .map_err(mls_to_js_err)?
+            .is_some()
+        {
+            let bound_device = db
+                .backend()
+                .get_account_meta("enrolled_device_id")
+                .map_err(mls_to_js_err)?;
+            let matches_device =
+                |candidate: &str| uuid_v4(candidate).as_ref() == Some(&canonical_device_uuid);
+            let device_matches = if let Some(bound) = bound_device {
+                matches_device(&bound)
+            } else {
+                db.backend()
+                    .get_labyrinth_state("status_json")
+                    .map_err(mls_to_js_err)?
+                    .and_then(|raw| serde_json::from_slice::<LabyrinthBackupStatus>(&raw).ok())
+                    .is_some_and(|status| {
+                        status
+                            .active_device_ids
+                            .iter()
+                            .any(|device| matches_device(device))
+                    })
+            };
+            let signer_raw = db
+                .backend()
+                .get_labyrinth_state("device_signer_json")
+                .map_err(mls_to_js_err)?
+                .ok_or_else(|| JsValue::from_str("Enrollment signer binding is missing"))?;
+            let bound_signer: SignatureKeyPair = serde_json::from_slice(&signer_raw)
+                .map_err(|e| JsValue::from_str(&format!("deserialize device signer: {e}")))?;
+            let key_matches = db
+                .backend()
+                .get_account_meta("enrolled_signer_key_id")
+                .map_err(mls_to_js_err)?
+                .is_none_or(|key| key == derive_key_id(bound_signer.public()));
+            if !device_matches || !key_matches {
+                return Err(JsValue::from_str(
+                    "Enrollment device identity does not match the retained signer",
+                ));
+            }
+        }
 
         let now_s = now_secs();
         let dr_lifetime_secs = DIRECT_REQUEST_KP_MIN_LIFETIME_SECS + 86_400 * 5;
@@ -281,7 +334,7 @@ impl WasmMlsClient {
                         has_recovery_code: false,
                         has_passkey_prf: false,
                         epoch_seq: 1,
-                        active_device_ids: vec![self.device_id.clone()],
+                        active_device_ids: vec![canonical_device_id.clone()],
                     };
                     tx.put_labyrinth_state(
                         "status_json",
@@ -304,7 +357,7 @@ impl WasmMlsClient {
         let receipt = EnrollmentReceipt {
             account_did: self.account_did.clone(),
             account_did_hash: self.account_did_hash.clone(),
-            device_id: self.device_id.clone(),
+            device_id: canonical_device_id,
             signature_public_key: pub_key,
             direct_request_kp_bytes: dr_kp_bytes,
             recovery_kp_bytes: rec_kp_bytes,
@@ -733,5 +786,20 @@ impl WasmMlsClient {
     #[wasm_bindgen]
     pub fn close(&mut self) {
         self.db = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uuid_v4;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn uuid_v4_matching_is_spelling_independent() {
+        assert_eq!(
+            uuid_v4("00000000-0000-4000-8000-00000000E001"),
+            uuid_v4("00000000-0000-4000-8000-00000000e001")
+        );
+        assert!(uuid_v4("00000000-0000-1000-8000-00000000e001").is_none());
     }
 }

@@ -137,11 +137,29 @@ async fn reenrolling_after_reopen_keeps_the_signer_and_skips_the_ds() {
         .await
         .expect("re-enrolling an enrolled device is idempotent");
     assert_eq!(again, enrolled);
-    assert_eq!(dsKey(device), Some(enrolled));
+    assert_eq!(dsKey(device).as_deref(), Some(enrolled.as_str()));
     assert_eq!((dsCalls(ENROLL), dsRevision(device)), (1, 1));
     let status: LabyrinthBackupStatus =
         serde_wasm_bindgen::from_value(client.labyrinth_status().unwrap()).unwrap();
     assert!(status.has_recovery_code, "archive status survives");
+    drop(client);
+    let canonical_spelling = open(did, &device.to_ascii_uppercase()).await;
+    assert_eq!(
+        enroll(&canonical_spelling)
+            .await
+            .expect("equivalent UUID spelling retains the enrolled identity"),
+        enrolled
+    );
+    assert_eq!(dsCalls(ENROLL), 1);
+    drop(canonical_spelling);
+    let rebound = open(did, "00000000-0000-4000-8000-00000000e099").await;
+    let error = enroll(&rebound)
+        .await
+        .expect_err("a completed enrollment cannot be rebound to another device")
+        .as_string()
+        .unwrap();
+    assert!(error.contains("Enrollment device identity"), "{error}");
+    assert_eq!(dsCalls(ENROLL), 1, "identity mismatch is rejected locally");
 }
 
 /// `mls-ds` applied `enrollDevice` but its response was lost. The retry reuses the persisted

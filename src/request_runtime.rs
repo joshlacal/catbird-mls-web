@@ -425,7 +425,11 @@ pub fn catbird_mls_request_command(
                 };
                 current(did, &runtime)?;
                 let outcome=result.map_err(|_|err("Delivery is not confirmed. The exact request is retained; check delivery before creating another."))?;
-                value.phase = if matches!(outcome, DirectRequestOutcome::OutcomeUnknown { .. }) {
+                value.phase = if matches!(
+                    outcome,
+                    DirectRequestOutcome::OutcomeUnknown { .. }
+                        | DirectRequestOutcome::Retryable { .. }
+                ) {
                     "checking"
                 } else {
                     "resolved"
@@ -563,6 +567,7 @@ pub fn catbird_mls_request_command(
 #[cfg(all(test, feature = "inventory-worker-tests"))]
 pub(crate) mod tests {
     use super::*;
+    use catbird_mls::orchestrator::MlsCryptoContext;
     use wasm_bindgen_test::*;
     #[wasm_bindgen(inline_js = r#"
  let previousFetch;let preparation=[];let cancellation=[];let queued=new Map();let latest=new Map();let history=[];let allowSend=false;let sentEntry;let holds=new Map();let arrived=new Map();

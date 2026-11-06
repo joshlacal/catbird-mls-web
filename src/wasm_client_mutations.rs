@@ -66,10 +66,10 @@ fn uuid_v4(raw: &str, field: &str) -> Result<uuid::Uuid, MLSError> {
 }
 
 impl WasmMlsClient {
-    /// `mls-ds` bootstrap, mirroring catbird-mls `enroll_device_live`: `auth_generation` is
-    /// persisted only once it completes; afterwards this is a no-op. A retry after a lost
-    /// response resumes: `enrollDevice` is create-only and request-key revisions must advance by
-    /// one, so it confirms what the DS already holds.
+    /// `mls-ds` bootstrap, mirroring catbird-mls `enroll_device_live`: completion is bound to
+    /// `auth_generation`, the canonical device ID and signer key. A retry after a lost response
+    /// resumes: `enrollDevice` is create-only and request-key revisions must advance by one, so it
+    /// confirms what the DS already holds.
     pub(crate) async fn enroll_device_live(
         &self,
         session_token: &str,
@@ -77,10 +77,55 @@ impl WasmMlsClient {
         signer: &SignatureKeyPair,
     ) -> Result<(), MLSError> {
         let db = self.require_db_mls()?;
-        if db.backend().get_account_meta("auth_generation")?.is_some() {
+        let pub_key = signer.public();
+        let key_id = derive_key_id(pub_key);
+        if let Some(auth_generation) = db.backend().get_account_meta("auth_generation")? {
+            let bound_device = db.backend().get_account_meta("enrolled_device_id")?;
+            let bound_key = db.backend().get_account_meta("enrolled_signer_key_id")?;
+            if bound_device
+                .as_deref()
+                .is_some_and(|bound| bound != canonical_dev_id)
+                || bound_key
+                    .as_deref()
+                    .is_some_and(|bound| bound != key_id.as_str())
+            {
+                return Err(MLSError::InvalidState(
+                    "EnrollmentDeviceIdentityMismatch".into(),
+                ));
+            }
+            if bound_device.as_deref() == Some(canonical_dev_id)
+                && bound_key.as_deref() == Some(key_id.as_str())
+            {
+                return Ok(());
+            }
+            let devices = self
+                .ds_signed_get(
+                    session_token,
+                    canonical_dev_id,
+                    "blue.catbird.chat.getOwnDevices",
+                    &[("actorDeviceId", canonical_dev_id), ("limit", "100")],
+                    signer,
+                )
+                .await?;
+            let own = chat_wire::own_active_device(&devices, canonical_dev_id, pub_key)
+                .ok_or_else(|| MLSError::InvalidState("EnrollmentDeviceIdentityMismatch".into()))?;
+            if own
+                .pointer("/device/authGeneration")
+                .or_else(|| own.get("authGeneration"))
+                .and_then(Value::as_i64)
+                != auth_generation.parse::<i64>().ok()
+            {
+                return Err(MLSError::InvalidState(
+                    "EnrollmentDeviceIdentityMismatch".into(),
+                ));
+            }
+            let ts = now_ms();
+            db.write_tx(|tx| {
+                tx.put_account_meta("enrolled_device_id", canonical_dev_id, ts)?;
+                tx.put_account_meta("enrolled_signer_key_id", &key_id, ts)
+            })?;
             return Ok(());
         }
-        let pub_key = signer.public();
         let dev_rec = chat_wire::build_pds_device_put_record_body(
             &self.account_did,
             canonical_dev_id,
@@ -164,7 +209,7 @@ impl WasmMlsClient {
             "actorDid": self.account_did,
             "deviceId": canonical_dev_id,
             "deviceName": "Catmos Web",
-            "keyId": derive_key_id(pub_key),
+            "keyId": key_id,
             "signaturePublicKey": { "$bytes": STANDARD.encode(pub_key) },
             "expectedAuthGeneration": 0,
             "capability": {
@@ -267,8 +312,12 @@ impl WasmMlsClient {
                 )
                 .await?;
         }
-        // The authoritative `auth_generation` marks the bootstrap complete.
-        db.write_tx(|tx| tx.put_account_meta("auth_generation", &auth_gen.to_string(), ts))?;
+        // Persist the authoritative completion binding atomically.
+        db.write_tx(|tx| {
+            tx.put_account_meta("auth_generation", &auth_gen.to_string(), ts)?;
+            tx.put_account_meta("enrolled_device_id", canonical_dev_id, ts)?;
+            tx.put_account_meta("enrolled_signer_key_id", &key_id, ts)
+        })?;
         let _ = self.replenish_key_packages_impl(4).await?;
         Ok(())
     }
@@ -667,6 +716,7 @@ impl WasmMlsClient {
         publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
         publish_body["next"] = bootstrap.coordinates.clone();
         publish_body["importUntil"] = json!(import_until_str);
+        publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
         publish_body["artifacts"] = json!({
             "genesisGroupInfo": artifact(&bootstrap.genesis_group_info, "groupInfo"),
             "addCommit": artifact(&bootstrap.add_commit, "publicMessageCommit"),
@@ -698,6 +748,8 @@ impl WasmMlsClient {
                 },
             }
         });
+
+        require_direct_request_archive_commitment(&publish_body, &bootstrap.archive_commitment)?;
 
         let publish_wrapper_bytes = chat_wire::sign_direct_request_wrapper(
             DirectRequestKind::Publish,
@@ -1393,14 +1445,20 @@ impl WasmMlsClient {
                 sequencer_receipt_json: Some(archived_json),
                 created_at_ms: ts,
             };
+            let queued_bytes =
+                serde_json::to_vec(&queued).map_err(|e| MLSError::Internal(e.to_string()))?;
+            tx.put_labyrinth_state(
+                &format!("native.message:{canonical_convo_id}:{canonical_msg_id}"),
+                &queued_bytes,
+                ts,
+            )?;
             tx.dequeue_labyrinth_item(&canonical_msg_id)?;
             tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
                 item_id: canonical_msg_id,
                 conversation_id: canonical_convo_id,
                 group_id_hex,
                 seq: authoritative_seq,
-                payload_bytes: serde_json::to_vec(&queued)
-                    .map_err(|e| MLSError::Internal(e.to_string()))?,
+                payload_bytes: queued_bytes,
                 created_at_ms: ts,
             })?;
             Ok((row, gap_convo))
@@ -1961,4 +2019,40 @@ pub(crate) fn member_root_dids(group: &MlsGroup) -> Result<Vec<String>, MLSError
         dids.insert(did.to_owned());
     }
     Ok(dids.into_iter().collect())
+}
+
+fn require_direct_request_archive_commitment(
+    body: &Value,
+    expected: &[u8; 32],
+) -> Result<(), MLSError> {
+    let actual = body
+        .get("archiveCommitment")
+        .ok_or_else(|| MLSError::Cryptography("C33 publication missing archiveCommitment".into()))
+        .and_then(chat_wire::json_bytes)?;
+    if actual.as_slice() != expected {
+        return Err(MLSError::Cryptography(
+            "C33 publication archiveCommitment mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_direct_request_archive_commitment;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde_json::json;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn c33_publication_requires_the_prepared_archive_commitment() {
+        let expected = [42u8; 32];
+        let mut body = json!({});
+        assert!(require_direct_request_archive_commitment(&body, &expected).is_err());
+        body["archiveCommitment"] = json!(STANDARD.encode(expected));
+        require_direct_request_archive_commitment(&body, &expected).unwrap();
+        body["archiveCommitment"] = json!(STANDARD.encode([41u8; 32]));
+        assert!(require_direct_request_archive_commitment(&body, &expected).is_err());
+    }
 }

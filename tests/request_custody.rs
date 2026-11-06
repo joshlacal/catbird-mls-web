@@ -40,6 +40,15 @@ fn sign_publication(
     let deliveries=b.expected_package_refs.iter().enumerate().map(|(i,r)|json!({"recipientDid":BOB,"recipientDeviceId":format!("00000000-0000-4000-8000-{:012}",i+1),"provenance":{"requestId":c["requestId"],"preparationDigest":c["preparationDigest"],"contextHash":STANDARD.encode(b.context_hash),"grantId":uuid::Uuid::new_v4().to_string(),"grantRevision":1,"keyPackageRef":STANDARD.encode(r),"importUntil":date(b.import_until)}})).collect::<Vec<_>>();
     let metadata = json!({"coordinate":metadata_coordinate(&b.coordinates).unwrap(),"originTransitionId":c["requestId"],"metadataVersion":1,"nonce":STANDARD.encode(&b.metadata_nonce),"ciphertext":STANDARD.encode(&b.metadata_ciphertext),"ciphertextSha256":STANDARD.encode(Sha256::digest(&b.metadata_ciphertext)),"ciphertextSize":b.metadata_ciphertext.len(),"authorProof":{"authorDid":ALICE,"authorDeviceId":ADEV,"authorKeyId":c["actorKeyId"],"signaturePublicKey":STANDARD.encode(public),"authGenerationAtOrigin":1,"originTransitionId":c["requestId"],"originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}});
     let body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}","protocolVersion":"2","actorDid":ALICE,"actorDeviceId":ADEV,"keyId":c["actorKeyId"],"authGeneration":1,"requestId":c["requestId"],"firstMessageId":c["firstMessageId"],"conversationId":c["conversationId"],"recipientDid":BOB,"origin":c["origin"],"profile":"encryptedIntroduction1","preparationDigest":c["preparationDigest"],"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"contextHash":STANDARD.encode(b.context_hash),"next":b.coordinates,"importUntil":date(b.import_until),"archiveCommitment":STANDARD.encode(b.archive_commitment),"artifacts":{"genesisGroupInfo":artifact(&b.genesis_group_info,"groupInfo"),"addCommit":artifact(&b.add_commit,"publicMessageCommit"),"finalGroupInfo":artifact(&b.final_group_info,"groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&b.welcome),"sha256":STANDARD.encode(Sha256::digest(&b.welcome)),"deliveries":deliveries},"metadataSnapshot":metadata,"initialCiphertext":STANDARD.encode(&b.initial_ciphertext)},"idempotencyKey":uuid::Uuid::new_v4().to_string(),"signedAt":date(chrono::Utc::now().timestamp() as u64)});
+    let mut body = body;
+    body["originalSenderAttestation"] = json!({
+        "senderDid": b.original_sender_attestation.sender_did,
+        "senderDeviceId": b.original_sender_attestation.sender_device_id,
+        "senderTransportPubkey": STANDARD.encode(
+            &b.original_sender_attestation.sender_transport_public_key
+        ),
+        "signature": STANDARD.encode(&b.original_sender_attestation.signature),
+    });
     let transcript = direct_request_signing_bytes(
         DirectRequestKind::Publish,
         &serde_json::to_vec(&body).unwrap(),

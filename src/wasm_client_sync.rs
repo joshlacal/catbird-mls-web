@@ -18,11 +18,13 @@ use catbird_mls::chat_v2::transcript::direct_request::{self as dr_transcript, Di
 use catbird_mls::client::chat_wire;
 use catbird_mls::client::{LabyrinthBackupStatus, QueuedLabyrinthArchivePayload};
 use catbird_mls::messaging::receive::{
-    extract_plaintext_body_and_verify_aad, PrivateMessagePlaintextEnvelope,
+    extract_plaintext_body_and_verify_aad, OriginalSenderArchiveAttestationEnvelope,
+    PrivateMessagePlaintextEnvelope,
 };
 use catbird_mls::metadata::derive_metadata_key_from_group;
 use catbird_mls::orchestrator::canonical_transport::{
-    canonical_commit_aad_bytes, derive_key_id, CanonicalOperation,
+    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id,
+    CanonicalOperation,
 };
 use catbird_mls::orchestrator::direct_request_bootstrap::{
     DirectRequestBootstrap, DirectRequestIntroductionResult, DirectRequestWelcomeInput,
@@ -1287,6 +1289,27 @@ impl WasmMlsClient {
         .map_err(|e| MLSError::invalid_input(format!("C33 importUntil: {e}")))?
         .timestamp()
         .max(0) as u64;
+        let opening_commitment: [u8; 32] = chat_wire::json_bytes(&vp["archiveCommitment"])?
+            .try_into()
+            .map_err(|_| {
+                MLSError::Cryptography("C33 archiveCommitment must be 32 bytes".into())
+            })?;
+        let original_sender_attestation =
+            OriginalSenderArchiveAttestationEnvelope::from_aad_json(
+                vp.get("originalSenderAttestation").ok_or_else(|| {
+                    MLSError::Cryptography(
+                        "C33 publication missing original sender attestation".into(),
+                    )
+                })?,
+            )?;
+        if original_sender_attestation.sender_did != sender_did
+            || original_sender_attestation.sender_device_id != sender_device_id
+        {
+            return Err(MLSError::Cryptography(
+                "C33 original sender attestation attribution mismatch".into(),
+            ));
+        }
+        original_sender_attestation.verify(cid, first_message_id, &opening_commitment)?;
 
         let bootstrap = DirectRequestBootstrap {
             context_json,
@@ -1303,11 +1326,8 @@ impl WasmMlsClient {
                 &artifact["metadataSnapshot"]["ciphertext"],
             )?,
             initial_ciphertext: chat_wire::json_bytes(&artifact["initialCiphertext"])?,
-            archive_commitment: chat_wire::json_bytes(&vp["archiveCommitment"])?
-                .try_into()
-                .map_err(|_| {
-                    MLSError::Cryptography("C33 archiveCommitment must be 32 bytes".into())
-                })?,
+            archive_commitment: opening_commitment,
+            original_sender_attestation,
             opening: None,
         };
         let publication_receipt = raw_dr_entry.get("publicationReceipt").ok_or_else(|| {
@@ -1517,6 +1537,15 @@ impl WasmMlsClient {
                     mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
                     frame_nonce_b64: Some(STANDARD.encode(opening.frame_nonce)),
                     sequencer_receipt_json: Some(dr_rcpt_json),
+                    original_sender_attestation_json: Some(
+                        serde_json::to_string(&bootstrap.original_sender_attestation).map_err(
+                            |error| {
+                                MLSError::Internal(format!(
+                                    "serialize C33 original sender attestation: {error}"
+                                ))
+                            },
+                        )?,
+                    ),
                     created_at_ms: ts,
                 };
                 tx.put_labyrinth_state(
@@ -2712,6 +2741,20 @@ impl WasmMlsClient {
                         .map_err(|e| MLSError::Cryptography(format!("decrypt app msg: {e:?}")))?;
                     let sender_cred = processed.credential().clone();
                     let aad_bytes = processed.aad().to_vec();
+                    let signed_aad =
+                        canonical_application_aad_bytes(body.get("aad").ok_or_else(|| {
+                            MLSError::Cryptography("signed application body missing MLS AAD".into())
+                        })?)
+                        .map_err(|error| {
+                            MLSError::Cryptography(format!(
+                                "invalid signed application AAD: {error}"
+                            ))
+                        })?;
+                    if signed_aad != aad_bytes {
+                        return Err(MLSError::Cryptography(
+                            "decrypted MLS AAD differs from signed outer application AAD".into(),
+                        ));
+                    }
                     let member = group
                         .members()
                         .find(|m| {
@@ -2727,6 +2770,13 @@ impl WasmMlsClient {
                         member.signature_key.as_slice(),
                         &peer_map,
                     )?;
+                    if body["actorDid"].as_str() != Some(sender_did.as_str())
+                        || body["actorDeviceId"].as_str() != Some(sender_dev_id.as_str())
+                    {
+                        return Err(MLSError::Cryptography(
+                            "verified outer sender differs from decrypted MLS sender".into(),
+                        ));
+                    }
                     let ProcessedMessageContent::ApplicationMessage(app_msg) =
                         processed.into_content()
                     else {
@@ -2737,13 +2787,36 @@ impl WasmMlsClient {
                         .map_err(|e| {
                             MLSError::Cryptography(format!("application archive envelope: {e}"))
                         })?;
-                    let (_display_body, json_str, verified_commitment_opt) =
-                        extract_plaintext_body_and_verify_aad(&app_bytes, &aad_bytes)?;
+                    let (
+                        _display_body,
+                        json_str,
+                        verified_commitment_opt,
+                        original_sender_attestation,
+                    ) = extract_plaintext_body_and_verify_aad(&app_bytes, &aad_bytes)?;
                     let verified_commitment = verified_commitment_opt.ok_or_else(|| {
                         MLSError::Cryptography(
                             "I13: applicationEntry missing verified AAD archiveCommitment".into(),
                         )
                     })?;
+                    let original_sender_attestation =
+                        original_sender_attestation.ok_or_else(|| {
+                            MLSError::Cryptography(
+                                "application message missing original sender archive attestation"
+                                    .into(),
+                            )
+                        })?;
+                    if original_sender_attestation.sender_did != sender_did
+                        || original_sender_attestation.sender_device_id != sender_dev_id
+                        || original_sender_attestation
+                            .sender_transport_public_key
+                            .as_slice()
+                            != member.signature_key.as_slice()
+                    {
+                        return Err(MLSError::Cryptography(
+                            "original sender attestation differs from decrypted MLS sender leaf"
+                                .into(),
+                        ));
+                    }
                     let (rcpt_seq, _, stored_receipt) =
                         chat_wire::parse_and_verify_i13_sequencer_receipt(
                             rcpt_val,
@@ -2753,7 +2826,9 @@ impl WasmMlsClient {
                             &c.group_id,
                             msg_epoch.max(0) as u64,
                             expected_rcpt_entry_id,
+                            msg_id,
                             &verified_commitment,
+                            Some(&original_sender_attestation),
                         )?;
                     if rcpt_seq as i64 != entry_seq {
                         return Err(MLSError::Cryptography(format!(
@@ -2782,6 +2857,15 @@ impl WasmMlsClient {
                         mls_ciphertext_b64: STANDARD.encode(&ct_bytes),
                         frame_nonce_b64: Some(STANDARD.encode(inner.frame_nonce)),
                         sequencer_receipt_json: Some(stored_receipt),
+                        original_sender_attestation_json: Some(
+                            serde_json::to_string(&original_sender_attestation).map_err(
+                                |error| {
+                                    MLSError::Internal(format!(
+                                        "serialize original sender archive attestation: {error}"
+                                    ))
+                                },
+                            )?,
+                        ),
                         created_at_ms: ts,
                     };
 

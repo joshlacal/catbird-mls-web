@@ -9,6 +9,7 @@ use base64::Engine as _;
 use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::signatures::Signer as _;
 use openmls_traits::OpenMlsProvider;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -19,7 +20,10 @@ use catbird_mls::client::chat_wire;
 use catbird_mls::client::{normalize_account_did, QueuedLabyrinthArchivePayload};
 use catbird_mls::groups::lifecycle::{enforce_admin_removal_policy, MemberRole};
 use catbird_mls::groups::metadata_v1::validate_metadata_snapshot_size;
-use catbird_mls::messaging::receive::{PrivateMessageAadEnvelope, PrivateMessagePlaintextEnvelope};
+use catbird_mls::messaging::receive::{
+    OriginalSenderArchiveAttestationEnvelope, PrivateMessageAadEnvelope,
+    PrivateMessagePlaintextEnvelope,
+};
 use catbird_mls::metadata::{
     derive_metadata_key_from_group, encrypt_metadata_snapshot_with_nonce, GroupMetadataV1,
 };
@@ -717,6 +721,16 @@ impl WasmMlsClient {
         publish_body["next"] = bootstrap.coordinates.clone();
         publish_body["importUntil"] = json!(import_until_str);
         publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
+        publish_body["originalSenderAttestation"] = json!({
+            "senderDid": bootstrap.original_sender_attestation.sender_did,
+            "senderDeviceId": bootstrap.original_sender_attestation.sender_device_id,
+            "senderTransportPubkey": STANDARD.encode(
+                &bootstrap
+                    .original_sender_attestation
+                    .sender_transport_public_key
+            ),
+            "signature": STANDARD.encode(&bootstrap.original_sender_attestation.signature),
+        });
         publish_body["artifacts"] = json!({
             "genesisGroupInfo": artifact(&bootstrap.genesis_group_info, "groupInfo"),
             "addCommit": artifact(&bootstrap.add_commit, "publicMessageCommit"),
@@ -842,6 +856,15 @@ impl WasmMlsClient {
                 mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
                 frame_nonce_b64: None,
                 sequencer_receipt_json: None,
+                original_sender_attestation_json: Some(
+                    serde_json::to_string(&bootstrap.original_sender_attestation).map_err(
+                        |error| {
+                            MLSError::Internal(format!(
+                                "serialize C33 original sender attestation: {error}"
+                            ))
+                        },
+                    )?,
+                ),
                 created_at_ms: ts,
             };
             tx.put_account_meta(
@@ -1240,11 +1263,6 @@ impl WasmMlsClient {
 
         let canonical_convo_id = convo_uuid.hyphenated().to_string();
         let canonical_msg_id = msg_uuid.hyphenated().to_string();
-        let inner_plaintext = serde_json::to_vec(&PrivateMessagePlaintextEnvelope {
-            frame_nonce,
-            canonical_payload_bytes: frame_json.as_bytes().to_vec(),
-        })
-        .map_err(|e| MLSError::Internal(e.to_string()))?;
 
         let prior_coords = self.load_or_build_conversation_coords(&canonical_convo_id)?;
         let generation = prior_coords["generation"].as_i64().unwrap_or(0);
@@ -1263,6 +1281,7 @@ impl WasmMlsClient {
             aad_json,
             kv_batch,
             sender_members,
+            original_sender_attestation,
         ) = {
             let backend = db.backend();
             let convo = backend
@@ -1280,6 +1299,37 @@ impl WasmMlsClient {
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(1)
                 .max(1);
+            let attestation_transcript =
+                labyrinth_protocol::transcripts::original_sender_archive_transcript(
+                    &canonical_convo_id,
+                    &canonical_msg_id,
+                    &archive_commitment,
+                );
+            let original_sender_attestation = OriginalSenderArchiveAttestationEnvelope {
+                sender_did: self.account_did.clone(),
+                sender_device_id: canonical_dev_id.clone(),
+                sender_transport_public_key: signer.public().to_vec(),
+                signature: signer.sign(&attestation_transcript).map_err(|error| {
+                    MLSError::Cryptography(format!(
+                        "sign original sender archive attestation: {error:?}"
+                    ))
+                })?,
+            };
+            original_sender_attestation.verify(
+                &canonical_convo_id,
+                &canonical_msg_id,
+                &archive_commitment,
+            )?;
+            let inner_plaintext = serde_json::to_vec(&PrivateMessagePlaintextEnvelope {
+                frame_nonce,
+                canonical_payload_bytes: frame_json.as_bytes().to_vec(),
+                original_sender_attestation: Some(original_sender_attestation.clone()),
+            })
+            .map_err(|error| {
+                MLSError::Internal(format!(
+                    "serialize PrivateMessagePlaintextEnvelope: {error}"
+                ))
+            })?;
             let aad_prior = chat_wire::build_aad_prior_coordinate(
                 &convo_uuid,
                 &convo.group_id,
@@ -1296,6 +1346,7 @@ impl WasmMlsClient {
                 "messageId": STANDARD.encode(msg_uuid.as_bytes()),
                 "prior": aad_prior,
                 "archiveCommitment": { "$bytes": STANDARD.encode(archive_commitment) },
+                "originalSenderAttestation": original_sender_attestation.to_aad_json(),
             });
             let aad_bytes = canonical_application_aad_bytes(&aad_val).map_err(|e| {
                 MLSError::Cryptography(format!("canonical_application_aad_bytes: {e}"))
@@ -1326,6 +1377,7 @@ impl WasmMlsClient {
                 aad_val,
                 overlay.into_batch(),
                 members,
+                original_sender_attestation,
             )
         };
 
@@ -1394,7 +1446,9 @@ impl WasmMlsClient {
                 &convo_snapshot.group_id,
                 msg_epoch.max(0) as u64,
                 expected_entry_id,
+                &canonical_msg_id,
                 &archive_commitment,
+                Some(&original_sender_attestation),
             )?;
         let authoritative_seq = rcpt_seq as i64;
 
@@ -1443,6 +1497,13 @@ impl WasmMlsClient {
                 mls_ciphertext_b64: STANDARD.encode(&ciphertext_bytes),
                 frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
                 sequencer_receipt_json: Some(archived_json),
+                original_sender_attestation_json: Some(
+                    serde_json::to_string(&original_sender_attestation).map_err(|error| {
+                        MLSError::Internal(format!(
+                            "serialize original sender archive attestation: {error}"
+                        ))
+                    })?,
+                ),
                 created_at_ms: ts,
             };
             let queued_bytes =

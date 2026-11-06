@@ -24,7 +24,7 @@ Requires `wasm-pack` and the `wasm32-unknown-unknown` target (pinned in `rust-to
 ./test-tooling-config.sh # guard against Unix-only global Cargo overrides
 ```
 
-Both emit to `pkg/` (gitignored, regenerated from source). `build.sh` runs `wasm-opt -Oz` only if `wasm-opt` is on `PATH` — it is skipped otherwise (currently not installed locally, so release builds ship un-`wasm-opt`'d unless you install binaryen).
+Both emit to `pkg/` (gitignored, regenerated from source). `build.sh` runs `wasm-opt -Oz` only if `wasm-opt` is on `PATH` and skips that final pass otherwise; install binaryen for size-sensitive builds.
 
 Fast iteration without producing a package:
 
@@ -125,8 +125,8 @@ Browser apps **MUST** call `catbird_mls_start_background_tasks(interval_ms)` onc
 - **Voice/media not exposed.** No audio codecs in the WASM surface; `audiopus_sys` is not a dependency of this crate.
 - **getrandom triple-pin.** `Cargo.toml` declares `getrandom` 0.2 (`js`), 0.3 and 0.4 (`wasm_js`) under aliases so Cargo unifies WASM RNG features across semver-incompatible versions pulled by `hpke-rs`/`rand`. Don't remove these.
 - `wasm-opt` absence silently downgrades `build.sh` to a non-optimized release artifact — install binaryen for size-sensitive builds.
-- **Vendored contract artifacts.** `src/generated/blue.catbird.chat.defs.json` and the signing/contract vector fixtures are byte copies from `catbird-mls`, synced by `python3 scripts/sync-chat-artifacts.py --core-revision <rev>` (which also rewrites `tests/fixtures/chat-artifact-provenance.json`). `cargo test --test provenance` (native) fails on drift. The current unsealed Task 4 R2 artifact candidate records exact `catbird-mls` revision `67b007901061a356fc94b16d81a5cb6d5d0e2c54`; `pkg/` was rebuilt from that source with `catbird-atproto` `a6986331eee54f3f0ce16e7ea07dda63ab581dd7` and `labyrinth` `c8a6f6c76fd3ffe84137b5508a20a8258496f2ba`. It is not a published or release-qualified artifact; re-sync and rebuild after any source change.
-- **Known WASM failures.** The Task 4 R2 artifact gate retains only the three dedicated-worker OPFS window-runner failures and two unsupported blob-operation fixtures as exact-parent baselines; every other Firefox target passes.
+- **Vendored contract artifacts.** `src/generated/blue.catbird.chat.defs.json` and the signing/contract vector fixtures are byte copies from `catbird-mls`, synced by `python3 scripts/sync-chat-artifacts.py --core-revision <rev>` (which also rewrites `tests/fixtures/chat-artifact-provenance.json`). `cargo test --test provenance` (native) fails on drift. The current unsealed Task 4 R3 artifact candidate records exact `catbird-mls` revision `4078ac996aef9f8d2964000162551045fdbde374`; `pkg/` was rebuilt from that source with `catbird-atproto` `8ead5353ab42a9b48dd46a1be70515dc87592273` and `labyrinth` `c32ea45480c9fad875c57ceb79333df68d969c3d`. It is not a published or release-qualified artifact; re-sync and rebuild after any source change.
+- **Known WASM failures.** The Task 4 R3 artifact gate retains only the same three dedicated-worker OPFS window-runner failures and two unsupported blob-operation fixtures as the exact R2 baseline; every other Firefox target passes.
 
 ## Coding Style
 

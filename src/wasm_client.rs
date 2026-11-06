@@ -335,6 +335,12 @@ impl WasmMlsClient {
                         has_passkey_prf: false,
                         epoch_seq: 1,
                         active_device_ids: vec![canonical_device_id.clone()],
+                        recovery_method_stale: false,
+                        rotation_exclusions: Vec::new(),
+                        pending_directory_epoch: None,
+                        directory_publication_stalled: false,
+                        directory_publication_retry_count: 0,
+                        directory_publication_error: None,
                     };
                     tx.put_labyrinth_state(
                         "status_json",
@@ -575,6 +581,12 @@ impl WasmMlsClient {
                 has_passkey_prf: false,
                 epoch_seq: 0,
                 active_device_ids: vec![self.device_id.clone()],
+                recovery_method_stale: false,
+                rotation_exclusions: Vec::new(),
+                pending_directory_epoch: None,
+                directory_publication_stalled: false,
+                directory_publication_retry_count: 0,
+                directory_publication_error: None,
             },
         };
         to_js_val(&status)

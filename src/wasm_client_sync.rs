@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use catbird_mls::chat_v2::ids::BareDid;
 use catbird_mls::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
+use catbird_mls::chat_v2::transcript::SignedMutationKind;
 use catbird_mls::client::chat_wire;
 use catbird_mls::client::{LabyrinthBackupStatus, QueuedLabyrinthArchivePayload};
 use catbird_mls::messaging::receive::{
@@ -100,6 +101,30 @@ fn pruned_direct_request_participants<'a>(
         return Err(missing("state participant binding"));
     }
     Ok((sender_did, recipient_did))
+}
+
+/// The sender of an application entry whose outer signed request verifies under that device's
+/// PDS key (`I4`) and binds this conversation and message id; `None` otherwise.
+fn verified_application_sender(
+    signed_request: &Value,
+    peer_map: &BTreeMap<String, Vec<(String, Vec<u8>)>>,
+    conversation_id: &str,
+    message_id: &str,
+) -> Option<(String, String)> {
+    let body = signed_request.get("body")?;
+    let (did, device) = (body["actorDid"].as_str()?, body["actorDeviceId"].as_str()?);
+    let (_, key) = peer_map.get(did)?.iter().find(|(id, _)| id == device)?;
+    let verified = chat_wire::verify_signed_mutation_body(
+        signed_request,
+        SignedMutationKind::ApplicationSend,
+        key,
+    )
+    .ok()?;
+    (verified["actorDid"] == did
+        && verified["actorDeviceId"] == device
+        && verified["messageId"] == message_id
+        && verified["prior"]["conversationId"] == conversation_id)
+        .then(|| (did.to_owned(), device.to_owned()))
 }
 
 impl WasmMlsClient {
@@ -2257,6 +2282,42 @@ impl WasmMlsClient {
         Ok(fulfilled)
     }
 
+    /// Record a sequenced application entry this device can never decrypt: evidence and a system
+    /// gap row at its seq, so the timeline shows the gap and sync moves on to later Commits. A
+    /// stored message keeps its row. No archive or witness copy exists (no plaintext).
+    fn record_undecryptable_entry(
+        &self,
+        evidence: &chat_wire::UndecryptableEntryEvidence,
+    ) -> Result<(), MLSError> {
+        let cid = evidence.conversation_id.as_str();
+        self.require_db_mls()?.write_tx(|tx| {
+            let Some(mut convo) = tx.get_conversation(cid)? else {
+                return Ok(());
+            };
+            let stored = tx
+                .exists(
+                    "SELECT 1 FROM messages WHERE message_id = ?1 LIMIT 1",
+                    &[(1, evidence.message_id.as_str())],
+                )
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            if !stored {
+                let is_own = evidence.sender_did == self.account_did;
+                tx.insert_message(&evidence.gap_row(&convo.group_id, is_own)?)?;
+                tx.put_labyrinth_state(
+                    &chat_wire::undecryptable_evidence_key(cid, &evidence.message_id),
+                    &serde_json::to_vec(evidence)?,
+                    evidence.recorded_at_ms,
+                )?;
+                if !is_own {
+                    convo.unread_count = convo.unread_count.saturating_add(1);
+                }
+            }
+            convo.last_seq = convo.last_seq.max(evidence.seq);
+            convo.updated_at_ms = evidence.recorded_at_ms;
+            tx.upsert_conversation(&convo)
+        })
+    }
+
     pub(crate) async fn sync_conversation_entries(
         &self,
         session_token: &str,
@@ -2717,8 +2778,40 @@ impl WasmMlsClient {
                         "I13: sequencer receipt public key was not pre-resolved".into(),
                     )
                 })?;
+                let journal_key = crate::wasm_client_mutations::pending_send_key(cid, msg_id);
+                if let Some(raw) = db.backend().get_account_meta(&journal_key)? {
+                    let pending: crate::wasm_client_mutations::PendingApplicationSend =
+                        serde_json::from_str(&raw)
+                            .map_err(|e| MLSError::Internal(format!("parse send journal: {e}")))?;
+                    if pending.archive.sender_did != self.account_did
+                        || pending.archive.sender_device_id != canonical_dev_id
+                        || STANDARD
+                            .decode(&pending.archive.mls_ciphertext_b64)
+                            .ok()
+                            .as_deref()
+                            != Some(ct_bytes.as_slice())
+                    {
+                        return Err(MLSError::Cryptography(
+                            "send journal does not match sequenced application ciphertext".into(),
+                        ));
+                    }
+                    // Own MLS ciphertext is not decryptable. A send whose response was lost is
+                    // recovered only from its exact journal, with the same I13 receipt checks.
+                    self.finish_application_send(
+                        pending,
+                        rcpt_val,
+                        expected_rcpt_entry_id,
+                        rcpt_sec1,
+                        Some(entry_seq),
+                    )?;
+                    max_seq = max_seq.max(entry_seq);
+                    applied_count = applied_count.saturating_add(1);
+                    continue;
+                }
 
-                db.write_tx(|tx| {
+                // Set only when OpenMLS can never open this current-epoch entry for this device.
+                let mut undecryptable = None;
+                let decrypt_result = db.write_tx(|tx| {
                     let Some(mut c) = tx.get_conversation(cid)? else {
                         return Ok(());
                     };
@@ -2736,9 +2829,14 @@ impl WasmMlsClient {
                         .try_into_protocol_message()
                         .map_err(|e| MLSError::Cryptography(format!("app protocol msg: {e:?}")))?;
                     let msg_epoch = proto.epoch().as_u64() as i64;
-                    let processed = group
-                        .process_message(&provider, proto)
-                        .map_err(|e| MLSError::Cryptography(format!("decrypt app msg: {e:?}")))?;
+                    let current_epoch = proto.epoch() == group.epoch();
+                    let processed = group.process_message(&provider, proto).map_err(|e| {
+                        if current_epoch {
+                            undecryptable = chat_wire::permanent_decrypt_failure(&e)
+                                .map(|reason| (reason, msg_epoch));
+                        }
+                        MLSError::Cryptography(format!("decrypt app msg: {e:?}"))
+                    })?;
                     let sender_cred = processed.credential().clone();
                     let aad_bytes = processed.aad().to_vec();
                     let signed_aad =
@@ -2893,7 +2991,33 @@ impl WasmMlsClient {
                     }
                     c.updated_at_ms = ts;
                     tx.upsert_conversation(&c)
-                })?;
+                });
+                if let (Err(_), Some((reason, epoch))) = (&decrypt_result, undecryptable) {
+                    // Never fail-stop or force a rejoin here: later entries, Commits above all,
+                    // must still apply. The failed attempt rolled back; record the gap instead,
+                    // but only for an entry whose outer signed request verifies.
+                    if let Some((sender_did, sender_device_id)) =
+                        verified_application_sender(signed_req, &peer_map, cid, msg_id)
+                    {
+                        let evidence = chat_wire::UndecryptableEntryEvidence {
+                            version: 1,
+                            conversation_id: cid.to_owned(),
+                            message_id: msg_id.to_owned(),
+                            entry_id: expected_rcpt_entry_id.to_owned(),
+                            seq: entry_seq,
+                            epoch,
+                            sender_did,
+                            sender_device_id,
+                            reason: reason.to_owned(),
+                            recorded_at_ms: ts,
+                        };
+                        self.record_undecryptable_entry(&evidence)?;
+                        max_seq = max_seq.max(entry_seq);
+                        applied_count = applied_count.saturating_add(1);
+                        continue;
+                    }
+                }
+                decrypt_result?;
                 max_seq = max_seq.max(entry_seq);
                 applied_count = applied_count.saturating_add(1);
                 continue;

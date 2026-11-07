@@ -69,6 +69,20 @@ fn uuid_v4(raw: &str, field: &str) -> Result<uuid::Uuid, MLSError> {
         .ok_or_else(|| MLSError::invalid_input(format!("{field} must be a UUIDv4")))
 }
 
+/// Send journal: the exact signed body and archive copy of one reserved MLS generation, written in
+/// the write transaction that advances the sender ratchet and `sendCounter`, before any HTTP.
+/// Retries resubmit these bytes; only `StaleSend` replaces them with a fresh frame.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingApplicationSend {
+    pub(crate) body: Value,
+    pub(crate) archive: QueuedLabyrinthArchivePayload,
+}
+
+/// `account_meta` key of the send journal for `message_id` in `conversation_id`.
+pub(crate) fn pending_send_key(conversation_id: &str, message_id: &str) -> String {
+    format!("application_send:{conversation_id}:{message_id}")
+}
+
 impl WasmMlsClient {
     /// `mls-ds` bootstrap, mirroring catbird-mls `enroll_device_live`: completion is bound to
     /// `auth_generation`, the canonical device ID and signer key. A retry after a lost response
@@ -1253,6 +1267,138 @@ impl WasmMlsClient {
         let msg_uuid = uuid_v4(message_id, "messageId")?;
         let (session_token, canonical_dev_id) = self.require_live_session()?;
         let (display_json, frame_json) = canonical_labyrinth_frame_for_text(text);
+        let canonical_msg_id = msg_uuid.hyphenated().to_string();
+        let reserve = |discard_refused| {
+            self.reserve_application_send(
+                convo_uuid,
+                msg_uuid,
+                &canonical_dev_id,
+                &display_json,
+                &frame_json,
+                discard_refused,
+            )
+        };
+
+        let (mut signer, mut auth_gen, mut pending) = reserve(false)?;
+        let resp_val = match self
+            .submit_application_send(
+                &session_token,
+                &canonical_dev_id,
+                &signer,
+                auth_gen,
+                &pending,
+            )
+            .await
+        {
+            // `mls-ds` already sequenced a newer send from this device and refuses these bytes
+            // for good. Send the same message id once more as a fresh frame and counter.
+            Err(error) if chat_wire::is_stale_send(&error) => {
+                (signer, auth_gen, pending) = reserve(true)?;
+                self.submit_application_send(
+                    &session_token,
+                    &canonical_dev_id,
+                    &signer,
+                    auth_gen,
+                    &pending,
+                )
+                .await?
+            }
+            result => result?,
+        };
+
+        let receipt_val = resp_val
+            .get("sequencerReceipt")
+            .or_else(|| {
+                resp_val
+                    .get("entry")
+                    .and_then(|e| e.get("sequencerReceipt"))
+            })
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| {
+                MLSError::Cryptography(
+                    "sendMessage response missing mandatory sequencerReceipt (I13)".into(),
+                )
+            })?;
+        let kid = receipt_val
+            .get("kid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("#mls-receipt-1");
+        let sec1_key = self
+            .fetch_sequencer_receipt_key_sec1(&session_token, &pending.archive.sequencer_did, kid)
+            .await?;
+        let expected_entry_id = resp_val
+            .pointer("/entry/entryId")
+            .and_then(|v| v.as_str())
+            .or_else(|| receipt_val.get("entryId").and_then(|v| v.as_str()))
+            .unwrap_or(&canonical_msg_id);
+        let (final_row, gap_convo_opt) =
+            self.finish_application_send(pending, receipt_val, expected_entry_id, &sec1_key, None)?;
+
+        if let Some(gap_convo) = gap_convo_opt {
+            let _ = self
+                .sync_conversation_entries(
+                    &session_token,
+                    &canonical_dev_id,
+                    &signer,
+                    auth_gen,
+                    &gap_convo,
+                )
+                .await;
+        }
+
+        let _ = self.flush_labyrinth_queue_impl().await;
+        Ok(final_row)
+    }
+
+    /// POST one journaled send (`I6`: strictly outside `write_tx`). `mls-ds` refuses an
+    /// out-of-order send with protocol error `StaleSend`, surfaced as
+    /// `MLSError::InvalidState("StaleSend")` whatever the HTTP status.
+    async fn submit_application_send(
+        &self,
+        session_token: &str,
+        canonical_dev_id: &str,
+        signer: &SignatureKeyPair,
+        auth_gen: i64,
+        pending: &PendingApplicationSend,
+    ) -> Result<Value, MLSError> {
+        self.submit_signed_chat_op(
+            session_token,
+            canonical_dev_id,
+            Some(auth_gen),
+            CanonicalOperation::SendMessage,
+            &pending.body,
+            signer,
+        )
+        .await
+        .map_err(|error| match &error {
+            // `ds_post_json` failure: "POST <nsid> returned HTTP <status>: <protocol error JSON>".
+            MLSError::Internal(message)
+                if message
+                    .split_once(": ")
+                    .and_then(|(_, body)| serde_json::from_str::<Value>(body).ok())
+                    .is_some_and(|body| body["error"] == chat_wire::STALE_SEND) =>
+            {
+                MLSError::InvalidState(chat_wire::STALE_SEND.into())
+            }
+            _ => error,
+        })
+    }
+
+    /// Reserve the sender generation, `sendCounter` and send journal in one write transaction
+    /// before any HTTP. A lost response can still publish the ciphertext, so rolling the ratchet
+    /// back would reuse its key and nonce. An existing journal for the message is returned
+    /// unchanged unless `discard_refused` drops it (`StaleSend` refused those bytes for good).
+    fn reserve_application_send(
+        &self,
+        convo_uuid: uuid::Uuid,
+        msg_uuid: uuid::Uuid,
+        canonical_dev_id: &str,
+        display_json: &str,
+        frame_json: &str,
+        discard_refused: bool,
+    ) -> Result<(SignatureKeyPair, i64, PendingApplicationSend), MLSError> {
+        let canonical_convo_id = convo_uuid.hyphenated().to_string();
+        let canonical_msg_id = msg_uuid.hyphenated().to_string();
         let mut frame_nonce = [0u8; 32];
         getrandom::getrandom(&mut frame_nonce)
             .map_err(|e| MLSError::Internal(format!("getrandom: {e}")))?;
@@ -1261,44 +1407,52 @@ impl WasmMlsClient {
                 .archive_commitment;
         let ts = now_ms();
 
-        let canonical_convo_id = convo_uuid.hyphenated().to_string();
-        let canonical_msg_id = msg_uuid.hyphenated().to_string();
-
         let prior_coords = self.load_or_build_conversation_coords(&canonical_convo_id)?;
         let generation = prior_coords["generation"].as_i64().unwrap_or(0);
         let state_version = prior_coords["stateVersion"].as_i64().unwrap_or(0);
         let epoch_u64 = prior_coords["epoch"].as_u64().unwrap_or(0);
         let gch = chat_wire::json_bytes(&prior_coords["groupContextHash"])?;
         let ctag = chat_wire::json_bytes(&prior_coords["confirmationTag"])?;
-        let db = self.require_db_mls()?;
+        let journal_key = pending_send_key(&canonical_convo_id, &canonical_msg_id);
 
-        let (
-            signer,
-            auth_gen,
-            convo_snapshot,
-            msg_epoch,
-            ciphertext_bytes,
-            aad_json,
-            kv_batch,
-            sender_members,
-            original_sender_attestation,
-        ) = {
-            let backend = db.backend();
-            let convo = backend
-                .get_conversation(&canonical_convo_id)?
-                .ok_or_else(|| {
-                    MLSError::group_not_found(format!("missing {canonical_convo_id}"))
-                })?;
-            let signer_raw = backend
+        self.require_db_mls()?.write_tx(|tx| {
+            let convo = tx.get_conversation(&canonical_convo_id)?.ok_or_else(|| {
+                MLSError::group_not_found(format!("missing {canonical_convo_id}"))
+            })?;
+            let signer_raw = tx
                 .get_labyrinth_state("device_signer_json")?
                 .ok_or_else(|| MLSError::InvalidState("WasmMlsClient not enrolled".into()))?;
             let signer: SignatureKeyPair = serde_json::from_slice(&signer_raw)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
-            let auth_gen = backend
+            if discard_refused {
+                tx.delete_account_meta(&journal_key)?;
+            }
+            if let Some(raw) = tx.get_account_meta(&journal_key)? {
+                let pending: PendingApplicationSend = serde_json::from_str(&raw)
+                    .map_err(|e| MLSError::Internal(format!("parse send journal: {e}")))?;
+                if pending.archive.plaintext_json != display_json
+                    || pending.archive.sender_device_id != canonical_dev_id
+                {
+                    return Err(MLSError::invalid_input(
+                        "messageId already reserved for a different send",
+                    ));
+                }
+                let auth_gen = pending.body["authGeneration"].as_i64().ok_or_else(|| {
+                    MLSError::Internal("send journal missing authGeneration".into())
+                })?;
+                return Ok((signer, auth_gen, pending));
+            }
+            let auth_gen = tx
                 .get_account_meta("auth_generation")?
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(1)
                 .max(1);
+            // Strictly above every counter this device signed here, so `mls-ds` sequences its
+            // sends in MLS generation order; persisted with this frame's ratchet advance below.
+            let counter_key = chat_wire::send_counter_key(&canonical_convo_id);
+            let send_counter =
+                chat_wire::next_send_counter(tx.get_account_meta(&counter_key)?.as_deref())?;
+
             let attestation_transcript =
                 labyrinth_protocol::transcripts::original_sender_archive_transcript(
                     &canonical_convo_id,
@@ -1307,7 +1461,7 @@ impl WasmMlsClient {
                 );
             let original_sender_attestation = OriginalSenderArchiveAttestationEnvelope {
                 sender_did: self.account_did.clone(),
-                sender_device_id: canonical_dev_id.clone(),
+                sender_device_id: canonical_dev_id.to_string(),
                 sender_transport_public_key: signer.public().to_vec(),
                 signature: signer.sign(&attestation_transcript).map_err(|error| {
                     MLSError::Cryptography(format!(
@@ -1351,115 +1505,148 @@ impl WasmMlsClient {
             let aad_bytes = canonical_application_aad_bytes(&aad_val).map_err(|e| {
                 MLSError::Cryptography(format!("canonical_application_aad_bytes: {e}"))
             })?;
-            let overlay = KvWriteOverlay::new(backend);
-            let (ciphertext, group_epoch, members) = {
-                let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
-                let mut group =
-                    MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
-                        .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
-                        .ok_or_else(|| MLSError::group_not_found("missing MlsGroup"))?;
-                group.set_aad(aad_bytes);
-                let mls_out = group
-                    .create_message(&provider, &signer, &inner_plaintext)
-                    .map_err(|e| MLSError::Cryptography(format!("create_message: {e:?}")));
-                group.set_aad(Vec::new());
-                let ct = mls_out?
-                    .tls_serialize_detached()
-                    .map_err(|e| MLSError::Internal(format!("serialize msg: {e:?}")))?;
-                (ct, group.epoch().as_u64() as i64, member_root_dids(&group)?)
+
+            let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
+            let mut group =
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                    .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+                    .ok_or_else(|| MLSError::group_not_found("missing MlsGroup"))?;
+            group.set_aad(aad_bytes);
+            let mls_out = group
+                .create_message(&provider, &signer, &inner_plaintext)
+                .map_err(|e| MLSError::Cryptography(format!("create_message: {e:?}")));
+            group.set_aad(Vec::new());
+            let ciphertext = mls_out?
+                .tls_serialize_detached()
+                .map_err(|e| MLSError::Internal(format!("serialize msg: {e:?}")))?;
+
+            let body = json!({
+                "$type": "blue.catbird.chat.defs#applicationSendBody",
+                "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
+                "messageId": canonical_msg_id,
+                "actorDid": self.account_did,
+                "actorDeviceId": canonical_dev_id,
+                "keyId": derive_key_id(signer.public()),
+                "authGeneration": auth_gen,
+                "sendCounter": send_counter,
+                "signedAt": chat_wire::now_rfc3339_millis(),
+                "prior": prior_coords,
+                "aad": aad_val,
+                "applicationMessage": {
+                    "framing": "mlsMessage",
+                    "contentType": "privateMessageApplication",
+                    "bytes": { "$bytes": STANDARD.encode(&ciphertext) },
+                    "sha256": { "$bytes": STANDARD.encode(Sha256::digest(&ciphertext)) },
+                },
+                "blobBindings": [],
+            });
+            let pending = PendingApplicationSend {
+                body,
+                archive: QueuedLabyrinthArchivePayload {
+                    version: 1,
+                    message_id: canonical_msg_id.clone(),
+                    conversation_id: canonical_convo_id.clone(),
+                    group_id_hex: hex::encode(&convo.group_id),
+                    epoch: group.epoch().as_u64() as i64,
+                    expected_member_dids: member_root_dids(&group)?,
+                    seq: 0,
+                    sender_did: self.account_did.clone(),
+                    sender_device_id: canonical_dev_id.to_string(),
+                    sequencer_did: convo.sequencer_did,
+                    space_uri: convo.space_uri,
+                    plaintext_json: display_json.to_string(),
+                    labyrinth_frame_json: frame_json.to_string(),
+                    mls_ciphertext_b64: STANDARD.encode(&ciphertext),
+                    frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
+                    sequencer_receipt_json: None,
+                    original_sender_attestation_json: Some(
+                        serde_json::to_string(&original_sender_attestation).map_err(|error| {
+                            MLSError::Internal(format!(
+                                "serialize original sender archive attestation: {error}"
+                            ))
+                        })?,
+                    ),
+                    created_at_ms: ts,
+                },
             };
-            (
-                signer,
-                auth_gen,
-                convo,
-                group_epoch,
-                ciphertext,
-                aad_val,
-                overlay.into_batch(),
-                members,
-                original_sender_attestation,
-            )
-        };
+            let journal = serde_json::to_string(&pending)
+                .map_err(|e| MLSError::Internal(format!("serialize send journal: {e}")))?;
+            tx.put_account_meta(&counter_key, &send_counter.to_string(), ts)?;
+            tx.put_account_meta(&journal_key, &journal, ts)?;
+            Ok((signer, auth_gen, pending))
+        })
+    }
 
-        let send_body = json!({
-            "$type": "blue.catbird.chat.defs#applicationSendBody",
-            "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
-            "messageId": canonical_msg_id,
-            "actorDid": self.account_did,
-            "actorDeviceId": canonical_dev_id,
-            "keyId": derive_key_id(signer.public()),
-            "authGeneration": auth_gen,
-            "signedAt": chat_wire::now_rfc3339_millis(),
-            "prior": prior_coords,
-            "aad": aad_json,
-            "applicationMessage": {
-                "framing": "mlsMessage",
-                "contentType": "privateMessageApplication",
-                "bytes": { "$bytes": STANDARD.encode(&ciphertext_bytes) },
-                "sha256": { "$bytes": STANDARD.encode(Sha256::digest(&ciphertext_bytes)) },
-            },
-            "blobBindings": [],
-        });
-
-        let resp_val = self
-            .submit_signed_chat_op(
-                &session_token,
-                &canonical_dev_id,
-                Some(auth_gen),
-                CanonicalOperation::SendMessage,
-                &send_body,
-                &signer,
-            )
-            .await?;
-
-        let receipt_val = resp_val
-            .get("sequencerReceipt")
-            .or_else(|| {
-                resp_val
-                    .get("entry")
-                    .and_then(|e| e.get("sequencerReceipt"))
-            })
-            .filter(|v| !v.is_null())
+    /// Store a sequenced journaled send after verifying its `I13` receipt: the local row,
+    /// archive evidence and Labyrinth outbox item land and the journal retires in one
+    /// transaction. `ordered_seq` is the entry seq when sync recovers a send whose response was
+    /// lost (own MLS ciphertext is not decryptable). Returns the conversation to gap-sync, if any.
+    pub(crate) fn finish_application_send(
+        &self,
+        pending: PendingApplicationSend,
+        receipt: &Value,
+        entry_id: &str,
+        receipt_key_sec1: &[u8],
+        ordered_seq: Option<i64>,
+    ) -> Result<(MessageRow, Option<ConversationRow>), MLSError> {
+        let mut queued = pending.archive;
+        let group_id = hex::decode(&queued.group_id_hex)
+            .map_err(|e| MLSError::Internal(format!("send journal group_id: {e}")))?;
+        let frame_nonce: [u8; 32] = STANDARD
+            .decode(queued.frame_nonce_b64.as_deref().unwrap_or_default())
+            .ok()
+            .and_then(|nonce| nonce.try_into().ok())
             .ok_or_else(|| {
-                MLSError::Cryptography(
-                    "sendMessage response missing mandatory sequencerReceipt (I13)".into(),
-                )
+                MLSError::Internal("send journal frame nonce must be 32 bytes".into())
             })?;
-        let kid = receipt_val
-            .get("kid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("#mls-receipt-1");
-        let sec1_key = self
-            .fetch_sequencer_receipt_key_sec1(&session_token, &convo_snapshot.sequencer_did, kid)
-            .await?;
-        let expected_entry_id = resp_val
-            .pointer("/entry/entryId")
-            .and_then(|v| v.as_str())
-            .or_else(|| receipt_val.get("entryId").and_then(|v| v.as_str()))
-            .unwrap_or(&canonical_msg_id);
+        let archive_commitment = PrivateMessageAadEnvelope::for_payload(
+            &frame_nonce,
+            queued.labyrinth_frame_json.as_bytes(),
+        )
+        .archive_commitment;
+        let original_sender_attestation: OriginalSenderArchiveAttestationEnvelope =
+            serde_json::from_str(
+                queued
+                    .original_sender_attestation_json
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+            .map_err(|error| {
+                MLSError::Cryptography(format!(
+                    "send journal original sender archive attestation: {error}"
+                ))
+            })?;
         let (rcpt_seq, _rcpt_gen, archived_json) =
             chat_wire::parse_and_verify_i13_sequencer_receipt(
-                receipt_val,
-                &sec1_key,
-                &convo_snapshot.sequencer_did,
-                &canonical_convo_id,
-                &convo_snapshot.group_id,
-                msg_epoch.max(0) as u64,
-                expected_entry_id,
-                &canonical_msg_id,
+                receipt,
+                receipt_key_sec1,
+                &queued.sequencer_did,
+                &queued.conversation_id,
+                &group_id,
+                queued.epoch.max(0) as u64,
+                entry_id,
+                &queued.message_id,
                 &archive_commitment,
                 Some(&original_sender_attestation),
             )?;
         let authoritative_seq = rcpt_seq as i64;
+        if ordered_seq.is_some_and(|expected| expected != authoritative_seq) {
+            return Err(MLSError::Cryptography(format!(
+                "I13: receipt seq {authoritative_seq} != entry seq {ordered_seq:?}"
+            )));
+        }
+        queued.seq = authoritative_seq;
+        queued.sequencer_receipt_json = Some(archived_json);
+        let ts = now_ms();
+        let journal_key = pending_send_key(&queued.conversation_id, &queued.message_id);
 
-        let (final_row, gap_convo_opt) = db.write_tx(|tx| {
-            kv_batch.apply(tx)?;
+        self.require_db_mls()?.write_tx(|tx| {
             let mut gap_convo = None;
-            if let Some(mut c) = tx.get_conversation(&canonical_convo_id)? {
+            if let Some(mut c) = tx.get_conversation(&queued.conversation_id)? {
                 let prior_last_seq = c.last_seq;
-                c.epoch = msg_epoch;
-                if authoritative_seq == prior_last_seq.saturating_add(1) {
-                    c.last_seq = authoritative_seq;
+                c.epoch = c.epoch.max(queued.epoch);
+                if ordered_seq.is_some() || authoritative_seq == prior_last_seq.saturating_add(1) {
+                    c.last_seq = prior_last_seq.max(authoritative_seq);
                 } else if authoritative_seq > prior_last_seq.saturating_add(1) {
                     gap_convo = Some(c.clone());
                 }
@@ -1467,78 +1654,40 @@ impl WasmMlsClient {
                 tx.upsert_conversation(&c)?;
             }
             let row = MessageRow {
-                message_id: canonical_msg_id.clone(),
-                conversation_id: canonical_convo_id.clone(),
-                group_id: convo_snapshot.group_id.clone(),
-                epoch: msg_epoch,
+                message_id: queued.message_id.clone(),
+                conversation_id: queued.conversation_id.clone(),
+                group_id,
+                epoch: queued.epoch,
                 seq: authoritative_seq,
-                sender_did: self.account_did.clone(),
-                sender_device_id: canonical_dev_id.clone(),
-                plaintext_json: display_json.clone(),
-                created_at_ms: ts,
+                sender_did: queued.sender_did.clone(),
+                sender_device_id: queued.sender_device_id.clone(),
+                plaintext_json: queued.plaintext_json.clone(),
+                created_at_ms: queued.created_at_ms,
                 is_own: true,
             };
             tx.insert_message(&row)?;
-            let group_id_hex = hex::encode(&convo_snapshot.group_id);
-            let queued = QueuedLabyrinthArchivePayload {
-                version: 1,
-                message_id: canonical_msg_id.clone(),
-                conversation_id: canonical_convo_id.clone(),
-                group_id_hex: group_id_hex.clone(),
-                epoch: msg_epoch,
-                seq: authoritative_seq,
-                expected_member_dids: sender_members.clone(),
-                sender_did: self.account_did.clone(),
-                sender_device_id: canonical_dev_id.clone(),
-                sequencer_did: convo_snapshot.sequencer_did.clone(),
-                space_uri: convo_snapshot.space_uri.clone(),
-                plaintext_json: display_json,
-                labyrinth_frame_json: frame_json,
-                mls_ciphertext_b64: STANDARD.encode(&ciphertext_bytes),
-                frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
-                sequencer_receipt_json: Some(archived_json),
-                original_sender_attestation_json: Some(
-                    serde_json::to_string(&original_sender_attestation).map_err(|error| {
-                        MLSError::Internal(format!(
-                            "serialize original sender archive attestation: {error}"
-                        ))
-                    })?,
-                ),
-                created_at_ms: ts,
-            };
             let queued_bytes =
                 serde_json::to_vec(&queued).map_err(|e| MLSError::Internal(e.to_string()))?;
             tx.put_labyrinth_state(
-                &format!("native.message:{canonical_convo_id}:{canonical_msg_id}"),
+                &format!(
+                    "native.message:{}:{}",
+                    queued.conversation_id, queued.message_id
+                ),
                 &queued_bytes,
                 ts,
             )?;
-            tx.dequeue_labyrinth_item(&canonical_msg_id)?;
+            tx.dequeue_labyrinth_item(&queued.message_id)?;
             tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                item_id: canonical_msg_id,
-                conversation_id: canonical_convo_id,
-                group_id_hex,
+                item_id: queued.message_id.clone(),
+                conversation_id: queued.conversation_id.clone(),
+                group_id_hex: queued.group_id_hex.clone(),
                 seq: authoritative_seq,
                 payload_bytes: queued_bytes,
                 created_at_ms: ts,
             })?;
+            tx.delete_account_meta(&journal_key)?;
             Ok((row, gap_convo))
-        })?;
-
-        if let Some(gap_convo) = gap_convo_opt {
-            let _ = self
-                .sync_conversation_entries(
-                    &session_token,
-                    &canonical_dev_id,
-                    &signer,
-                    auth_gen,
-                    &gap_convo,
-                )
-                .await;
-        }
-
-        let _ = self.flush_labyrinth_queue_impl().await;
-        Ok(final_row)
+        })
     }
 
     pub(crate) async fn remove_group_member_impl(

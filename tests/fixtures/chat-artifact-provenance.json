@@ -1,25 +1,25 @@
 {
-  "coreRevision": "f609cd3413eff8dc291f25e607290627c16c4a0e",
+  "coreRevision": "5b9898e898b44527d5d790a4aa696d6bf0965993",
   "artifacts": [
     {
       "target": "src/generated/blue.catbird.chat.defs.json",
       "source": "src/orchestrator/generated/blue.catbird.chat.defs.json",
-      "sha256": "e1e1102682519a763cbaa98e1e6be3bc3231cffbcf5d95e137d4fcd2fc85f278"
+      "sha256": "274d54fdec818968a87ae22dd94221fdaf33930ecf42621e07c635ead4321dc3"
     },
     {
       "target": "tests/fixtures/mls_chat_signing_domain_vectors.json",
       "source": "src/orchestrator/generated/mls_chat_signing_domain_vectors.json",
-      "sha256": "d231512281055dd1e7403ca528001281e5cc9496a6e51f925588af06506f27a2"
+      "sha256": "5e4c9ccb0b1fcc2d93a5abe05729ec8f266ce150468795627bce08a375398135"
     },
     {
       "target": "tests/fixtures/mls_chat_contract_vectors.json",
       "source": "src/orchestrator/generated/mls_chat_contract_vectors.json",
-      "sha256": "6af383eaf76ddf730b434491325e000f5217c54f6954a4707e113d64146c0fd1"
+      "sha256": "e3d041367d818f2b47dc617986574ff05e5c5d721701cbf042ab270a3bf54220"
     },
     {
       "target": "tests/fixtures/mls_chat_control_fingerprint_source.json",
       "source": "src/orchestrator/generated/mls_chat_control_fingerprint_source.json",
-      "sha256": "fb37bdec147f952c3bd332062ec45694fbbaab33afa18b0f8e44c0e5c01b8b92"
+      "sha256": "a6608b46e2764f6ff628cb5ead37d597640ea921115881552180dba9a294a318"
     }
   ]
 }

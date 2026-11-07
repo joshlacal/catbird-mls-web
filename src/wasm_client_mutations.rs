@@ -948,6 +948,9 @@ impl WasmMlsClient {
                     .use_ratchet_tree_extension(true)
                     .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
                     .max_past_epochs(5)
+                    .sender_ratchet_configuration(
+                        catbird_mls::GroupConfig::default().sender_ratchet_configuration(),
+                    )
                     .build();
                 let mut group = MlsGroup::new_with_group_id(
                     &provider,

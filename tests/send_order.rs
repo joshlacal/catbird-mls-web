@@ -315,6 +315,9 @@ async fn conversation(alice: &str, bob: &str, cid: &str) -> (WasmMlsClient, Wasm
             .use_ratchet_tree_extension(true)
             .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .max_past_epochs(5)
+            .sender_ratchet_configuration(
+                catbird_mls::GroupConfig::default().sender_ratchet_configuration(),
+            )
             .build();
         let group_id = [
             uuid::Uuid::new_v4().into_bytes(),
@@ -342,6 +345,9 @@ async fn conversation(alice: &str, bob: &str, cid: &str) -> (WasmMlsClient, Wasm
             .use_ratchet_tree_extension(true)
             .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .max_past_epochs(5)
+            .sender_ratchet_configuration(
+                catbird_mls::GroupConfig::default().sender_ratchet_configuration(),
+            )
             .build();
         StagedWelcome::new_from_welcome(&bob_mls, &join, welcome, None)
             .unwrap()
@@ -526,8 +532,8 @@ async fn lost_send_response_never_reuses_the_reserved_generation() {
     assert_eq!(conversation_row(&bob_client, cid).last_seq, 3);
 }
 
-/// Seed 2323: a send held by the network was sequenced after six newer sends from the same
-/// device, beyond the receiver's sender-ratchet window. The receiver records a gap row and
+/// Seed 2323: a send held by the network was sequenced after ten newer sends from the same
+/// device, beyond the receiver's sender-ratchet window (10). The receiver records a gap row and
 /// evidence, advances its cursor and still applies the later Commit.
 #[wasm_bindgen_test]
 async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_applies() {
@@ -539,7 +545,7 @@ async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_appl
     enforceSendOrder(false);
     holdNextSend();
     send(&bob_client, cid, 1, "late").await.unwrap_err();
-    for n in 2..=7 {
+    for n in 2..=11 {
         send(&bob_client, cid, n, &format!("newer {n}"))
             .await
             .unwrap();
@@ -575,19 +581,19 @@ async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_appl
             "commit": {"bytes": STANDARD.encode(&commit)},
         }},
     });
-    assert_eq!(appendEntry(cid, &commit_entry.to_string()), 9);
+    assert_eq!(appendEntry(cid, &commit_entry.to_string()), 13);
 
     alice_client
         .sync()
         .await
         .expect("an undecryptable entry no longer stops sync");
-    let mut expected: Vec<(i64, String)> = (2..=7).map(|n| (n, format!("newer {n}"))).collect();
-    expected.push((8, chat_wire::UNDECRYPTABLE_MESSAGE_NOTICE.into()));
+    let mut expected: Vec<(i64, String)> = (2..=11).map(|n| (n, format!("newer {n}"))).collect();
+    expected.push((12, chat_wire::UNDECRYPTABLE_MESSAGE_NOTICE.into()));
     assert_eq!(timeline(&alice_client, cid), expected);
     let rows: Vec<MessageRow> =
         serde_wasm_bindgen::from_value(alice_client.list_messages(cid.into(), None, 50).unwrap())
             .unwrap();
-    let gap = rows.iter().find(|row| row.seq == 8).unwrap();
+    let gap = rows.iter().find(|row| row.seq == 12).unwrap();
     assert_eq!(
         (gap.message_id.as_str(), gap.sender_did.as_str(), gap.is_own),
         (message_id(1).as_str(), bob.as_str(), false)
@@ -602,7 +608,7 @@ async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_appl
     let convo = conversation_row(&alice_client, cid);
     assert_eq!(
         (convo.last_seq, convo.epoch, convo.unread_count),
-        (9, 2, 7),
+        (13, 2, 11),
         "cursor past the gap, Bob's Commit applied"
     );
     drop(alice_client);
@@ -621,6 +627,6 @@ async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_appl
             evidence.sender_did.as_str(),
             evidence.sender_device_id.as_str(),
         ),
-        (8, 1, "TooDistantInThePast", bob.as_str(), BOB_DEVICE)
+        (12, 1, "TooDistantInThePast", bob.as_str(), BOB_DEVICE)
     );
 }

@@ -24,8 +24,7 @@ use catbird_mls::messaging::receive::{
 };
 use catbird_mls::metadata::derive_metadata_key_from_group;
 use catbird_mls::orchestrator::canonical_transport::{
-    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id,
-    CanonicalOperation,
+    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id, CanonicalOperation,
 };
 use catbird_mls::orchestrator::direct_request_bootstrap::{
     DirectRequestBootstrap, DirectRequestIntroductionResult, DirectRequestWelcomeInput,
@@ -47,6 +46,9 @@ fn build_join_config() -> MlsGroupJoinConfig {
         .use_ratchet_tree_extension(true)
         .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .max_past_epochs(5)
+        .sender_ratchet_configuration(
+            catbird_mls::GroupConfig::default().sender_ratchet_configuration(),
+        )
         .build()
 }
 
@@ -1316,17 +1318,12 @@ impl WasmMlsClient {
         .max(0) as u64;
         let opening_commitment: [u8; 32] = chat_wire::json_bytes(&vp["archiveCommitment"])?
             .try_into()
-            .map_err(|_| {
-                MLSError::Cryptography("C33 archiveCommitment must be 32 bytes".into())
-            })?;
-        let original_sender_attestation =
-            OriginalSenderArchiveAttestationEnvelope::from_aad_json(
-                vp.get("originalSenderAttestation").ok_or_else(|| {
-                    MLSError::Cryptography(
-                        "C33 publication missing original sender attestation".into(),
-                    )
-                })?,
-            )?;
+            .map_err(|_| MLSError::Cryptography("C33 archiveCommitment must be 32 bytes".into()))?;
+        let original_sender_attestation = OriginalSenderArchiveAttestationEnvelope::from_aad_json(
+            vp.get("originalSenderAttestation").ok_or_else(|| {
+                MLSError::Cryptography("C33 publication missing original sender attestation".into())
+            })?,
+        )?;
         if original_sender_attestation.sender_did != sender_did
             || original_sender_attestation.sender_device_id != sender_device_id
         {

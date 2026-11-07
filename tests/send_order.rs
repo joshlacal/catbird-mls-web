@@ -1,9 +1,9 @@
-//! Seed 2323 regressions for `WasmMlsClient` over real encrypted OPFS. A stateful fetch fixture
-//! applies the `mls-ds` send-order rule (an unresolved send is accepted only if
-//! `(prior.generation, prior.epoch, sendCounter)` exceeds the device's last accepted send in the
-//! conversation, otherwise `StaleSend`) and returns real `I13` ES256 receipts. Alice and Bob are
-//! enrolled clients sharing one MLS group, built in their account databases the way
-//! `createGroup` plus Bob's Welcome import leave it.
+//! Seed 2323 and sync-verification regressions for `WasmMlsClient` over real encrypted OPFS. A
+//! stateful fetch fixture applies the `mls-ds` send-order rule (an unresolved send is accepted
+//! only if `(prior.generation, prior.epoch, sendCounter)` exceeds the device's last accepted send
+//! in the conversation, otherwise `StaleSend`) and returns real `I13` ES256 receipts under a
+//! rotatable `#mls-receipt-<n>` method. Alice and Bob are enrolled clients sharing one MLS group,
+//! built in their account databases the way `createGroup` plus Bob's Welcome import leave it.
 #![cfg(target_arch = "wasm32")]
 use std::rc::Rc;
 
@@ -11,14 +11,15 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use catbird_mls::client::{chat_wire, REQUIRED_LABYRINTH_OAUTH_SCOPES};
+use catbird_mls::client::{
+    chat_wire, QueuedLabyrinthArchivePayload, REQUIRED_LABYRINTH_OAUTH_SCOPES,
+};
+use catbird_mls::orchestrator::canonical_transport::{derive_key_id, CanonicalOperation};
 use catbird_mls::orchestrator::MLSMessagePayload;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
 use catbird_mls::storage::{ConversationRow, MessageRow};
 use catbird_mls_web::{SqliteConn, WasmMlsClient};
-use labyrinth_protocol::receipt::{
-    expected_receipt_key_id, sign_sequencer_receipt, SequencerReceiptPayload,
-};
+use labyrinth_protocol::receipt::{sign_sequencer_receipt, SequencerReceiptPayload};
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -65,17 +66,31 @@ function sequence(text) {
   const seq = ++ds.seq[cid];
   const entry = {$type: 'blue.catbird.chat.defs#applicationEntry', entryId: b.messageId,
     conversationId: cid, seq, signedRequest,
-    sequencerReceipt: JSON.parse(receiptFor(JSON.stringify({body: b, seq}))),
+    sequencerReceipt: JSON.parse(receiptFor(JSON.stringify({body: b, seq, keyGeneration: ds.keyGeneration}))),
     receivedAt: new Date().toISOString()};
   ds.entries[cid].push(entry);
   ds.accepted[`${cid} ${b.messageId}`] = {text, response: {entry}};
   return [200, {entry}];
 }
+// A signed transition or acceptance is sequenced as the entry its body names.
+function transition(text) {
+  ds.transitions.push(text);
+  const signedRequest = JSON.parse(text).signedRequest;
+  const b = signedRequest.body;
+  const cid = (b.next || b.prior).conversationId;
+  const entry = {$type: `blue.catbird.chat.defs#${b.$type.split('#')[1].replace(/(Transition)?Body$/, 'Entry')}`,
+    entryId: b.transitionId, conversationId: cid, seq: ++ds.seq[cid], signedRequest, receivedAt: b.signedAt};
+  ds.entries[cid].push(entry);
+  return entry;
+}
+const entryAt = (cid, seq) => ds.entries[cid].find((e) => e.seq === seq);
 export function installDs(receipt, didDoc) {
   originalFetch = globalThis.fetch;
   receiptFor = receipt;
   ds = {records: {}, sends: [], accepted: {}, order: {}, seq: {}, entries: {}, held: [],
-    hold: 0, lose: 0, refuse: false, enforce: true};
+    hold: 0, lose: 0, refuse: false, enforce: true, keyGeneration: 1, acks: 0, repoReadAuth: [],
+    transitions: [], loseTransition: 0, inventory: {}, welcomes: {}, inbox: {}, welcomeAcks: [],
+    floor: {}};
   globalThis.fetch = async (request) => {
     const reply = (body, status = 200) => {
       const r = new Response(JSON.stringify(body), {status, headers: {'content-type': 'application/json'}});
@@ -87,6 +102,7 @@ export function installDs(receipt, didDoc) {
     const nsid = url.pathname.replace('/xrpc/', '');
     const text = request.method === 'POST' ? await request.clone().text() : '';
     const b = text ? JSON.parse(text).signedRequest?.body : undefined;
+    const device = url.searchParams.get('actorDeviceId');
     switch (nsid) {
       case 'com.atproto.server.getServiceAuth': return reply({token: 'service-auth'});
       case 'com.atproto.repo.putRecord': {
@@ -95,6 +111,7 @@ export function installDs(receipt, didDoc) {
         return reply({uri: 'at://fixture', cid: 'bafyfixture'});
       }
       case 'com.atproto.repo.listRecords': {
+        ds.repoReadAuth.push(request.headers.get('authorization'));
         const prefix = `at://${url.searchParams.get('repo')}/${url.searchParams.get('collection')}/`;
         return reply({records: Object.entries(ds.records).filter(([uri]) => uri.startsWith(prefix))
           .map(([uri, value]) => ({uri, cid: 'bafyfixture', value}))});
@@ -119,15 +136,32 @@ export function installDs(receipt, didDoc) {
         }
         return reply(body, status);
       }
+      // A device reads only the entries from its readable floor on (`readableFrom`).
       case 'blue.catbird.chat.getEntries': {
         const after = Number(url.searchParams.get('afterSeq'));
         return reply({entries: (ds.entries[url.searchParams.get('conversationId')] || [])
-          .filter((e) => e.seq > after), hasMore: false});
+          .filter((e) => e.seq > after && e.seq >= (ds.floor[device] || 0)), hasMore: false});
       }
-      case 'blue.catbird.chat.acknowledgeEntries': return reply({});
+      case 'blue.catbird.chat.acknowledgeEntries': ds.acks++; return reply({});
+      case 'blue.catbird.chat.submitTransition': {
+        const entry = transition(text);
+        if (ds.loseTransition > 0) {
+          ds.loseTransition--;
+          throw new TypeError('submitTransition response lost');
+        }
+        return reply({coordinates: entry.signedRequest.body.next, entry, welcomes: []});
+      }
+      case 'blue.catbird.chat.acceptConversation': {
+        const entry = transition(text);
+        return reply({coordinates: entry.signedRequest.body.next, entry});
+      }
+      case 'blue.catbird.chat.acknowledgeWelcome': ds.welcomeAcks.push(b); return reply({});
       case 'blue.catbird.chat.getConversations':
+        return reply({items: ds.inventory[device] || [], hasMore: false});
       case 'blue.catbird.chat.getPendingWelcomes':
-      case 'blue.catbird.chat.getLeafRecoveryInbox': return reply({items: [], hasMore: false});
+        return reply({items: ds.welcomes[device] || [], hasMore: false});
+      case 'blue.catbird.chat.getLeafRecoveryInbox':
+        return reply({items: ds.inbox[device] || [], hasMore: false});
       default: return reply({error: 'NotFound', message: nsid}, 404);
     }
   };
@@ -138,14 +172,49 @@ export function loseNextSendResponse() { ds.lose += 1; }
 export function deliverHeld() { for (const text of ds.held.splice(0)) sequence(text); }
 export function refuseEverySend(refuse) { ds.refuse = refuse; }
 export function enforceSendOrder(enforce) { ds.enforce = enforce; }
+// Later receipts are signed by `#mls-receipt-<generation>`; earlier methods stay published.
+export function useReceiptKey(generation) { ds.keyGeneration = generation; }
 export function appendEntry(cid, entry) {
   const e = JSON.parse(entry);
   e.seq = ++ds.seq[cid];
   ds.entries[cid].push(e);
   return e.seq;
 }
+// A receipt altered after signing: its signature no longer verifies.
+export function tamperReceipt(cid, seq) { entryAt(cid, seq).sequencerReceipt.issuedAtMs += 1; }
+// The `payloadPruned` projection `getEntries` serves once the ciphertext is pruned (O7).
+export function pruneEntry(cid, seq) {
+  const e = entryAt(cid, seq);
+  const pruned = {$type: e.$type, conversationId: e.conversationId, entryId: e.entryId,
+    payloadPruned: true, receivedAt: e.receivedAt, seq, sequencerReceipt: e.sequencerReceipt};
+  ds.entries[cid][ds.entries[cid].indexOf(e)] = pruned;
+}
+// The same sequenced entry served again under the next seq.
+export function replayEntry(cid, seq) {
+  const e = structuredClone(entryAt(cid, seq));
+  e.seq = ++ds.seq[cid];
+  ds.entries[cid].push(e);
+  return e.seq;
+}
 export function dsSends() { return JSON.stringify(ds.sends); }
+export function ackCount() { return ds.acks; }
+export function repoReadAuth() { return JSON.stringify(ds.repoReadAuth); }
 export function restoreFetch() { globalThis.fetch = originalFetch; }
+export function loseNextTransition() { ds.loseTransition += 1; }
+export function serveInventory(device, items) { ds.inventory[device] = JSON.parse(items); }
+export function serveWelcomes(device, items) { ds.welcomes[device] = JSON.parse(items); }
+export function serveInbox(device, items) { ds.inbox[device] = JSON.parse(items); }
+// `device` joined later: it reads only the entries from `seq` on.
+export function readableFrom(device, seq) { ds.floor[device] = seq; }
+// Serve `entry` at its own seq, replacing the entry there.
+export function setEntry(cid, entry) {
+  const e = JSON.parse(entry);
+  ds.entries[cid] = ds.entries[cid].filter((x) => x.seq !== e.seq).concat([e])
+    .sort((x, y) => x.seq - y.seq);
+}
+export function entryJson(cid, seq) { return JSON.stringify(entryAt(cid, seq)); }
+export function dsTransitions() { return JSON.stringify(ds.transitions); }
+export function welcomeAcks() { return JSON.stringify(ds.welcomeAcks); }
 "#)]
 extern "C" {
     fn installDs(receipt: &js_sys::Function, did_doc: &str);
@@ -155,9 +224,24 @@ extern "C" {
     fn deliverHeld();
     fn refuseEverySend(refuse: bool);
     fn enforceSendOrder(enforce: bool);
+    fn useReceiptKey(generation: u32);
     fn appendEntry(cid: &str, entry: &str) -> u32;
+    fn tamperReceipt(cid: &str, seq: u32);
+    fn pruneEntry(cid: &str, seq: u32);
+    fn replayEntry(cid: &str, seq: u32) -> u32;
     fn dsSends() -> String;
+    fn ackCount() -> u32;
+    fn repoReadAuth() -> String;
     fn restoreFetch();
+    fn loseNextTransition();
+    fn serveInventory(device: &str, items: &str);
+    fn serveWelcomes(device: &str, items: &str);
+    fn serveInbox(device: &str, items: &str);
+    fn readableFrom(device: &str, seq: u32);
+    fn setEntry(cid: &str, entry: &str);
+    fn entryJson(cid: &str, seq: u32) -> String;
+    fn dsTransitions() -> String;
+    fn welcomeAcks() -> String;
 }
 struct RestoreFetch;
 impl Drop for RestoreFetch {
@@ -170,6 +254,9 @@ const SEQUENCER: &str = "did:web:ds.catbird.test";
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 const ALICE_DEVICE: &str = "00000000-0000-4000-8000-00000000a001";
 const BOB_DEVICE: &str = "00000000-0000-4000-8000-00000000b001";
+const CAROL_DEVICE: &str = "00000000-0000-4000-8000-00000000c001";
+const DAVE_DEVICE: &str = "00000000-0000-4000-8000-00000000d001";
+const ERIN_DEVICE: &str = "00000000-0000-4000-8000-00000000e001";
 
 fn did(name: &str) -> String {
     format!("did:plc:{name:a<24}")
@@ -179,14 +266,21 @@ fn message_id(n: u32) -> String {
     format!("00000000-0000-4000-8000-{n:012x}")
 }
 
-fn sequencer_key() -> p256::ecdsa::SigningKey {
-    p256::ecdsa::SigningKey::from_slice(&[19; 32]).unwrap()
+/// The sequencer's ES256 key for its receipt method `#mls-receipt-<generation>`.
+fn sequencer_key(generation: u64) -> p256::ecdsa::SigningKey {
+    p256::ecdsa::SigningKey::from_slice(&[18 + generation as u8; 32]).unwrap()
 }
 
-/// `I13` receipt for a send the fixture sequenced: `{"body": <wire send body>, "seq": n}`.
+fn receipt_kid(generation: u64) -> String {
+    format!("{SEQUENCER}#mls-receipt-{generation}")
+}
+
+/// `I13` receipt for a send the fixture sequenced:
+/// `{"body": <wire send body>, "seq": n, "keyGeneration": g}`.
 fn receipt_for(request: String) -> String {
     let request: Value = serde_json::from_str(&request).unwrap();
     let body = &request["body"];
+    let generation = request["keyGeneration"].as_u64().unwrap();
     let text = |v: &Value| v.as_str().unwrap().to_owned();
     let payload = SequencerReceiptPayload {
         sequencer_did: SEQUENCER.into(),
@@ -207,8 +301,8 @@ fn receipt_for(request: String) -> String {
         issued_at_ms: js_sys::Date::now() as i64,
     };
     let signed = sign_sequencer_receipt(
-        &sequencer_key(),
-        &expected_receipt_key_id(SEQUENCER),
+        &sequencer_key(generation),
+        &receipt_kid(generation),
         &payload,
     )
     .unwrap();
@@ -223,13 +317,22 @@ fn receipt_for(request: String) -> String {
     .to_string()
 }
 
+/// The sequencer DID document retains every receipt method it ever signed with (G3).
 fn install_ds() -> RestoreFetch {
-    let point = sequencer_key().verifying_key().to_encoded_point(false);
-    let did_doc = json!({"id": SEQUENCER, "verificationMethod": [{
-        "id": format!("{SEQUENCER}#mls-receipt-1"), "type": "JsonWebKey2020", "controller": SEQUENCER,
-        "publicKeyJwk": {"kty": "EC", "crv": "P-256",
-            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()), "y": URL_SAFE_NO_PAD.encode(point.y().unwrap())},
-    }]});
+    let methods: Vec<Value> = (1..=2)
+        .map(|generation| {
+            let point = sequencer_key(generation)
+                .verifying_key()
+                .to_encoded_point(false);
+            json!({
+                "id": receipt_kid(generation), "type": "JsonWebKey2020", "controller": SEQUENCER,
+                "publicKeyJwk": {"kty": "EC", "crv": "P-256",
+                    "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                    "y": URL_SAFE_NO_PAD.encode(point.y().unwrap())},
+            })
+        })
+        .collect();
+    let did_doc = json!({"id": SEQUENCER, "verificationMethod": methods});
     let receipt = Closure::<dyn Fn(String) -> String>::new(receipt_for);
     installDs(receipt.as_ref().unchecked_ref(), &did_doc.to_string());
     receipt.forget();
@@ -285,30 +388,43 @@ fn capabilities() -> Capabilities {
     )
 }
 
-/// Enroll both devices, then leave both account databases the way `createGroup` and Bob's
-/// Welcome import do: one MLS group at epoch 1 holding both leaves, conversation at seq 1.
-async fn conversation(alice: &str, bob: &str, cid: &str) -> (WasmMlsClient, WasmMlsClient) {
-    for (did, device_id) in [(alice, ALICE_DEVICE), (bob, BOB_DEVICE)] {
-        let client = open(did, device_id).await;
-        let scopes = serde_wasm_bindgen::to_value(&REQUIRED_LABYRINTH_OAUTH_SCOPES).unwrap();
-        client.enroll_device(true, scopes).await.unwrap();
+/// Enroll `did#device_id`, then close its client.
+async fn enroll(did: &str, device_id: &str) {
+    let client = open(did, device_id).await;
+    let scopes = serde_wasm_bindgen::to_value(&REQUIRED_LABYRINTH_OAUTH_SCOPES).unwrap();
+    client.enroll_device(true, scopes).await.unwrap();
+}
+
+/// Enroll every member, then leave each account database the way `createGroup` and the
+/// members' Welcome imports do: one MLS group at epoch 1, created by the first member and
+/// holding every leaf, conversation at seq 1. Returns the members' clients, in order.
+async fn group(members: &[(&str, &str)], cid: &str) -> Vec<WasmMlsClient> {
+    for (did, device_id) in members {
+        enroll(did, device_id).await;
     }
-    let (alice_db, bob_db) = (account_db(alice), account_db(bob));
+    let dbs: Vec<_> = members.iter().map(|(did, _)| account_db(did)).collect();
     {
-        let (alice_signer, bob_signer) = (device_signer(&alice_db), device_signer(&bob_db));
-        let (alice_mls, bob_mls) = (
-            alice_db.openmls_provider().unwrap(),
-            bob_db.openmls_provider().unwrap(),
-        );
-        let package = KeyPackage::builder()
-            .leaf_node_capabilities(capabilities())
-            .build(
-                CIPHERSUITE,
-                &bob_mls,
-                &bob_signer,
-                credential(bob, BOB_DEVICE, &bob_signer),
-            )
-            .unwrap();
+        let ((creator, creator_device), joiners) = members.split_first().unwrap();
+        let creator_signer = device_signer(&dbs[0]);
+        let creator_mls = dbs[0].openmls_provider().unwrap();
+        let packages: Vec<KeyPackage> = joiners
+            .iter()
+            .zip(&dbs[1..])
+            .map(|((did, device_id), db)| {
+                let signer = device_signer(db);
+                KeyPackage::builder()
+                    .leaf_node_capabilities(capabilities())
+                    .build(
+                        CIPHERSUITE,
+                        &db.openmls_provider().unwrap(),
+                        &signer,
+                        credential(did, device_id, &signer),
+                    )
+                    .unwrap()
+                    .key_package()
+                    .clone()
+            })
+            .collect();
         let create = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
             .capabilities(capabilities())
@@ -325,17 +441,17 @@ async fn conversation(alice: &str, bob: &str, cid: &str) -> (WasmMlsClient, Wasm
         ]
         .concat();
         let mut group = MlsGroup::new_with_group_id(
-            &alice_mls,
-            &alice_signer,
+            &creator_mls,
+            &creator_signer,
             &create,
             GroupId::from_slice(&group_id),
-            credential(alice, ALICE_DEVICE, &alice_signer),
+            credential(creator, creator_device, &creator_signer),
         )
         .unwrap();
         let (_, welcome, _) = group
-            .add_members(&alice_mls, &alice_signer, &[package.key_package().clone()])
+            .add_members(&creator_mls, &creator_signer, &packages)
             .unwrap();
-        group.merge_pending_commit(&alice_mls).unwrap();
+        group.merge_pending_commit(&creator_mls).unwrap();
         let welcome =
             MlsMessageIn::tls_deserialize_exact(welcome.tls_serialize_detached().unwrap()).unwrap();
         let MlsMessageBodyIn::Welcome(welcome) = welcome.extract() else {
@@ -349,11 +465,14 @@ async fn conversation(alice: &str, bob: &str, cid: &str) -> (WasmMlsClient, Wasm
                 catbird_mls::GroupConfig::default().sender_ratchet_configuration(),
             )
             .build();
-        StagedWelcome::new_from_welcome(&bob_mls, &join, welcome, None)
-            .unwrap()
-            .into_group(&bob_mls)
-            .unwrap();
-        for db in [&alice_db, &bob_db] {
+        for db in &dbs[1..] {
+            let mls = db.openmls_provider().unwrap();
+            StagedWelcome::new_from_welcome(&mls, &join, welcome.clone(), None)
+                .unwrap()
+                .into_group(&mls)
+                .unwrap();
+        }
+        for db in &dbs {
             db.write_tx(|tx| {
                 tx.upsert_conversation(&ConversationRow {
                     conversation_id: cid.into(),
@@ -371,9 +490,97 @@ async fn conversation(alice: &str, bob: &str, cid: &str) -> (WasmMlsClient, Wasm
             .unwrap();
         }
     }
-    drop((alice_db, bob_db));
+    drop(dbs);
     openConversation(cid);
-    (open(alice, ALICE_DEVICE).await, open(bob, BOB_DEVICE).await)
+    let mut clients = Vec::new();
+    for (did, device_id) in members {
+        clients.push(open(did, device_id).await);
+    }
+    clients
+}
+
+/// Alice and Bob's [`group`].
+async fn conversation(alice: &str, bob: &str, cid: &str) -> (WasmMlsClient, WasmMlsClient) {
+    let mut clients = group(&[(alice, ALICE_DEVICE), (bob, BOB_DEVICE)], cid)
+        .await
+        .into_iter();
+    (clients.next().unwrap(), clients.next().unwrap())
+}
+
+/// The signed wrapper of `body` as `operation`, signed by `signer` as the device `body` names.
+fn signed(operation: CanonicalOperation, mut body: Value, signer: &SignatureKeyPair) -> Value {
+    body["keyId"] = json!(derive_key_id(signer.public()));
+    let did = body["actorDid"].as_str().unwrap().to_owned();
+    let device_id = body["actorDeviceId"].as_str().unwrap().to_owned();
+    let prepared =
+        chat_wire::sign_clean_chat_mutation(&did, &device_id, Some(1), operation, &body, signer)
+            .unwrap();
+    let mut request: Value = serde_json::from_slice(prepared.body.as_deref().unwrap()).unwrap();
+    request["signedRequest"].take()
+}
+
+/// The entry `getEntries` serves at `seq` of `cid`.
+fn entry_at(cid: &str, seq: u32) -> Value {
+    serde_json::from_str(&entryJson(cid, seq)).unwrap()
+}
+
+/// `entry` with its signed body edited by `edit`, signed again by `signer` as `operation`.
+fn resigned(
+    entry: &Value,
+    operation: CanonicalOperation,
+    signer: &SignatureKeyPair,
+    edit: impl FnOnce(&mut Value),
+) -> Value {
+    let mut entry = entry.clone();
+    let mut body = entry["signedRequest"]["body"].take();
+    edit(&mut body);
+    entry["signedRequest"] = signed(operation, body, signer);
+    entry
+}
+
+/// `entry` altered after signing: its signature no longer verifies.
+fn altered(entry: &Value) -> Value {
+    let mut entry = entry.clone();
+    entry["signedRequest"]["body"]["signedAt"] = json!("2026-11-07T00:00:00.000Z");
+    entry
+}
+
+fn canonical(coordinate: &Value, cid: &str) -> Value {
+    chat_wire::canonicalize_wire_coordinate(coordinate, Some(cid)).unwrap()
+}
+
+/// `account`'s stored coordinates of `cid`, canonical, from its closed database.
+fn stored_coords(account: &str, cid: &str) -> Option<Value> {
+    account_db(account)
+        .backend()
+        .get_account_meta(&format!("conversation_coords:{cid}"))
+        .unwrap()
+        .map(|raw| canonical(&serde_json::from_str(&raw).unwrap(), cid))
+}
+
+/// The current coordinate of `account`'s MLS group for `cid`, from its closed database, at
+/// `stateVersion` 0 (no transition stored).
+fn group_coords(account: &str, cid: &str) -> Value {
+    let db = account_db(account);
+    let group_id = db
+        .backend()
+        .get_conversation(cid)
+        .unwrap()
+        .unwrap()
+        .group_id;
+    let mls = db.openmls_provider().unwrap();
+    let group = MlsGroup::load(mls.storage(), &GroupId::from_slice(&group_id))
+        .unwrap()
+        .unwrap();
+    let (gch, tag) = chat_wire::compute_group_context_hash_and_tag(&group, &mls).unwrap();
+    canonical(
+        &json!({
+            "conversationId": cid, "generation": 0, "stateVersion": 0, "lifecycle": "active",
+            "groupId": STANDARD.encode(&group_id), "epoch": group.epoch().as_u64(),
+            "groupContextHash": STANDARD.encode(gch), "confirmationTag": STANDARD.encode(tag),
+        }),
+        cid,
+    )
 }
 
 async fn send(client: &WasmMlsClient, cid: &str, n: u32, text: &str) -> Result<MessageRow, String> {
@@ -460,7 +667,9 @@ async fn send_counter_strictly_increases_across_sends_and_reopen() {
 /// A send held in the network keeps its journal; after a newer send is sequenced, the caller's
 /// retry resubmits those exact bytes, `mls-ds` refuses them (`StaleSend`), and the same message
 /// id goes out once more as a fresh frame with a new counter. The refused bytes are never
-/// sequenced, and a second `StaleSend` is returned rather than retried.
+/// sequenced, and a second `StaleSend` is returned rather than retried. Every refusal discards
+/// its journal: fail-before, a later retry after the second refusal resubmitted those refused
+/// bytes and `mls-ds` sequenced them.
 #[wasm_bindgen_test]
 async fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
     let _restore = install_ds();
@@ -506,6 +715,24 @@ async fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
         [(4, "stale"), (5, "stale")].map(|(c, o)| (c, o.to_owned())),
         "exactly one fresh re-encryption"
     );
+
+    refuseEverySend(false);
+    let row = send(&bob_client, cid, 4, "refused")
+        .await
+        .expect("a later retry goes out as a fresh frame");
+    let tries = attempts(4);
+    assert_eq!(
+        tries
+            .iter()
+            .map(|(counter, outcome, _)| (*counter, outcome.as_str()))
+            .collect::<Vec<_>>(),
+        [(4, "stale"), (5, "stale"), (6, "accepted")]
+    );
+    assert!(
+        tries[2].2 != tries[0].2 && tries[2].2 != tries[1].2,
+        "refused bytes are never resubmitted"
+    );
+    assert_eq!((row.message_id, row.seq), (message_id(4), 4));
 }
 
 /// `mls-ds` sequenced a send whose response was lost. The generation was reserved before
@@ -534,13 +761,20 @@ async fn lost_send_response_never_reuses_the_reserved_generation() {
 
 /// Seed 2323: a send held by the network was sequenced after ten newer sends from the same
 /// device, beyond the receiver's sender-ratchet window (10). The receiver records a gap row and
-/// evidence, advances its cursor and still applies the later Commit.
+/// evidence, advances its cursor and still applies the later Commit (Bob's signed removal of
+/// Carol).
 #[wasm_bindgen_test]
 async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_applies() {
     let _restore = install_ds();
-    let (alice, bob) = (did("tombalice"), did("tombbob"));
+    let (alice, bob, carol) = (did("tombalice"), did("tombbob"), did("tombcarol"));
     let cid = "00000000-0000-4000-8000-0000000c0004";
-    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    let members = [
+        (alice.as_str(), ALICE_DEVICE),
+        (bob.as_str(), BOB_DEVICE),
+        (carol.as_str(), CAROL_DEVICE),
+    ];
+    let mut clients = group(&members, cid).await.into_iter();
+    let (alice_client, bob_client) = (clients.next().unwrap(), clients.next().unwrap());
     // A `mls-ds` without the send-order rule sequences the late send.
     enforceSendOrder(false);
     holdNextSend();
@@ -551,37 +785,14 @@ async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_appl
             .unwrap();
     }
     deliverHeld();
-    drop(bob_client);
-    let commit = {
-        let db = account_db(&bob);
-        let signer = device_signer(&db);
-        let mls = db.openmls_provider().unwrap();
-        let group_id = db
-            .backend()
-            .get_conversation(cid)
-            .unwrap()
-            .unwrap()
-            .group_id;
-        let mut group = MlsGroup::load(mls.storage(), &GroupId::from_slice(&group_id))
-            .unwrap()
-            .unwrap();
-        let bundle = group
-            .self_update(&mls, &signer, LeafNodeParameters::default())
-            .unwrap();
-        group.merge_pending_commit(&mls).unwrap();
-        bundle.into_commit().tls_serialize_detached().unwrap()
-    };
-    let commit_entry = json!({
-        "$type": "blue.catbird.chat.defs#commitEntry",
-        "entryId": uuid::Uuid::new_v4().to_string(),
-        "conversationId": cid,
-        "signedRequest": {"body": {
-            "$type": "blue.catbird.chat.defs#commitTransitionBody",
-            "actorDid": bob, "actorDeviceId": BOB_DEVICE,
-            "commit": {"bytes": STANDARD.encode(&commit)},
-        }},
-    });
-    assert_eq!(appendEntry(cid, &commit_entry.to_string()), 13);
+    bob_client
+        .remove_group_member(true, cid.into(), carol.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        entry_at(cid, 13)["$type"],
+        "blue.catbird.chat.defs#commitEntry"
+    );
 
     alice_client
         .sync()
@@ -629,4 +840,979 @@ async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_appl
         ),
         (12, 1, "TooDistantInThePast", bob.as_str(), BOB_DEVICE)
     );
+}
+
+/// A v2 `accountDeletedEntry` the sequencer signs under `#mls-receipt-1`, or unsigned.
+fn account_deletion_entry(cid: &str, deleted_did: &str, seq: u64, signed: bool) -> Value {
+    let entry_id = uuid::Uuid::new_v4().to_string();
+    let received_at = "2026-11-07T12:00:00.000Z";
+    let mut entry = json!({
+        "$type": "blue.catbird.chat.defs#accountDeletedEntry",
+        "conversationId": cid, "deletedDid": deleted_did, "entryId": entry_id,
+        "receivedAt": received_at, "sequencerDid": SEQUENCER, "seq": seq,
+    });
+    if signed {
+        use p256::ecdsa::signature::Signer as _;
+        let key_id = receipt_kid(1);
+        let seq_text = seq.to_string();
+        let mut transcript = b"catbird-mls-account-deletion-authority-v2\0".to_vec();
+        let field = |bytes: &mut Vec<u8>, text: &str| {
+            bytes.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        };
+        field(&mut transcript, &key_id);
+        transcript.extend_from_slice(b"catbird-mls-account-deletion-v1\0");
+        for text in [
+            SEQUENCER,
+            cid,
+            deleted_did,
+            seq_text.as_str(),
+            entry_id.as_str(),
+            received_at,
+        ] {
+            field(&mut transcript, text);
+        }
+        let signature: p256::ecdsa::Signature = sequencer_key(1).sign(&transcript);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        entry["sequencerAuthority"] = json!({
+            "sequencerDid": SEQUENCER, "keyId": key_id,
+            "signature": STANDARD.encode(signature.to_bytes()),
+        });
+    }
+    entry
+}
+
+/// Labyrinth archive is paused, so sync's queue flush leaves every queued row in place.
+fn pause_archive(did: &str) {
+    let db = account_db(did);
+    let raw = db
+        .backend()
+        .get_labyrinth_state("status_json")
+        .unwrap()
+        .expect("enrollment writes the archive status");
+    let mut status: Value = serde_json::from_slice(&raw).unwrap();
+    status["backup_enabled"] = json!(false);
+    db.write_tx(|tx| {
+        tx.put_labyrinth_state("status_json", &serde_json::to_vec(&status).unwrap(), 0)
+    })
+    .unwrap();
+}
+
+/// A batch whose receipts span a sequencer receipt-key rotation verifies each receipt under the
+/// retained method its own `kid` names (G3). Fail-before: the whole batch reused the first
+/// receipt's key, so the `#mls-receipt-2` entry failed and sync stopped there.
+#[wasm_bindgen_test]
+async fn a_batch_spanning_a_receipt_key_rotation_verifies_each_receipt_kid() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("rotalice"), did("rotbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0005";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    send(&bob_client, cid, 1, "under key one").await.unwrap();
+    useReceiptKey(2);
+    send(&bob_client, cid, 2, "under key two").await.unwrap();
+    alice_client
+        .sync()
+        .await
+        .expect("each receipt verifies under its own kid");
+    assert_eq!(
+        timeline(&alice_client, cid),
+        timeline_of(&[(2, "under key one"), (3, "under key two")])
+    );
+}
+
+/// An undecryptable entry is tombstoned only once it proves itself without its plaintext: its
+/// `I13` receipt must sequence exactly that entry. Fail-before: a gap row was written and the
+/// cursor moved past an entry whose receipt was forged.
+#[wasm_bindgen_test]
+async fn an_undecryptable_entry_with_a_forged_receipt_is_never_tombstoned() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("forgedgapalice"), did("forgedgapbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0006";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    enforceSendOrder(false);
+    holdNextSend();
+    send(&bob_client, cid, 1, "late").await.unwrap_err();
+    for n in 2..=11 {
+        send(&bob_client, cid, n, &format!("newer {n}"))
+            .await
+            .unwrap();
+    }
+    deliverHeld();
+    tamperReceipt(cid, 12);
+    let error = alice_client
+        .sync()
+        .await
+        .expect_err("a forged receipt never records a gap")
+        .as_string()
+        .unwrap_or_default();
+    assert!(error.contains("I13"), "{error}");
+    let expected: Vec<(i64, String)> = (2..=11).map(|n| (n, format!("newer {n}"))).collect();
+    assert_eq!(timeline(&alice_client, cid), expected, "no gap row");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 11);
+}
+
+/// A pruned entry keeps only its signed receipt, which must sequence exactly that entry before
+/// the cursor passes it. Fail-before: any `payloadPruned` entry moved the cursor unverified.
+#[wasm_bindgen_test]
+async fn a_pruned_entry_moves_the_cursor_only_under_its_verified_receipt() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("prunealice"), did("prunebob"));
+    let cid = "00000000-0000-4000-8000-0000000c0007";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    send(&bob_client, cid, 1, "pruned before delivery")
+        .await
+        .unwrap();
+    pruneEntry(cid, 2);
+    alice_client
+        .sync()
+        .await
+        .expect("a pruned entry under its receipt");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+    assert!(timeline(&alice_client, cid).is_empty());
+
+    let forged = json!({
+        "$type": "blue.catbird.chat.defs#applicationEntry",
+        "entryId": message_id(2), "conversationId": cid,
+        "payloadPruned": true, "receivedAt": "2026-11-07T00:00:00.000Z",
+    });
+    assert_eq!(appendEntry(cid, &forged.to_string()), 3);
+    alice_client
+        .sync()
+        .await
+        .expect_err("a pruned entry without its receipt");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+}
+
+/// A stored message re-presented under another seq must prove that seq with its own receipt
+/// against the retained evidence. Fail-before: any stored message id moved the cursor
+/// unverified.
+#[wasm_bindgen_test]
+async fn a_stored_message_replayed_at_another_seq_never_moves_the_cursor() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("replayalice"), did("replaybob"));
+    let cid = "00000000-0000-4000-8000-0000000c0008";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    send(&bob_client, cid, 1, "once").await.unwrap();
+    alice_client.sync().await.unwrap();
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+    assert_eq!(replayEntry(cid, 2), 3);
+    let error = alice_client
+        .sync()
+        .await
+        .expect_err("its receipt sequences seq 2, not 3")
+        .as_string()
+        .unwrap_or_default();
+    assert!(error.contains("I13"), "{error}");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+    assert_eq!(timeline(&alice_client, cid), timeline_of(&[(2, "once")]));
+}
+
+/// Without the conversation's MLS group there is no roster to authenticate an entry against:
+/// sync fails and acknowledges nothing. Fail-before: the entry counted as applied, the cursor
+/// moved and its seq was acknowledged to `mls-ds`.
+#[wasm_bindgen_test]
+async fn an_entry_without_its_mls_group_is_never_acknowledged() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("nogroupalice"), did("nogroupbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0009";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    send(&bob_client, cid, 1, "unreadable here").await.unwrap();
+    drop(alice_client);
+    account_db(&alice)
+        .write_tx(|tx| {
+            let mut row = tx.get_conversation(cid)?.unwrap();
+            row.group_id = vec![7; 32];
+            tx.upsert_conversation(&row)
+        })
+        .unwrap();
+    let alice_client = open(&alice, ALICE_DEVICE).await;
+    alice_client
+        .sync()
+        .await
+        .expect_err("no group, nothing applied");
+    assert_eq!(ackCount(), 0, "nothing acknowledged");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 1);
+}
+
+/// An `accountDeletedEntry` purges only under its v2 sequencer authority, verified under the
+/// exact receipt method it names, and one that does not verify stops sync there: no later
+/// entry passes it. A verified one purges the account's messages and records the deletion for
+/// archive rosters. Fail-before: an unsigned deletion was skipped, so Carol's later message
+/// moved the cursor past it.
+#[wasm_bindgen_test]
+async fn only_a_verified_account_deletion_purges_messages() {
+    let _restore = install_ds();
+    let (alice, bob, carol) = (did("deletealice"), did("deletebob"), did("deletecarol"));
+    let cid = "00000000-0000-4000-8000-0000000c000a";
+    let members = [
+        (alice.as_str(), ALICE_DEVICE),
+        (bob.as_str(), BOB_DEVICE),
+        (carol.as_str(), CAROL_DEVICE),
+    ];
+    let mut clients = group(&members, cid).await.into_iter();
+    let (alice_client, bob_client, carol_client) = (
+        clients.next().unwrap(),
+        clients.next().unwrap(),
+        clients.next().unwrap(),
+    );
+    send(&bob_client, cid, 1, "from a living account")
+        .await
+        .unwrap();
+    alice_client.sync().await.unwrap();
+
+    let unsigned = account_deletion_entry(cid, &bob, 3, false);
+    assert_eq!(appendEntry(cid, &unsigned.to_string()), 3);
+    send(&carol_client, cid, 2, "after the deletion")
+        .await
+        .unwrap();
+    alice_client
+        .sync()
+        .await
+        .expect_err("an unverifiable deletion stops sync");
+    assert_eq!(
+        timeline(&alice_client, cid),
+        timeline_of(&[(2, "from a living account")]),
+        "an unsigned deletion purges nothing and no later entry passes it"
+    );
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+
+    setEntry(cid, &account_deletion_entry(cid, &bob, 3, true).to_string());
+    alice_client.sync().await.unwrap();
+    assert_eq!(
+        timeline(&alice_client, cid),
+        timeline_of(&[(4, "after the deletion")]),
+        "verified deletion"
+    );
+    drop(alice_client);
+    let recorded = account_db(&alice)
+        .backend()
+        .get_labyrinth_state(&chat_wire::account_deletion_key(cid, &bob))
+        .unwrap();
+    assert_eq!(recorded.as_deref(), Some(b"3".as_slice()));
+}
+
+/// Own-echo Commit labels are only a routing hint: the body must verify under this device's
+/// signer before a Commit is skipped as already applied. Fail-before: an unsigned entry
+/// labelled with Alice's device was skipped and moved her cursor.
+#[wasm_bindgen_test]
+async fn a_commit_only_labelled_as_an_own_echo_is_rejected() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("echoalice"), did("echobob"));
+    let cid = "00000000-0000-4000-8000-0000000c000b";
+    let (alice_client, _bob_client) = conversation(&alice, &bob, cid).await;
+    let forged = json!({
+        "$type": "blue.catbird.chat.defs#commitEntry",
+        "entryId": uuid::Uuid::new_v4().to_string(),
+        "conversationId": cid,
+        "signedRequest": {"body": {
+            "$type": "blue.catbird.chat.defs#commitTransitionBody",
+            "actorDid": alice, "actorDeviceId": ALICE_DEVICE,
+            "commit": {"bytes": STANDARD.encode([0u8; 4])},
+        }},
+    });
+    assert_eq!(appendEntry(cid, &forged.to_string()), 2);
+    alice_client
+        .sync()
+        .await
+        .expect_err("an unsigned own-echo label is not an own Commit");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 1);
+}
+
+/// Device records are public: the session's bearer token never reaches the PDS a DID document
+/// names, which may be a peer's. Fail-before: every `listRecords` carried the session bearer.
+#[wasm_bindgen_test]
+async fn pds_record_reads_never_carry_the_session_bearer() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("beareralice"), did("bearerbob"));
+    let cid = "00000000-0000-4000-8000-0000000c000c";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    send(&bob_client, cid, 1, "hello").await.unwrap();
+    alice_client.sync().await.unwrap();
+    let auth: Vec<Option<String>> = serde_json::from_str(&repoReadAuth()).unwrap();
+    assert!(!auth.is_empty(), "sync read device records");
+    assert!(auth.iter().all(Option::is_none), "{auth:?}");
+}
+
+/// A received peer message is queued as a witness copy carrying its verified frame nonce,
+/// receipt and original-sender attestation, so pre-removal history never depends on its
+/// sender flushing (G11). Fail-before: only a sender's own device ever queued a copy.
+#[wasm_bindgen_test]
+async fn a_received_peer_message_is_queued_as_a_witness_copy() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("witnessalice"), did("witnessbob"));
+    let cid = "00000000-0000-4000-8000-0000000c000d";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    send(&bob_client, cid, 1, "witness me").await.unwrap();
+    drop(alice_client);
+    pause_archive(&alice);
+    let alice_client = open(&alice, ALICE_DEVICE).await;
+    alice_client.sync().await.unwrap();
+    drop(alice_client);
+    let queued = account_db(&alice)
+        .backend()
+        .list_labyrinth_queue(Some(cid), 10)
+        .unwrap();
+    assert_eq!(
+        queued
+            .iter()
+            .map(|row| (row.item_id.as_str(), row.seq))
+            .collect::<Vec<_>>(),
+        [(message_id(1).as_str(), 2)]
+    );
+    let witness: QueuedLabyrinthArchivePayload =
+        serde_json::from_slice(&queued[0].payload_bytes).unwrap();
+    assert_eq!(
+        (witness.sender_did.as_str(), witness.seq),
+        (bob.as_str(), 2)
+    );
+    assert!(
+        witness.frame_nonce_b64.is_some()
+            && witness.sequencer_receipt_json.is_some()
+            && witness.original_sender_attestation_json.is_some(),
+        "committed archive evidence"
+    );
+}
+
+/// An entry sync cannot classify stops it there, below the cursor: an application entry
+/// without a message id, an opening (`directRequestEntry`) past the cursor, and an entry of no
+/// known kind, each followed by Bob's genuine message. Fail-before: each was skipped and the
+/// later message moved the cursor past it.
+#[wasm_bindgen_test]
+async fn an_unclassifiable_entry_stops_sync_below_it() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("unknownalice"), did("unknownbob"));
+    let cid = "00000000-0000-4000-8000-0000000c000e";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    let received_at = "2026-11-07T00:00:00.000Z";
+    let cases = [
+        (
+            "an application entry without a message id",
+            json!({
+                "$type": "blue.catbird.chat.defs#applicationEntry", "seq": 2,
+                "conversationId": cid, "receivedAt": received_at,
+                "signedRequest": {"body": {"$type": "blue.catbird.chat.defs#applicationSendBody"}},
+            }),
+        ),
+        (
+            "an opening past the cursor",
+            json!({
+                "$type": "blue.catbird.chat.defs#directRequestEntry", "seq": 2,
+                "entryId": message_id(9), "conversationId": cid, "receivedAt": received_at,
+                "signedRequest": {"body": {
+                    "$type": "blue.catbird.chat.defs#directRequestPublicationBody",
+                }},
+            }),
+        ),
+        (
+            "an entry of no known kind",
+            json!({
+                "$type": "blue.catbird.chat.defs#mysteryEntry", "seq": 2,
+                "entryId": message_id(9), "conversationId": cid, "receivedAt": received_at,
+            }),
+        ),
+    ];
+    assert_eq!(appendEntry(cid, &cases[0].1.to_string()), 2);
+    send(&bob_client, cid, 1, "after it").await.unwrap();
+    for (case, entry) in cases {
+        setEntry(cid, &entry.to_string());
+        alice_client.sync().await.expect_err(case);
+        assert_eq!(conversation_row(&alice_client, cid).last_seq, 1, "{case}");
+        assert!(timeline(&alice_client, cid).is_empty(), "{case}");
+    }
+}
+
+/// A peer Commit applies only from its verified signed body: the body verifies under its
+/// actor's current leaf, the MLS Commit in it is that very leaf's, and once merged its signed
+/// `next` names the local MLS state one `stateVersion` on. Bob removes Carol; Alice is served
+/// that entry altered after signing, Bob's Commit in a body Carol (another leaf) signed, and
+/// Bob's body re-signed with a `next` two state versions on: each fails her sync with nothing
+/// merged, her cursor at 1 and no coordinates. The genuine entry then merges and writes its
+/// signed `next`. Fail-before: sync processed whatever Commit an entry carried and wrote its
+/// unverified `next`.
+#[wasm_bindgen_test]
+async fn a_peer_commit_applies_only_from_its_verified_body() {
+    let _restore = install_ds();
+    let (alice, bob, carol) = (did("commitalice"), did("commitbob"), did("commitcarol"));
+    let cid = "00000000-0000-4000-8000-0000000c000f";
+    let members = [
+        (alice.as_str(), ALICE_DEVICE),
+        (bob.as_str(), BOB_DEVICE),
+        (carol.as_str(), CAROL_DEVICE),
+    ];
+    let mut clients = group(&members, cid).await.into_iter();
+    let (alice_client, bob_client) = (clients.next().unwrap(), clients.next().unwrap());
+    drop(clients);
+    bob_client
+        .remove_group_member(true, cid.into(), carol.clone())
+        .await
+        .unwrap();
+    drop(bob_client);
+    let genuine = entry_at(cid, 2);
+    let (bob_signer, carol_signer) = (
+        device_signer(&account_db(&bob)),
+        device_signer(&account_db(&carol)),
+    );
+    let carols = resigned(
+        &genuine,
+        CanonicalOperation::SubmitTransition,
+        &carol_signer,
+        |body| {
+            body["actorDid"] = json!(carol);
+            body["actorDeviceId"] = json!(CAROL_DEVICE);
+        },
+    );
+    let skipping = resigned(
+        &genuine,
+        CanonicalOperation::SubmitTransition,
+        &bob_signer,
+        |body| body["next"]["stateVersion"] = json!(2),
+    );
+    for (case, entry) in [
+        ("altered after signing", altered(&genuine)),
+        ("Bob's Commit in Carol's body", carols),
+        ("a next two versions on", skipping),
+    ] {
+        setEntry(cid, &entry.to_string());
+        alice_client.sync().await.expect_err(case);
+        let row = conversation_row(&alice_client, cid);
+        assert_eq!((row.epoch, row.last_seq), (1, 1), "{case}");
+    }
+    setEntry(cid, &genuine.to_string());
+    alice_client.sync().await.unwrap();
+    let row = conversation_row(&alice_client, cid);
+    assert_eq!((row.epoch, row.last_seq), (2, 2));
+    drop(alice_client);
+    assert_eq!(
+        stored_coords(&alice, cid),
+        Some(canonical(&genuine["signedRequest"]["body"]["next"], cid))
+    );
+}
+
+/// A policy entry applies only under a current leaf, one `stateVersion` on. Alice invites
+/// Dave; Bob is served her policy altered after signing, signed by Dave (no leaf), and re-signed
+/// with a `next` two versions on: each fails his sync with his cursor at 1 and no coordinates.
+/// The genuine policy then writes its signed `next`. Fail-before: any policy entry moved the
+/// cursor and none wrote its coordinates.
+#[wasm_bindgen_test]
+async fn a_policy_entry_applies_only_under_a_current_leaf() {
+    let _restore = install_ds();
+    let (alice, bob, dave) = (did("policyalice"), did("policybob"), did("policydave"));
+    let cid = "00000000-0000-4000-8000-0000000c0010";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    enroll(&dave, DAVE_DEVICE).await;
+    alice_client
+        .add_group_members(cid.into(), serde_wasm_bindgen::to_value(&[&dave]).unwrap())
+        .await
+        .unwrap();
+    drop(alice_client);
+    let genuine = entry_at(cid, 2);
+    assert_eq!(genuine["$type"], "blue.catbird.chat.defs#policyEntry");
+    let (alice_signer, dave_signer) = (
+        device_signer(&account_db(&alice)),
+        device_signer(&account_db(&dave)),
+    );
+    let daves = resigned(
+        &genuine,
+        CanonicalOperation::SubmitTransition,
+        &dave_signer,
+        |body| {
+            body["actorDid"] = json!(dave);
+            body["actorDeviceId"] = json!(DAVE_DEVICE);
+        },
+    );
+    let skipping = resigned(
+        &genuine,
+        CanonicalOperation::SubmitTransition,
+        &alice_signer,
+        |body| body["next"]["stateVersion"] = json!(2),
+    );
+    for (case, entry) in [
+        ("altered after signing", altered(&genuine)),
+        ("signed by no leaf", daves),
+        ("a next two versions on", skipping),
+    ] {
+        setEntry(cid, &entry.to_string());
+        bob_client.sync().await.expect_err(case);
+        assert_eq!(conversation_row(&bob_client, cid).last_seq, 1, "{case}");
+    }
+    drop(bob_client);
+    assert_eq!(stored_coords(&bob, cid), None);
+    setEntry(cid, &genuine.to_string());
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    bob_client.sync().await.unwrap();
+    assert_eq!(conversation_row(&bob_client, cid).last_seq, 2);
+    drop(bob_client);
+    assert_eq!(
+        stored_coords(&bob, cid),
+        Some(canonical(&genuine["signedRequest"]["body"]["next"], cid))
+    );
+}
+
+/// Alice and Bob's conversation, in which Alice invites Dave (her policy entry at seq 2) and
+/// Dave's client accepts from his inventory (his participant acceptance at seq 3). Returns
+/// Bob's client.
+async fn invitation_accepted(alice: &str, bob: &str, dave: &str, cid: &str) -> WasmMlsClient {
+    let (alice_client, bob_client) = conversation(alice, bob, cid).await;
+    enroll(dave, DAVE_DEVICE).await;
+    alice_client
+        .add_group_members(cid.into(), serde_wasm_bindgen::to_value(&[dave]).unwrap())
+        .await
+        .unwrap();
+    let policy = entry_at(cid, 2);
+    let body = &policy["signedRequest"]["body"];
+    let pending = json!({
+        "userDid": dave, "status": "pending",
+        "invitationProvenance": body["participantChanges"][0]["invitationProvenance"],
+    });
+    let state = json!({
+        "conversationKind": "group", "coordinates": body["next"], "participants": [pending],
+    });
+    serveInventory(DAVE_DEVICE, &json!([{ "state": state }]).to_string());
+    open(dave, DAVE_DEVICE).await.sync().await.unwrap();
+    assert_eq!(
+        entry_at(cid, 3)["$type"],
+        "blue.catbird.chat.defs#participantAcceptanceEntry"
+    );
+    bob_client
+}
+
+/// A participant acceptance applies only under its actor's PDS-authorized device, one
+/// `stateVersion` on, and only when the invitation its signed provenance names verifies under
+/// its inviter's device and invites exactly that actor with exactly that provenance (found by
+/// paging history once it lies before this pass). Bob is served Dave's acceptance altered after
+/// signing, re-signed by Erin (never invited), re-signed naming Bob as the inviter, and
+/// re-signed two versions on: each fails his sync with his cursor and coordinates at Alice's
+/// policy. The genuine acceptance then writes its signed `next`. Fail-before: any participant
+/// acceptance moved the cursor and the coordinates unverified.
+#[wasm_bindgen_test]
+async fn a_participant_acceptance_applies_only_under_its_verified_invitation() {
+    let _restore = install_ds();
+    let (alice, bob, dave, erin) = (
+        did("acceptalice"),
+        did("acceptbob"),
+        did("acceptdave"),
+        did("accepterin"),
+    );
+    let cid = "00000000-0000-4000-8000-0000000c0011";
+    let bob_client = invitation_accepted(&alice, &bob, &dave, cid).await;
+    enroll(&erin, ERIN_DEVICE).await;
+    let genuine = entry_at(cid, 3);
+    let (dave_signer, erin_signer) = (
+        device_signer(&account_db(&dave)),
+        device_signer(&account_db(&erin)),
+    );
+    let accept = CanonicalOperation::AcceptConversation;
+    let uninvited = resigned(&genuine, accept, &erin_signer, |body| {
+        body["actorDid"] = json!(erin);
+        body["actorDeviceId"] = json!(ERIN_DEVICE);
+    });
+    let misattributed = resigned(&genuine, accept, &dave_signer, |body| {
+        body["invitationProvenance"]["invitedByDid"] = json!(bob);
+        body["invitationProvenance"]["invitedByDeviceId"] = json!(BOB_DEVICE);
+    });
+    let skipping = resigned(&genuine, accept, &dave_signer, |body| {
+        body["next"]["stateVersion"] = json!(3);
+    });
+    for (case, entry) in [
+        ("altered after signing", altered(&genuine)),
+        ("an actor nobody invited", uninvited),
+        ("another inviter's provenance", misattributed),
+        ("a next two versions on", skipping),
+    ] {
+        setEntry(cid, &entry.to_string());
+        bob_client.sync().await.expect_err(case);
+        assert_eq!(conversation_row(&bob_client, cid).last_seq, 2, "{case}");
+    }
+    drop(bob_client);
+    let policy_next = &entry_at(cid, 2)["signedRequest"]["body"]["next"];
+    assert_eq!(stored_coords(&bob, cid), Some(canonical(policy_next, cid)));
+    setEntry(cid, &genuine.to_string());
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    bob_client.sync().await.unwrap();
+    assert_eq!(conversation_row(&bob_client, cid).last_seq, 3);
+    drop(bob_client);
+    assert_eq!(
+        stored_coords(&bob, cid),
+        Some(canonical(&genuine["signedRequest"]["body"]["next"], cid))
+    );
+}
+
+/// mls-ds never makes a later joiner a recipient of control entries before it joined: when
+/// a device's readable history starts after seq 1 and lacks the invitation, the acceptance's
+/// device signature and coordinate step stand alone. Bob joined at seq 2 and reads from seq 3:
+/// Dave's acceptance applies. Once his history reaches seq 1, an acceptance naming an invitation
+/// that history lacks fails his sync. Fail-before: that acceptance applied unverified.
+#[wasm_bindgen_test]
+async fn a_later_joiner_takes_an_acceptance_whose_invitation_predates_its_history() {
+    let _restore = install_ds();
+    let (alice, bob, dave) = (did("joineralice"), did("joinerbob"), did("joinerdave"));
+    let cid = "00000000-0000-4000-8000-0000000c0012";
+    drop(invitation_accepted(&alice, &bob, &dave, cid).await);
+    account_db(&bob)
+        .write_tx(|tx| {
+            let mut row = tx.get_conversation(cid)?.unwrap();
+            row.last_seq = 2;
+            tx.upsert_conversation(&row)
+        })
+        .unwrap();
+    readableFrom(BOB_DEVICE, 3);
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    bob_client
+        .sync()
+        .await
+        .expect("its signature and step stand alone");
+    assert_eq!(conversation_row(&bob_client, cid).last_seq, 3);
+
+    readableFrom(BOB_DEVICE, 0);
+    let creation = json!({
+        "$type": "blue.catbird.chat.defs#creationEntry", "seq": 1,
+        "entryId": uuid::Uuid::new_v4().to_string(), "conversationId": cid,
+        "receivedAt": "2026-11-07T00:00:00.000Z",
+    });
+    setEntry(cid, &creation.to_string());
+    let genuine = entry_at(cid, 3);
+    let unknown = resigned(
+        &genuine,
+        CanonicalOperation::AcceptConversation,
+        &device_signer(&account_db(&dave)),
+        |body| {
+            body["prior"] = body["next"].clone();
+            body["next"]["stateVersion"] = json!(3);
+            body["invitationProvenance"]["invitationTransitionId"] =
+                json!(uuid::Uuid::new_v4().to_string());
+        },
+    );
+    assert_eq!(appendEntry(cid, &unknown.to_string()), 4);
+    bob_client
+        .sync()
+        .await
+        .expect_err("history from seq 1 lacks the invitation");
+    assert_eq!(conversation_row(&bob_client, cid).last_seq, 3);
+}
+
+/// A metadata entry applies only under a current leaf, one `stateVersion` on, and its snapshot
+/// only from the verified body. Bob renames the conversation; Alice is served his entry altered
+/// after signing, signed by Dave (no leaf), and re-signed two versions on: each fails her sync
+/// with no title, snapshot or coordinates and her cursor at 1. The genuine entry then applies.
+/// Fail-before: any metadata entry applied its snapshot and coordinates unverified.
+#[wasm_bindgen_test]
+async fn forged_metadata_never_changes_the_snapshot_or_coordinates() {
+    let _restore = install_ds();
+    let (alice, bob, dave) = (did("metaalice"), did("metabob"), did("metadave"));
+    let cid = "00000000-0000-4000-8000-0000000c0013";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    enroll(&dave, DAVE_DEVICE).await;
+    bob_client
+        .update_group_metadata(cid.into(), "renamed".into(), String::new())
+        .await
+        .unwrap();
+    drop(bob_client);
+    let genuine = entry_at(cid, 2);
+    assert_eq!(genuine["$type"], "blue.catbird.chat.defs#metadataEntry");
+    let (bob_signer, dave_signer) = (
+        device_signer(&account_db(&bob)),
+        device_signer(&account_db(&dave)),
+    );
+    let daves = resigned(
+        &genuine,
+        CanonicalOperation::SubmitTransition,
+        &dave_signer,
+        |body| {
+            body["actorDid"] = json!(dave);
+            body["actorDeviceId"] = json!(DAVE_DEVICE);
+        },
+    );
+    let skipping = resigned(
+        &genuine,
+        CanonicalOperation::SubmitTransition,
+        &bob_signer,
+        |body| body["next"]["stateVersion"] = json!(2),
+    );
+    for (case, entry) in [
+        ("altered after signing", altered(&genuine)),
+        ("signed by no leaf", daves),
+        ("a next two versions on", skipping),
+    ] {
+        setEntry(cid, &entry.to_string());
+        alice_client.sync().await.expect_err(case);
+        let row = conversation_row(&alice_client, cid);
+        assert_eq!((row.title, row.last_seq), (None, 1), "{case}");
+    }
+    drop(alice_client);
+    let snapshot = |account: &str| {
+        account_db(account)
+            .backend()
+            .get_account_meta(&format!("metadata_snapshot_json:{cid}"))
+            .unwrap()
+    };
+    assert_eq!((stored_coords(&alice, cid), snapshot(&alice)), (None, None));
+    setEntry(cid, &genuine.to_string());
+    let alice_client = open(&alice, ALICE_DEVICE).await;
+    alice_client.sync().await.unwrap();
+    let row = conversation_row(&alice_client, cid);
+    assert_eq!((row.title.as_deref(), row.last_seq), (Some("renamed"), 2));
+    drop(alice_client);
+    let body = &genuine["signedRequest"]["body"];
+    assert_eq!(
+        stored_coords(&alice, cid),
+        Some(canonical(&body["next"], cid))
+    );
+    assert_eq!(
+        snapshot(&alice).map(|raw| serde_json::from_str::<Value>(&raw).unwrap()),
+        Some(body["metadataSnapshot"].clone())
+    );
+}
+
+/// A verified close is applied as the terminal close: the MLS group and its journals are
+/// erased, the signed `retired` coordinate and the closed marker written, the cursor moved and
+/// nothing acknowledged; later syncs skip the conversation. A close retiring two versions on
+/// fails Alice's sync first with nothing changed. Fail-before: a close only moved the cursor,
+/// so the conversation was never closed on web.
+#[wasm_bindgen_test]
+async fn a_verified_close_is_applied_as_the_terminal_close() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("closealice"), did("closebob"));
+    let cid = "00000000-0000-4000-8000-0000000c0014";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(bob_client);
+    let bob_signer = device_signer(&account_db(&bob));
+    let prior = group_coords(&bob, cid);
+    let close = |retired_version: i64| {
+        let mut retired = prior.clone();
+        retired["stateVersion"] = json!(retired_version);
+        retired["lifecycle"] = json!("superseded");
+        let transition = uuid::Uuid::new_v4().to_string();
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseBody",
+            "signatureDomain": "CATBIRD-CHAT-CLOSE\0",
+            "transitionId": transition, "idempotencyKey": transition,
+            "actorDid": bob, "actorDeviceId": BOB_DEVICE, "authGeneration": 1,
+            "conversationKind": "group", "prior": prior, "retired": retired,
+            "signedAt": chat_wire::now_rfc3339_millis(),
+        });
+        let entry = json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseEntry", "seq": 2,
+            "entryId": transition, "conversationId": cid,
+            "receivedAt": "2026-11-07T00:00:00.000Z",
+            "signedRequest": signed(CanonicalOperation::CloseConversation, body, &bob_signer),
+        });
+        (entry, retired)
+    };
+    let (skipping, _) = close(2);
+    setEntry(cid, &skipping.to_string());
+    alice_client
+        .sync()
+        .await
+        .expect_err("a close retiring two versions on");
+    let row = conversation_row(&alice_client, cid);
+    assert_eq!((row.epoch, row.last_seq), (1, 1));
+
+    let (genuine, retired) = close(1);
+    setEntry(cid, &genuine.to_string());
+    alice_client.sync().await.unwrap();
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+    assert_eq!(
+        alice_client.sync().await.unwrap(),
+        0,
+        "a closed conversation is skipped"
+    );
+    assert_eq!(ackCount(), 0, "nothing acknowledged");
+    drop(alice_client);
+    assert_eq!(stored_coords(&alice, cid), Some(retired));
+    let db = account_db(&alice);
+    assert_eq!(
+        db.backend()
+            .get_account_meta(&format!("conversation_closed:{cid}"))
+            .unwrap()
+            .as_deref(),
+        Some("true")
+    );
+    let group_id = db
+        .backend()
+        .get_conversation(cid)
+        .unwrap()
+        .unwrap()
+        .group_id;
+    let mls = db.openmls_provider().unwrap();
+    assert!(
+        MlsGroup::load(mls.storage(), &GroupId::from_slice(&group_id))
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// An own Commit whose answer was lost is merged by its own echo only from its journal: with
+/// the Commit unmerged locally and no journal, the echo fails sync and writes nothing (never a
+/// `next` over an unmerged epoch); with the journal, the echo applies it and erases it.
+/// Fail-before: the echo wrote its `next` and moved the cursor with the epoch unmerged.
+#[wasm_bindgen_test]
+async fn an_unmerged_own_commit_echo_applies_only_its_journal() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("journalalice"), did("journalbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0015";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(bob_client);
+    loseNextTransition();
+    alice_client
+        .remove_group_member(true, cid.into(), bob.clone())
+        .await
+        .unwrap_err();
+    drop(alice_client);
+    let transition = &entry_at(cid, 2)["signedRequest"]["body"]["transitionId"];
+    let key = format!("commit_transition:{cid}:{}", transition.as_str().unwrap());
+    let journal = account_db(&alice)
+        .backend()
+        .get_account_meta(&key)
+        .unwrap()
+        .expect("journaled before HTTP");
+    account_db(&alice)
+        .write_tx(|tx| tx.delete_account_meta(&key))
+        .unwrap();
+    let alice_client = open(&alice, ALICE_DEVICE).await;
+    let error = alice_client
+        .sync()
+        .await
+        .expect_err("an unmerged own Commit without its journal")
+        .as_string()
+        .unwrap_or_default();
+    assert!(error.contains("no recovery journal"), "{error}");
+    let row = conversation_row(&alice_client, cid);
+    assert_eq!((row.epoch, row.last_seq), (1, 1));
+    drop(alice_client);
+    assert_eq!(stored_coords(&alice, cid), None);
+
+    account_db(&alice)
+        .write_tx(|tx| tx.put_account_meta(&key, &journal, 0))
+        .unwrap();
+    let alice_client = open(&alice, ALICE_DEVICE).await;
+    alice_client.sync().await.unwrap();
+    let row = conversation_row(&alice_client, cid);
+    assert_eq!((row.epoch, row.last_seq), (2, 2));
+    drop(alice_client);
+    let next = &entry_at(cid, 2)["signedRequest"]["body"]["next"];
+    assert_eq!(stored_coords(&alice, cid), Some(canonical(next, cid)));
+    assert_eq!(
+        account_db(&alice).backend().get_account_meta(&key).unwrap(),
+        None
+    );
+}
+
+/// Enroll Carol and serve Alice's device Carol's leaf-recovery request for `cid`, with a fresh
+/// KeyPackage Carol's database holds.
+async fn serve_recovery_request(carol: &str, cid: &str) {
+    enroll(carol, CAROL_DEVICE).await;
+    let db = account_db(carol);
+    let signer = device_signer(&db);
+    let mls = db.openmls_provider().unwrap();
+    let bundle = KeyPackage::builder()
+        .leaf_node_capabilities(capabilities())
+        .build(
+            CIPHERSUITE,
+            &mls,
+            &signer,
+            credential(carol, CAROL_DEVICE, &signer),
+        )
+        .unwrap();
+    let package = MlsMessageOut::from(bundle.key_package().clone())
+        .tls_serialize_detached()
+        .unwrap();
+    let package_ref = bundle.key_package().hash_ref(mls.crypto()).unwrap();
+    let request = json!({
+        "conversationId": cid, "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
+        "requesterDid": carol, "requesterDeviceId": CAROL_DEVICE,
+        "keyPackage": {
+            "bytes": STANDARD.encode(&package),
+            "keyPackageRef": STANDARD.encode(package_ref.as_slice()),
+        },
+    });
+    serveInbox(ALICE_DEVICE, &json!([request]).to_string());
+}
+
+/// Alice's leaf-recovery fulfillment is journaled before HTTP: its answer lost, her own echo
+/// merges it from the journal, writes its signed `next` and erases the journal. Fail-before:
+/// nothing was journaled, so the echo of the unmerged Commit failed her sync for good.
+#[wasm_bindgen_test]
+async fn a_lost_fulfillment_answer_is_merged_by_its_own_echo() {
+    let _restore = install_ds();
+    let (alice, bob, carol) = (did("fulfillalice"), did("fulfillbob"), did("fulfillcarol"));
+    let cid = "00000000-0000-4000-8000-0000000c0017";
+    let (alice_client, _bob_client) = conversation(&alice, &bob, cid).await;
+    serve_recovery_request(&carol, cid).await;
+    loseNextTransition();
+    alice_client
+        .sync()
+        .await
+        .expect_err("the fulfillment answer is lost");
+    serveInbox(ALICE_DEVICE, "[]");
+    assert_eq!(conversation_row(&alice_client, cid).epoch, 1);
+    alice_client.sync().await.unwrap();
+    let row = conversation_row(&alice_client, cid);
+    assert_eq!((row.epoch, row.last_seq), (2, 2));
+    drop(alice_client);
+    let next = &entry_at(cid, 2)["signedRequest"]["body"]["next"];
+    assert_eq!(stored_coords(&alice, cid), Some(canonical(next, cid)));
+    let db = account_db(&alice);
+    let transition = &entry_at(cid, 2)["signedRequest"]["body"]["transitionId"];
+    for key in [
+        format!("commit_transition:{cid}:{}", transition.as_str().unwrap()),
+        format!("commit_transitions:{cid}"),
+    ] {
+        assert_eq!(db.backend().get_account_meta(&key).unwrap(), None, "{key}");
+    }
+}
+
+/// A generic Welcome joins only as the verified Welcome of the signed leaf-recovery
+/// fulfillment sequenced at its `transitionSeq`, at that fulfillment's signed `next`. Alice
+/// fulfills Carol's recovery request (seq 2). Carol's pending Welcome view first names seq 1,
+/// where no fulfillment is: nothing joins and nothing is acknowledged. Naming seq 2, she joins
+/// at the fulfillment's signed `next` and acknowledges it, whatever coordinates the view
+/// forges. Fail-before: the view's Welcome joined at once, at its forged coordinates.
+#[wasm_bindgen_test]
+async fn a_generic_welcome_joins_only_as_its_verified_fulfillment() {
+    let _restore = install_ds();
+    let (alice, bob, carol) = (did("welcomealice"), did("welcomebob"), did("welcomecarol"));
+    let cid = "00000000-0000-4000-8000-0000000c0016";
+    let (alice_client, _bob_client) = conversation(&alice, &bob, cid).await;
+    serve_recovery_request(&carol, cid).await;
+    alice_client.sync().await.unwrap();
+    serveInbox(ALICE_DEVICE, "[]");
+    let fulfillment = entry_at(cid, 2);
+    assert_eq!(
+        fulfillment["$type"],
+        "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"
+    );
+    let body = &fulfillment["signedRequest"]["body"];
+    let next = canonical(&body["next"], cid);
+    let mut forged = next.clone();
+    forged["epoch"] = json!(7);
+    let view = |transition_seq: u32| {
+        json!([{
+            "welcomeId": uuid::Uuid::new_v4().to_string(), "conversationId": cid,
+            "transitionSeq": transition_seq, "coordinates": forged, "status": "pending",
+            "opaqueWelcome": body["manifest"]["welcomeBundle"]["opaqueWelcome"],
+            "recipientDid": carol, "recipientDeviceId": CAROL_DEVICE,
+        }])
+        .to_string()
+    };
+    let carol_client = open(&carol, CAROL_DEVICE).await;
+    let joined = |client: &WasmMlsClient| {
+        serde_wasm_bindgen::from_value::<Vec<ConversationRow>>(
+            client.list_conversations(None, 10).unwrap(),
+        )
+        .unwrap()
+    };
+    serveWelcomes(CAROL_DEVICE, &view(1));
+    carol_client.sync().await.unwrap();
+    assert!(joined(&carol_client).is_empty(), "no fulfillment at seq 1");
+    assert_eq!(welcomeAcks(), "[]");
+
+    serveWelcomes(CAROL_DEVICE, &view(2));
+    carol_client.sync().await.unwrap();
+    let row = conversation_row(&carol_client, cid);
+    assert_eq!((row.last_seq, row.epoch), (2, 2));
+    let acks: Vec<Value> = serde_json::from_str(&welcomeAcks()).unwrap();
+    assert_eq!(acks.len(), 1);
+    assert_eq!(canonical(&acks[0]["coordinates"], cid), next);
+    drop(carol_client);
+    assert_eq!(stored_coords(&carol, cid), Some(next));
 }

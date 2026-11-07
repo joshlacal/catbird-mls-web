@@ -1062,6 +1062,37 @@ impl SqliteConn {
         Ok(!rows.is_empty())
     }
 
+    /// The stored message `message_id`, whatever its conversation or seq.
+    pub fn get_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<catbird_mls::storage::MessageRow>, catbird_mls::MLSError> {
+        let rows = self
+            .query_text_int_blob(
+                "SELECT message_id, conversation_id, group_id, epoch, seq, sender_did, sender_device_id, plaintext_json, created_at_ms, is_own \
+                 FROM messages WHERE message_id = ?1",
+                &[(1, message_id)],
+                &[],
+                10,
+                &[2],
+            )
+            .map_err(map_wasm_mls_err)?;
+        Ok(rows.first().map(|row| message_row(row)))
+    }
+
+    /// Drops every queued archive item `sender_did` sent (a verified account deletion).
+    pub fn purge_labyrinth_queue_from_sender(
+        &self,
+        sender_did: &str,
+    ) -> Result<(), catbird_mls::MLSError> {
+        self.exec_with_text_params(
+            "DELETE FROM labyrinth_queue \
+             WHERE json_extract(CAST(payload_bytes AS TEXT), '$.sender_did') = ?1",
+            &[(1, sender_did)],
+        )
+        .map_err(map_wasm_mls_err)
+    }
+
     /// Extract the last error message from the database handle.
     pub fn last_error(&self, code: i32) -> WasmSqliteError {
         let msg = unsafe {
@@ -1097,6 +1128,23 @@ fn map_wasm_kv_err(err: WasmSqliteError) -> catbird_mls::storage::openmls_kv::Op
 
 fn map_wasm_mls_err(err: WasmSqliteError) -> catbird_mls::MLSError {
     catbird_mls::MLSError::Internal(err.to_string())
+}
+
+/// A `messages` row selected as `message_id, conversation_id, group_id (blob), epoch, seq,
+/// sender_did, sender_device_id, plaintext_json, created_at_ms, is_own`.
+fn message_row(r: &[(Option<String>, Option<Vec<u8>>)]) -> catbird_mls::storage::MessageRow {
+    catbird_mls::storage::MessageRow {
+        message_id: r[0].0.clone().unwrap_or_default(),
+        conversation_id: r[1].0.clone().unwrap_or_default(),
+        group_id: r[2].1.clone().unwrap_or_default(),
+        epoch: r[3].0.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
+        seq: r[4].0.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
+        sender_did: r[5].0.clone().unwrap_or_default(),
+        sender_device_id: r[6].0.clone().unwrap_or_default(),
+        plaintext_json: r[7].0.clone().unwrap_or_default(),
+        created_at_ms: r[8].0.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
+        is_own: r[9].0.as_deref() == Some("1"),
+    }
 }
 
 impl catbird_mls::storage::openmls_kv::KvBackend for SqliteConn {
@@ -1344,21 +1392,7 @@ impl catbird_mls::storage::driver_wasm::WasmSqlBackend for SqliteConn {
                 &[2],
             )
             .map_err(map_wasm_mls_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| catbird_mls::storage::MessageRow {
-                message_id: r[0].0.clone().unwrap_or_default(),
-                conversation_id: r[1].0.clone().unwrap_or_default(),
-                group_id: r[2].1.clone().unwrap_or_default(),
-                epoch: r[3].0.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
-                seq: r[4].0.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
-                sender_did: r[5].0.clone().unwrap_or_default(),
-                sender_device_id: r[6].0.clone().unwrap_or_default(),
-                plaintext_json: r[7].0.clone().unwrap_or_default(),
-                created_at_ms: r[8].0.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
-                is_own: r[9].0.as_deref() == Some("1"),
-            })
-            .collect())
+        Ok(rows.iter().map(|row| message_row(row)).collect())
     }
 
     fn purge_messages_from_sender(

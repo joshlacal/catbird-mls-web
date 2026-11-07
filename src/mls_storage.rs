@@ -2581,20 +2581,6 @@ impl MLSStorageBackend for WasmUnifiedStorage {
             .map_err(sql_to_orch_err)
     }
 
-    /// The same `account_meta` key `WasmMlsClient.sendMessage` advances, written durably
-    /// before the caller encrypts: a lost write would re-sign a counter `mls-ds` refuses.
-    async fn reserve_send_counter(&self, conversation_id: &str) -> OrchResult<u64> {
-        let key = catbird_mls::client::chat_wire::send_counter_key(conversation_id);
-        let last = self.conn.get_account_meta(&key).map_err(sql_to_orch_err)?;
-        let next = catbird_mls::client::chat_wire::next_send_counter(last.as_deref())
-            .map_err(sql_to_orch_err)?;
-        self.conn
-            .put_account_meta(&key, &next.to_string(), now_ms())
-            .map_err(sql_to_orch_err)?;
-        self.conn.ensure_durable().map_err(sql_to_orch_err)?;
-        Ok(next)
-    }
-
     async fn store_sequencer_receipt(&self, receipt: &SequencerReceipt) -> OrchResult<()> {
         let entry_id = hex::encode(&receipt.commit_hash);
         let json = serde_json::to_string(receipt)

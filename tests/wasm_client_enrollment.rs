@@ -1,7 +1,8 @@
 //! `WasmMlsClient.enrollDevice` re-enrollment over real encrypted OPFS, against a stateful fetch
 //! fixture with the `mls-ds` enrollment rules: `enrollDevice` is create-only
 //! (`DeviceAlreadyExists`), request-key revisions advance by one, and `getOwnDevices` reports
-//! the registered key. The fixture checks read-claim shape, not signatures.
+//! the registered key. The fixture checks read-claim shape, not signatures, and counts every
+//! call, PDS `putRecord` writes included.
 #![cfg(target_arch = "wasm32")]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_mls::client::{
@@ -17,7 +18,7 @@ let originalFetch;
 let ds;
 export function installDs() {
   originalFetch = globalThis.fetch;
-  ds = {keys: {}, revisions: {}, calls: {}, loseEnroll: false, loseKeys: false};
+  ds = {keys: {}, revisions: {}, calls: {}, loseEnroll: false, loseKeys: false, answerKey: null};
   globalThis.fetch = async (request) => {
     const reply = (body, status = 200) => {
       const r = new Response(JSON.stringify(body), {status, headers: {'content-type': 'application/json'}});
@@ -53,7 +54,9 @@ export function installDs() {
       const key = b.signaturePublicKey;
       ds.keys[b.deviceId] = typeof key === 'string' ? key : key.$bytes;
       if (ds.loseEnroll) { ds.loseEnroll = false; throw new Error('enrollDevice response lost'); }
-      return reply({device: {deviceId: b.deviceId, keyId: b.keyId, signaturePublicKey: b.signaturePublicKey,
+      // `answerKey`: an answer naming another key than the one this request registered.
+      const answered = ds.answerKey ? {$bytes: ds.answerKey} : b.signaturePublicKey;
+      return reply({device: {deviceId: b.deviceId, keyId: b.keyId, signaturePublicKey: answered,
         authGeneration: 1, status: 'active', availablePackageCount: 2, reservedPackageCount: 0,
         createdAt: '2026-11-03T00:00:00.000Z', updatedAt: '2026-11-03T00:00:00.000Z'}});
     }
@@ -70,6 +73,7 @@ export function installDs() {
 export function loseNextEnrollResponse() { ds.loseEnroll = true; }
 export function loseNextRequestKeysResponse() { ds.loseKeys = true; }
 export function holdDeviceKey(deviceId, key) { ds.keys[deviceId] = key; }
+export function answerEnrollWithKey(key) { ds.answerKey = key; }
 export function dsKey(deviceId) { return ds.keys[deviceId]; }
 export function dsRevision(deviceId) { return ds.revisions[deviceId] || 0; }
 export function dsCalls(nsid) { return ds.calls[nsid] || 0; }
@@ -80,6 +84,7 @@ extern "C" {
     fn loseNextEnrollResponse();
     fn loseNextRequestKeysResponse();
     fn holdDeviceKey(device_id: &str, key: &str);
+    fn answerEnrollWithKey(key: &str);
     fn dsKey(device_id: &str) -> Option<String>;
     fn dsRevision(device_id: &str) -> u32;
     fn dsCalls(nsid: &str) -> u32;
@@ -214,6 +219,48 @@ async fn retry_after_a_lost_request_keys_response_does_not_republish() {
         .expect("the retry skips the published request keys");
     assert_eq!(dsKey(device), Some(key));
     assert_eq!((dsRevision(device), dsCalls(REQUEST_KEYS)), (1, 1));
+}
+
+/// A key-mismatch refusal writes nothing to the PDS: `mls-ds` must hold the device under this
+/// key before either PDS record is written, whether it reports another key for an existing
+/// device ID (`DeviceAlreadyExists`) or answers a fresh enrollment naming another key. A device
+/// ID registered under another key keeps that key's PDS device record.
+///
+/// Fail-before: the PDS device and declaration records were written before `enrollDevice`, so
+/// both refusals had already replaced the PDS device record with this key.
+#[wasm_bindgen_test]
+async fn a_key_mismatch_refuses_before_any_pds_write() {
+    installDs();
+    let _restore = RestoreFetch;
+    let other_key = STANDARD.encode([7_u8; 32]);
+    let held = "00000000-0000-4000-8000-00000000e004";
+    holdDeviceKey(held, &other_key);
+    let client = open("did:plc:heldkeyaaaaaaaaaaaaaaaaa", held).await;
+    let error = enroll(&client)
+        .await
+        .expect_err("mls-ds holds the device under another key")
+        .as_string()
+        .unwrap();
+    assert!(error.contains("DeviceAlreadyExists"), "{error}");
+    assert_eq!(dsCalls("com.atproto.repo.putRecord"), 0, "{error}");
+
+    answerEnrollWithKey(&other_key);
+    let client = open(
+        "did:plc:answeredkeyaaaaaaaaaaaaa",
+        "00000000-0000-4000-8000-00000000e005",
+    )
+    .await;
+    let error = enroll(&client)
+        .await
+        .expect_err("mls-ds answered another key")
+        .as_string()
+        .unwrap();
+    assert!(
+        error.contains("EnrollmentDeviceIdentityMismatch"),
+        "{error}"
+    );
+    assert_eq!(dsCalls("com.atproto.repo.putRecord"), 0, "{error}");
+    assert_eq!(dsKey(held).as_deref(), Some(other_key.as_str()));
 }
 
 /// A non-UUIDv4 ID, or a missing session, once selected a local-only group, a receiptless queued

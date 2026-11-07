@@ -546,6 +546,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "js-sys",
+ "labyrinth",
  "labyrinth-protocol",
  "openmls",
  "openmls_basic_credential",

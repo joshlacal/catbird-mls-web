@@ -28,9 +28,12 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_libcrux_crypto::CryptoProvider as LibcruxCrypto;
 use openmls_traits::OpenMlsProvider;
 
+use catbird_mls::client::chat_wire;
 use catbird_mls::orchestrator::mls_provider::{
     IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome,
 };
+use catbird_mls::orchestrator::ReservedApplicationSend;
+use catbird_mls::storage::driver_wasm::WasmSqlBackend as _;
 use catbird_mls::{
     AddMembersResult, CredentialData, DecryptResult, EncryptResult, ExternalCommitResult,
     GroupConfig, GroupCreationResult, KeyPackageData, KeyPackageResult, MLSError, WelcomeResult,
@@ -55,6 +58,8 @@ impl From<crate::sqlite_conn::WasmSqliteError> for MLSError {
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 const BUCKET_SIZES: [usize; 5] = [512, 1024, 2048, 4096, 8192];
+/// `pending_ops` kind of the orchestrator's pre-HTTP application send journal (seed 2323).
+const ORCHESTRATOR_APPLICATION_SEND_OP: &str = "orchestrator_application_send";
 
 /// The delivery service validates every KeyPackage leaf against a closed
 /// "clean leaf" profile: MLS 1.0 only, the XWING suite only, no extensions, no
@@ -1231,33 +1236,63 @@ impl WasmMLSContext {
         })
     }
 
-    pub(crate) fn encrypt_canonical_message(
+    /// [`MlsCryptoContext::reserve_application_send`] on this database: the next `sendCounter`,
+    /// the sender-ratchet advance and the send journal commit in one storage transaction, or
+    /// none does. A journal already reserved for `message_id` is returned unchanged. The cached
+    /// group is replaced only by the committed state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_application_send(
         &self,
         group_id: Vec<u8>,
+        expected_epoch: u64,
+        conversation_id: &str,
+        message_id: &str,
         plaintext: Vec<u8>,
         aad: Vec<u8>,
-        expected_epoch: u64,
-    ) -> Result<EncryptResult, MLSError> {
-        if aad.is_empty() || aad.len() > 64 * 1024 {
+        complete: &dyn Fn(u64, &[u8]) -> Result<ReservedApplicationSend, MLSError>,
+    ) -> Result<ReservedApplicationSend, MLSError> {
+        if aad.is_empty() || aad.len() > 16 * 1024 {
             return Err(MLSError::invalid_input(
-                "Canonical application AAD is missing or exceeds its bound",
+                "Invalid canonical application AAD length",
             ));
         }
         self.require_published_group(&group_id)?;
-        // The transaction owns ratchet advancement. Publish a fresh cache entry
-        // only after its ciphertext and ratchet are durably committed.
-        self.groups.borrow_mut().remove(&group_id);
         let conn = self.provider.storage().conn();
-        let (group, ciphertext) = conn.transaction(|| -> Result<_, MLSError> {
+        if let Some(raw) = conn
+            .query_text(
+                "SELECT payload_json FROM pending_ops WHERE op_kind = ?1 AND op_key = ?2",
+                &[(1, ORCHESTRATOR_APPLICATION_SEND_OP), (2, message_id)],
+                1,
+            )?
+            .into_iter()
+            .next()
+            .and_then(|mut row| row.pop().flatten())
+        {
+            let reserved: ReservedApplicationSend =
+                serde_json::from_str(&raw).map_err(|_| MLSError::SerializationError)?;
+            if reserved.conversation_id != conversation_id || reserved.message_id != message_id {
+                return Err(MLSError::invalid_input(
+                    "message_id already reserved for a different send",
+                ));
+            }
+            return Ok(reserved);
+        }
+        // The transaction owns the ratchet advance: a rolled-back attempt leaves no cached
+        // group behind, and the committed state is cached only once it is durable.
+        self.groups.borrow_mut().remove(&group_id);
+        let (group, reserved) = conn.transaction(|| -> Result<_, MLSError> {
             let mut group =
                 MlsGroup::load(self.provider.storage(), &GroupId::from_slice(&group_id))
                     .map_err(|_| MLSError::StorageFailed)?
                     .ok_or_else(|| MLSError::group_not_found("Canonical message group missing"))?;
             if group.epoch().as_u64() != expected_epoch {
                 return Err(MLSError::invalid_input(
-                    "MLS epoch changed before application encryption",
+                    "Canonical application epoch changed before encryption",
                 ));
             }
+            let counter_key = chat_wire::send_counter_key(conversation_id);
+            let send_counter =
+                chat_wire::next_send_counter(conn.get_account_meta(&counter_key)?.as_deref())?;
             let leaf = group
                 .own_leaf()
                 .ok_or_else(|| MLSError::invalid_input("Group has no own leaf"))?;
@@ -1266,24 +1301,68 @@ impl WasmMLSContext {
                 leaf.signature_key().as_slice().to_vec(),
             )?;
             group.set_aad(aad);
-            let result = group
+            let message = group
                 .create_message(&self.provider, signer.as_ref(), &plaintext)
-                .map_err(|_| MLSError::EncryptionFailed)
-                .and_then(|message| {
-                    message
-                        .tls_serialize_detached()
-                        .map_err(|_| MLSError::SerializationError)
-                });
+                .map_err(|_| MLSError::EncryptionFailed);
             group.set_aad(Vec::new());
-            Ok((group, result?))
+            let ciphertext = message?
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+            let reserved = complete(send_counter, &ciphertext)?;
+            let journal =
+                serde_json::to_string(&reserved).map_err(|_| MLSError::SerializationError)?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            conn.put_account_meta(&counter_key, &send_counter.to_string(), now_ms)?;
+            conn.exec_with_text_int_blob_params(
+                "INSERT INTO pending_ops (op_kind, op_key, payload_json, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    (1, ORCHESTRATOR_APPLICATION_SEND_OP),
+                    (2, message_id),
+                    (3, journal.as_str()),
+                ],
+                &[(4, now_ms)],
+                &[],
+            )?;
+            Ok((group, reserved))
         })?;
         conn.ensure_durable()?;
         self.groups.borrow_mut().insert(group_id, group);
-        Ok(EncryptResult {
-            padded_size: u32::try_from(ciphertext.len())
-                .map_err(|_| MLSError::SerializationError)?,
-            ciphertext,
-        })
+        Ok(reserved)
+    }
+
+    /// [`MlsCryptoContext::discard_application_send`].
+    pub(crate) fn discard_application_send(&self, message_id: &str) -> Result<(), MLSError> {
+        let conn = self.provider.storage().conn();
+        conn.exec_with_text_params(
+            "DELETE FROM pending_ops WHERE op_kind = ?1 AND op_key = ?2",
+            &[(1, ORCHESTRATOR_APPLICATION_SEND_OP), (2, message_id)],
+        )?;
+        conn.ensure_durable()?;
+        Ok(())
+    }
+
+    /// [`MlsCryptoContext::reserved_application_send`].
+    pub(crate) fn reserved_application_send(
+        &self,
+        conversation_id: &str,
+        ciphertext_sha256: &[u8; 32],
+    ) -> Result<Option<ReservedApplicationSend>, MLSError> {
+        let rows = self.provider.storage().conn().query_text(
+            "SELECT payload_json FROM pending_ops WHERE op_kind = ?1",
+            &[(1, ORCHESTRATOR_APPLICATION_SEND_OP)],
+            1,
+        )?;
+        for raw in rows.into_iter().filter_map(|mut row| row.pop().flatten()) {
+            let reserved: ReservedApplicationSend =
+                serde_json::from_str(&raw).map_err(|_| MLSError::SerializationError)?;
+            if reserved.conversation_id == conversation_id
+                && &reserved.ciphertext_sha256 == ciphertext_sha256
+            {
+                return Ok(Some(reserved));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn decrypt_message(
@@ -1819,14 +1898,37 @@ impl MlsCryptoContext for WasmMLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         WasmMLSContext::export_group_info(self, group_id, signer_identity)
     }
-    fn encrypt_message_with_aad(
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_application_send(
         &self,
         group_id: Vec<u8>,
+        expected_epoch: u64,
+        conversation_id: &str,
+        message_id: &str,
         plaintext: Vec<u8>,
         aad: Vec<u8>,
-        expected_epoch: u64,
-    ) -> Result<EncryptResult, MLSError> {
-        self.encrypt_canonical_message(group_id, plaintext, aad, expected_epoch)
+        complete: &dyn Fn(u64, &[u8]) -> Result<ReservedApplicationSend, MLSError>,
+    ) -> Result<ReservedApplicationSend, MLSError> {
+        WasmMLSContext::reserve_application_send(
+            self,
+            group_id,
+            expected_epoch,
+            conversation_id,
+            message_id,
+            plaintext,
+            aad,
+            complete,
+        )
+    }
+    fn discard_application_send(&self, message_id: &str) -> Result<(), MLSError> {
+        WasmMLSContext::discard_application_send(self, message_id)
+    }
+    fn reserved_application_send(
+        &self,
+        conversation_id: &str,
+        ciphertext_sha256: &[u8; 32],
+    ) -> Result<Option<ReservedApplicationSend>, MLSError> {
+        WasmMLSContext::reserved_application_send(self, conversation_id, ciphertext_sha256)
     }
     fn encrypt_message(
         &self,

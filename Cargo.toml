@@ -93,6 +93,9 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 # audiopus_sys/CMake voice stack into this browser-only crate.
 catbird_mls = { path = "../catbird-mls", default-features = false, features = ["browser"] }
 catbird-atproto = { path = "../catbird-atproto" }
+# Labyrinth records, MEKs and directory for the browser archive (already in the graph via
+# catbird_mls).
+labyrinth = { path = "../labyrinth", features = ["space"] }
 
 # SQLite for WASM — raw FFI bindings with sqlite3mc encryption. Keep this out
 # of native checks/tests: its OPFS VFS and C amalgamation only run in WASM.

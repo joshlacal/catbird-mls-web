@@ -1,10 +1,10 @@
 {
-  "coreRevision": "9a2708e192197c5b787f2330c2456c5b42063dfe",
+  "coreRevision": "c045032d42a7a68f320a3bc8f2162e503cab5645",
   "artifacts": [
     {
       "target": "src/generated/blue.catbird.chat.defs.json",
       "source": "src/orchestrator/generated/blue.catbird.chat.defs.json",
-      "sha256": "274d54fdec818968a87ae22dd94221fdaf33930ecf42621e07c635ead4321dc3"
+      "sha256": "57f32467a21dea19e89749644a14da8b59edc8d30841ddeb3cec4b93520eac4f"
     },
     {
       "target": "tests/fixtures/mls_chat_signing_domain_vectors.json",

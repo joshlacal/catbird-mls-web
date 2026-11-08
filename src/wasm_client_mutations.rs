@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use catbird_mls::chat_v2::ids::BareDid;
 use catbird_mls::chat_v2::transcript::direct_request as dr_transcript;
+use catbird_mls::chat_v2::transcript::SignedMutationKind;
 use catbird_mls::client::chat_wire;
 use catbird_mls::client::{normalize_account_did, QueuedLabyrinthArchivePayload};
 use catbird_mls::groups::lifecycle::{enforce_admin_removal_policy, MemberRole};
@@ -41,6 +42,8 @@ use catbird_mls::storage::{
     OpenMlsKvProvider, OpenMlsKvStorage,
 };
 use catbird_mls::MLSError;
+
+use crate::wasm_client_sync::apply_verified_roster_effects;
 
 use crate::wasm_client::{now_ms, now_secs, WasmMlsClient, CIPHERSUITE};
 
@@ -859,7 +862,9 @@ impl WasmMlsClient {
             "metadataSnapshot": meta_snap_json,
             "signedAt": chat_wire::now_rfc3339_millis(),
         });
-
+        // The roster this manifest names becomes this device's verified roster once the
+        // creation's answer verifies; every later verified transition keeps it current.
+        let roster = chat_wire::roster_from_participants(&create_body["manifest"]["participants"])?;
         let resp = self
             .submit_signed_chat_op(
                 session_token,
@@ -918,6 +923,11 @@ impl WasmMlsClient {
             tx.put_account_meta(
                 &format!("metadata_snapshot_json:{canonical_convo_id}"),
                 &snap_str,
+                ts,
+            )?;
+            tx.put_account_meta(
+                &chat_wire::conversation_roster_key(canonical_convo_id),
+                &roster.to_string(),
                 ts,
             )?;
             Ok(row)
@@ -1015,10 +1025,24 @@ impl WasmMlsClient {
                 &coords_str,
                 ts,
             )?;
+            // The verified answer applies the policy: its echo then moves only the cursor.
+            apply_verified_roster_effects(
+                tx,
+                conversation_id,
+                SignedMutationKind::PolicyTransition,
+                &policy_body,
+                ts,
+            )?;
             Ok(row)
         })?;
         let _ = self
-            .fulfill_leaf_recovery_inbox(&session_token, &canonical_dev_id, &signer, auth_gen, None)
+            .fulfill_leaf_recovery(
+                &session_token,
+                &canonical_dev_id,
+                &signer,
+                auth_gen,
+                conversation_id,
+            )
             .await;
         Ok(db
             .backend()
@@ -1116,13 +1140,7 @@ impl WasmMlsClient {
 
         if let Some(gap_convo) = gap_convo_opt {
             let _ = self
-                .sync_conversation_entries(
-                    &session_token,
-                    &canonical_dev_id,
-                    &signer,
-                    auth_gen,
-                    &gap_convo,
-                )
+                .sync_conversation_entries(&session_token, &canonical_dev_id, &signer, &gap_convo)
                 .await;
         }
 
@@ -1931,13 +1949,15 @@ impl WasmMlsClient {
 
     /// Submit this device's own Commit-bearing transition `body` (`I6`: outside `write_tx`),
     /// journaled as `pending` under [`commit_transition_key`] before HTTP. A verified answer
-    /// applies, in one transaction, the staged MLS batch, its epoch, the signed `next` and
-    /// metadata snapshot and the cursor (only onto the next entry), erases this journal and
-    /// prunes every one it supersedes: `true`. A verified answer past a cursor gap changes
-    /// nothing, since the entries before it still need this epoch's roster; the own echo in sync
-    /// applies the journal: `false`. A lost, transient or unverifiable answer is an error that
-    /// keeps the journal for that echo; a terminal refusal erases this journal alone, since
-    /// mls-ds will never sequence those bytes.
+    /// applies, in one transaction, the staged MLS batch, its epoch, the signed `next`, metadata
+    /// snapshot and manifest participant effects on the verified roster, and the cursor (only
+    /// onto the next entry), erases this journal and prunes every one it supersedes: `true`. A
+    /// verified answer past a cursor gap changes nothing, since the entries before it still need
+    /// this epoch's roster; the own echo in sync applies the journal: `false`. Either way the
+    /// sequenced Commit moved the coordinate, so its verified answer drops any leaf-recovery
+    /// authorization. A lost, transient or unverifiable answer is an error that keeps the
+    /// journal for that echo; a terminal refusal erases this journal alone, since mls-ds will
+    /// never sequence those bytes.
     pub(crate) async fn submit_own_commit(
         &self,
         session_token: &str,
@@ -1980,6 +2000,7 @@ impl WasmMlsClient {
         let epoch = pending.next["epoch"].as_i64().unwrap_or_default();
         let ts = now_ms();
         db.write_tx(|tx| {
+            tx.delete_account_meta(&chat_wire::leaf_recovery_authorization_key(cid))?;
             let convo = tx.get_conversation(cid)?;
             if convo
                 .as_ref()
@@ -1998,6 +2019,14 @@ impl WasmMlsClient {
             }
             tx.put_account_meta(&format!("metadata_snapshot_json:{cid}"), &snapshot, ts)?;
             tx.put_account_meta(&format!("conversation_coords:{cid}"), &coords, ts)?;
+            // The verified answer applies its own transition, participant effects included; its
+            // echo then moves only the cursor.
+            if let Some(kind) = body["$type"]
+                .as_str()
+                .and_then(SignedMutationKind::from_type_id)
+            {
+                apply_verified_roster_effects(tx, cid, kind, body, ts)?;
+            }
             remove_commit_transition(tx, cid, transition_id)?;
             prune_commit_transitions(tx, cid, generation, epoch, false)?;
             Ok(true)

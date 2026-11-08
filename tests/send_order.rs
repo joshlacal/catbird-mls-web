@@ -72,7 +72,8 @@ function sequence(text) {
   ds.accepted[`${cid} ${b.messageId}`] = {text, response: {entry}};
   return [200, {entry}];
 }
-// A signed transition or acceptance is sequenced as the entry its body names.
+// A signed transition or acceptance is sequenced as the entry its body names, and its `next` is
+// the conversation's state coordinate.
 function transition(text) {
   ds.transitions.push(text);
   const signedRequest = JSON.parse(text).signedRequest;
@@ -81,7 +82,24 @@ function transition(text) {
   const entry = {$type: `blue.catbird.chat.defs#${b.$type.split('#')[1].replace(/(Transition)?Body$/, 'Entry')}`,
     entryId: b.transitionId, conversationId: cid, seq: ++ds.seq[cid], signedRequest, receivedAt: b.signedAt};
   ds.entries[cid].push(entry);
+  if (b.next) ds.coords[cid] = b.next;
   return entry;
+}
+// mls-ds opens an acceptance's add recovery bound to its `next`, reserving one of the KeyPackages
+// the accepting device enrolled with, lists it in `getConversationState` and answers with it.
+function openRecovery(b) {
+  const kp = (ds.kps[b.actorDeviceId] || []).shift();
+  if (!kp) return undefined;
+  const cid = b.next.conversationId;
+  const ids = {conversationId: cid, recoveryRequestId: b.recoveryRequestId, boundCoordinate: b.next,
+    requesterDid: b.actorDid, requesterDeviceId: b.actorDeviceId};
+  const view = {$type: 'blue.catbird.chat.defs#leafRecoveryView', ...ids,
+    recoveryKind: 'add', status: 'open', requestedAt: b.signedAt, expiresAt: '2099-01-01T00:00:00.000Z',
+    reservation: {...ids, requesterKeyId: b.keyId, requesterAuthGeneration: b.authGeneration,
+      keyPackageRef: kp.keyPackageRef, cipherSuite: 'MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519',
+      purpose: 'leafRecovery', status: 'active', expiresAt: '2099-01-01T00:00:00.000Z', keyPackage: kp}};
+  (ds.recoveries[cid] ||= []).push(view);
+  return view;
 }
 const entryAt = (cid, seq) => ds.entries[cid].find((e) => e.seq === seq);
 export function installDs(receipt, didDoc) {
@@ -90,7 +108,7 @@ export function installDs(receipt, didDoc) {
   ds = {records: {}, sends: [], accepted: {}, order: {}, seq: {}, entries: {}, held: [],
     hold: 0, lose: 0, refuse: false, enforce: true, keyGeneration: 1, acks: 0, repoReadAuth: [],
     transitions: [], loseTransition: 0, inventory: {}, welcomes: {}, inbox: {}, welcomeAcks: [],
-    floor: {}};
+    floor: {}, kps: {}, coords: {}, recoveries: {}, acked: {}};
   globalThis.fetch = async (request) => {
     const reply = (body, status = 200) => {
       const r = new Response(JSON.stringify(body), {status, headers: {'content-type': 'application/json'}});
@@ -117,6 +135,7 @@ export function installDs(receipt, didDoc) {
           .map(([uri, value]) => ({uri, cid: 'bafyfixture', value}))});
       }
       case 'blue.catbird.chat.enrollDevice':
+        ds.kps[b.deviceId] = b.keyPackages.slice();
         return reply({device: {deviceId: b.deviceId, keyId: b.keyId, signaturePublicKey: b.signaturePublicKey,
           authGeneration: 1, status: 'active', availablePackageCount: 2, reservedPackageCount: 0,
           createdAt: '2026-11-07T00:00:00.000Z', updatedAt: '2026-11-07T00:00:00.000Z'}});
@@ -142,7 +161,12 @@ export function installDs(receipt, didDoc) {
         return reply({entries: (ds.entries[url.searchParams.get('conversationId')] || [])
           .filter((e) => e.seq > after && e.seq >= (ds.floor[device] || 0)), hasMore: false});
       }
-      case 'blue.catbird.chat.acknowledgeEntries': ds.acks++; return reply({});
+      case 'blue.catbird.chat.acknowledgeEntries': {
+        const a = JSON.parse(text);
+        ds.acks++;
+        ds.acked[`${a.conversationId} ${a.actorDeviceId}`] = a.upToSeq;
+        return reply({});
+      }
       case 'blue.catbird.chat.submitTransition': {
         const entry = transition(text);
         if (ds.loseTransition > 0) {
@@ -153,15 +177,21 @@ export function installDs(receipt, didDoc) {
       }
       case 'blue.catbird.chat.acceptConversation': {
         const entry = transition(text);
-        return reply({coordinates: entry.signedRequest.body.next, entry});
+        return reply({coordinates: entry.signedRequest.body.next, entry, recovery: openRecovery(b)});
       }
       case 'blue.catbird.chat.acknowledgeWelcome': ds.welcomeAcks.push(b); return reply({});
       case 'blue.catbird.chat.getConversations':
         return reply({items: ds.inventory[device] || [], hasMore: false});
       case 'blue.catbird.chat.getPendingWelcomes':
         return reply({items: ds.welcomes[device] || [], hasMore: false});
+      // Requests mls-ds lists to a device as its own; a fulfiller never takes work from here.
       case 'blue.catbird.chat.getLeafRecoveryInbox':
         return reply({items: ds.inbox[device] || [], hasMore: false});
+      case 'blue.catbird.chat.getConversationState': {
+        const cid = url.searchParams.get('conversationId');
+        return reply({state: {conversationId: cid, coordinates: ds.coords[cid]},
+          pendingLeafRecoveryRequests: ds.recoveries[cid] || []});
+      }
       default: return reply({error: 'NotFound', message: nsid}, 404);
     }
   };
@@ -204,6 +234,13 @@ export function loseNextTransition() { ds.loseTransition += 1; }
 export function serveInventory(device, items) { ds.inventory[device] = JSON.parse(items); }
 export function serveWelcomes(device, items) { ds.welcomes[device] = JSON.parse(items); }
 export function serveInbox(device, items) { ds.inbox[device] = JSON.parse(items); }
+// The leaf recoveries `getConversationState` lists for `cid`, replacing what it listed.
+export function serveRecoveries(cid, items) { ds.recoveries[cid] = JSON.parse(items); }
+export function recoveriesJson(cid) { return JSON.stringify(ds.recoveries[cid] || []); }
+// One of `device`'s enrolled KeyPackages, no longer reservable by mls-ds.
+export function takeKeyPackage(device) { return JSON.stringify(ds.kps[device].shift()); }
+// The highest seq `device` acknowledged in `cid`, 0 before any.
+export function ackedUpTo(cid, device) { return ds.acked[`${cid} ${device}`] || 0; }
 // `device` joined later: it reads only the entries from `seq` on.
 export function readableFrom(device, seq) { ds.floor[device] = seq; }
 // Serve `entry` at its own seq, replacing the entry there.
@@ -237,6 +274,10 @@ extern "C" {
     fn serveInventory(device: &str, items: &str);
     fn serveWelcomes(device: &str, items: &str);
     fn serveInbox(device: &str, items: &str);
+    fn serveRecoveries(cid: &str, items: &str);
+    fn recoveriesJson(cid: &str) -> String;
+    fn takeKeyPackage(device: &str) -> String;
+    fn ackedUpTo(cid: &str, device: &str) -> u32;
     fn readableFrom(device: &str, seq: u32);
     fn setEntry(cid: &str, entry: &str);
     fn entryJson(cid: &str, seq: u32) -> String;
@@ -1008,8 +1049,8 @@ async fn a_stored_message_replayed_at_another_seq_never_moves_the_cursor() {
 }
 
 /// Without the conversation's MLS group there is no roster to authenticate an entry against:
-/// sync fails and acknowledges nothing. Fail-before: the entry counted as applied, the cursor
-/// moved and its seq was acknowledged to `mls-ds`.
+/// the row reads none of its entries, so nothing is applied or acknowledged. Fail-before: the
+/// entry counted as applied, the cursor moved and its seq was acknowledged to `mls-ds`.
 #[wasm_bindgen_test]
 async fn an_entry_without_its_mls_group_is_never_acknowledged() {
     let _restore = install_ds();
@@ -1026,6 +1067,8 @@ async fn an_entry_without_its_mls_group_is_never_acknowledged() {
         })
         .unwrap();
     let alice_client = open(&alice, ALICE_DEVICE).await;
+    // Its sync owes only Alice's own recovery request, from a state this fixture leaves without
+    // coordinates: that request is never signed either.
     alice_client
         .sync()
         .await
@@ -1348,31 +1391,41 @@ async fn a_policy_entry_applies_only_under_a_current_leaf() {
     );
 }
 
-/// Alice and Bob's conversation, in which Alice invites Dave (her policy entry at seq 2) and
-/// Dave's client accepts from his inventory (his participant acceptance at seq 3). Returns
-/// Bob's client.
-async fn invitation_accepted(alice: &str, bob: &str, dave: &str, cid: &str) -> WasmMlsClient {
-    let (alice_client, bob_client) = conversation(alice, bob, cid).await;
-    enroll(dave, DAVE_DEVICE).await;
-    alice_client
-        .add_group_members(cid.into(), serde_wasm_bindgen::to_value(&[dave]).unwrap())
+/// `inviter` invites `invitee` to `cid`, standing at seq 1 (the policy entry at seq 2), and
+/// `invitee`'s client on `device` accepts from its inventory (the participant acceptance at
+/// seq 3), whereupon mls-ds lists the acceptance's add recovery.
+async fn accept_invitation(inviter: &WasmMlsClient, invitee: &str, device: &str, cid: &str) {
+    enroll(invitee, device).await;
+    inviter
+        .add_group_members(
+            cid.into(),
+            serde_wasm_bindgen::to_value(&[invitee]).unwrap(),
+        )
         .await
         .unwrap();
     let policy = entry_at(cid, 2);
     let body = &policy["signedRequest"]["body"];
     let pending = json!({
-        "userDid": dave, "status": "pending",
+        "userDid": invitee, "status": "pending",
         "invitationProvenance": body["participantChanges"][0]["invitationProvenance"],
     });
     let state = json!({
         "conversationKind": "group", "coordinates": body["next"], "participants": [pending],
     });
-    serveInventory(DAVE_DEVICE, &json!([{ "state": state }]).to_string());
-    open(dave, DAVE_DEVICE).await.sync().await.unwrap();
+    serveInventory(device, &json!([{ "state": state }]).to_string());
+    open(invitee, device).await.sync().await.unwrap();
+    serveInventory(device, "[]");
     assert_eq!(
         entry_at(cid, 3)["$type"],
         "blue.catbird.chat.defs#participantAcceptanceEntry"
     );
+}
+
+/// Alice and Bob's conversation, in which Alice invites Dave and Dave accepts
+/// ([`accept_invitation`]). Returns Bob's client.
+async fn invitation_accepted(alice: &str, bob: &str, dave: &str, cid: &str) -> WasmMlsClient {
+    let (alice_client, bob_client) = conversation(alice, bob, cid).await;
+    accept_invitation(&alice_client, dave, DAVE_DEVICE, cid).await;
     bob_client
 }
 
@@ -1427,6 +1480,8 @@ async fn a_participant_acceptance_applies_only_under_its_verified_invitation() {
     let policy_next = &entry_at(cid, 2)["signedRequest"]["body"]["next"];
     assert_eq!(stored_coords(&bob, cid), Some(canonical(policy_next, cid)));
     setEntry(cid, &genuine.to_string());
+    // mls-ds lists no recovery for Dave here: the acceptance alone applies.
+    serveRecoveries(cid, "[]");
     let bob_client = open(&bob, BOB_DEVICE).await;
     bob_client.sync().await.unwrap();
     assert_eq!(conversation_row(&bob_client, cid).last_seq, 3);
@@ -1697,64 +1752,44 @@ async fn an_unmerged_own_commit_echo_applies_only_its_journal() {
     );
 }
 
-/// Enroll Carol and serve Alice's device Carol's leaf-recovery request for `cid`, with a fresh
-/// KeyPackage Carol's database holds.
-async fn serve_recovery_request(carol: &str, cid: &str) {
-    enroll(carol, CAROL_DEVICE).await;
-    let db = account_db(carol);
-    let signer = device_signer(&db);
-    let mls = db.openmls_provider().unwrap();
-    let bundle = KeyPackage::builder()
-        .leaf_node_capabilities(capabilities())
-        .build(
-            CIPHERSUITE,
-            &mls,
-            &signer,
-            credential(carol, CAROL_DEVICE, &signer),
-        )
-        .unwrap();
-    let package = MlsMessageOut::from(bundle.key_package().clone())
-        .tls_serialize_detached()
-        .unwrap();
-    let package_ref = bundle.key_package().hash_ref(mls.crypto()).unwrap();
-    let request = json!({
-        "conversationId": cid, "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
-        "requesterDid": carol, "requesterDeviceId": CAROL_DEVICE,
-        "keyPackage": {
-            "bytes": STANDARD.encode(&package),
-            "keyPackageRef": STANDARD.encode(package_ref.as_slice()),
-        },
-    });
-    serveInbox(ALICE_DEVICE, &json!([request]).to_string());
-}
-
-/// Alice's leaf-recovery fulfillment is journaled before HTTP: its answer lost, her own echo
-/// merges it from the journal, writes its signed `next` and erases the journal. Fail-before:
-/// nothing was journaled, so the echo of the unmerged Commit failed her sync for good.
+/// Alice's leaf-recovery fulfillment is journaled before HTTP. Alice invites Carol, Carol
+/// accepts, and Alice's sync fulfills the add her acceptance requested (seq 4) with its answer
+/// lost: her own echo merges it from the journal, writes its signed `next` and erases the
+/// journal. Fail-before: nothing was journaled, so the echo of the unmerged Commit failed her
+/// sync for good.
 #[wasm_bindgen_test]
 async fn a_lost_fulfillment_answer_is_merged_by_its_own_echo() {
     let _restore = install_ds();
     let (alice, bob, carol) = (did("fulfillalice"), did("fulfillbob"), did("fulfillcarol"));
     let cid = "00000000-0000-4000-8000-0000000c0017";
     let (alice_client, _bob_client) = conversation(&alice, &bob, cid).await;
-    serve_recovery_request(&carol, cid).await;
+    accept_invitation(&alice_client, &carol, CAROL_DEVICE, cid).await;
     loseNextTransition();
     alice_client
         .sync()
         .await
         .expect_err("the fulfillment answer is lost");
-    serveInbox(ALICE_DEVICE, "[]");
     assert_eq!(conversation_row(&alice_client, cid).epoch, 1);
     alice_client.sync().await.unwrap();
     let row = conversation_row(&alice_client, cid);
-    assert_eq!((row.epoch, row.last_seq), (2, 2));
+    assert_eq!((row.epoch, row.last_seq), (2, 4));
     drop(alice_client);
-    let next = &entry_at(cid, 2)["signedRequest"]["body"]["next"];
-    assert_eq!(stored_coords(&alice, cid), Some(canonical(next, cid)));
+    let fulfillment = entry_at(cid, 4);
+    assert_eq!(
+        fulfillment["$type"],
+        "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"
+    );
+    let body = &fulfillment["signedRequest"]["body"];
+    assert_eq!(
+        stored_coords(&alice, cid),
+        Some(canonical(&body["next"], cid))
+    );
     let db = account_db(&alice);
-    let transition = &entry_at(cid, 2)["signedRequest"]["body"]["transitionId"];
     for key in [
-        format!("commit_transition:{cid}:{}", transition.as_str().unwrap()),
+        format!(
+            "commit_transition:{cid}:{}",
+            body["transitionId"].as_str().unwrap()
+        ),
         format!("commit_transitions:{cid}"),
     ] {
         assert_eq!(db.backend().get_account_meta(&key).unwrap(), None, "{key}");
@@ -1763,20 +1798,20 @@ async fn a_lost_fulfillment_answer_is_merged_by_its_own_echo() {
 
 /// A generic Welcome joins only as the verified Welcome of the signed leaf-recovery
 /// fulfillment sequenced at its `transitionSeq`, at that fulfillment's signed `next`. Alice
-/// fulfills Carol's recovery request (seq 2). Carol's pending Welcome view first names seq 1,
-/// where no fulfillment is: nothing joins and nothing is acknowledged. Naming seq 2, she joins
-/// at the fulfillment's signed `next` and acknowledges it, whatever coordinates the view
-/// forges. Fail-before: the view's Welcome joined at once, at its forged coordinates.
+/// invites Carol, Carol accepts and Alice fulfills her add (seq 4). Carol's pending Welcome view
+/// first names seq 1, where no fulfillment is: nothing joins and nothing is acknowledged. Naming
+/// seq 4, she joins at the fulfillment's signed `next` and acknowledges it, whatever
+/// coordinates the view forges. Fail-before: the view's Welcome joined at once, at its forged
+/// coordinates.
 #[wasm_bindgen_test]
 async fn a_generic_welcome_joins_only_as_its_verified_fulfillment() {
     let _restore = install_ds();
     let (alice, bob, carol) = (did("welcomealice"), did("welcomebob"), did("welcomecarol"));
     let cid = "00000000-0000-4000-8000-0000000c0016";
     let (alice_client, _bob_client) = conversation(&alice, &bob, cid).await;
-    serve_recovery_request(&carol, cid).await;
+    accept_invitation(&alice_client, &carol, CAROL_DEVICE, cid).await;
     alice_client.sync().await.unwrap();
-    serveInbox(ALICE_DEVICE, "[]");
-    let fulfillment = entry_at(cid, 2);
+    let fulfillment = entry_at(cid, 4);
     assert_eq!(
         fulfillment["$type"],
         "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"
@@ -1806,13 +1841,434 @@ async fn a_generic_welcome_joins_only_as_its_verified_fulfillment() {
     assert!(joined(&carol_client).is_empty(), "no fulfillment at seq 1");
     assert_eq!(welcomeAcks(), "[]");
 
-    serveWelcomes(CAROL_DEVICE, &view(2));
+    serveWelcomes(CAROL_DEVICE, &view(4));
     carol_client.sync().await.unwrap();
     let row = conversation_row(&carol_client, cid);
-    assert_eq!((row.last_seq, row.epoch), (2, 2));
+    assert_eq!((row.last_seq, row.epoch), (4, 2));
     let acks: Vec<Value> = serde_json::from_str(&welcomeAcks()).unwrap();
     assert_eq!(acks.len(), 1);
     assert_eq!(canonical(&acks[0]["coordinates"], cid), next);
     drop(carol_client);
     assert_eq!(stored_coords(&carol, cid), Some(next));
+}
+
+/// One conversation's failing entry never stops another conversation's sync. Alice and Bob
+/// share two groups; mls-ds serves Alice, in the first, Bob's genuine message and then one
+/// altered after signing, and in the second Bob's genuine message. Alice's sync fails naming
+/// only the first conversation, its cursor and acknowledgement at the genuine message before
+/// the altered one; the second conversation's message applies and is acknowledged. The altered
+/// entry keeps failing only its own conversation.
+///
+/// Fail-before (web `7be78145`): `sync_impl` returned at the first failing conversation (`?` on
+/// `sync_conversation_entries`, itself returning before its acknowledgement), so that
+/// conversation's verified prefix was never acknowledged and no later conversation was read.
+#[wasm_bindgen_test]
+async fn one_conversations_failing_entry_never_stops_another() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("isolatealice"), did("isolatebob"));
+    let (first, second) = (
+        "00000000-0000-4000-8000-0000000c0018",
+        "00000000-0000-4000-8000-0000000c0019",
+    );
+    drop(conversation(&alice, &bob, first).await);
+    let (alice_client, bob_client) = conversation(&alice, &bob, second).await;
+    send(&bob_client, first, 1, "genuine").await.unwrap();
+    send(&bob_client, first, 2, "altered").await.unwrap();
+    send(&bob_client, second, 3, "other").await.unwrap();
+    setEntry(first, &altered(&entry_at(first, 3)).to_string());
+    for _ in 0..2 {
+        let error = alice_client
+            .sync()
+            .await
+            .expect_err("the altered entry fails its conversation")
+            .as_string()
+            .unwrap_or_default();
+        assert!(
+            error.starts_with("sync incomplete")
+                && error.contains(&format!("conversation {first}: "))
+                && !error.contains(second),
+            "{error}"
+        );
+        let first_row = conversation_row(&alice_client, first);
+        assert_eq!((first_row.last_seq, ackedUpTo(first, ALICE_DEVICE)), (2, 2));
+        assert_eq!(
+            timeline(&alice_client, first),
+            timeline_of(&[(2, "genuine")])
+        );
+        let second_row = conversation_row(&alice_client, second);
+        assert_eq!(
+            (second_row.last_seq, ackedUpTo(second, ALICE_DEVICE)),
+            (2, 2)
+        );
+        assert_eq!(
+            timeline(&alice_client, second),
+            timeline_of(&[(2, "other")])
+        );
+    }
+}
+
+/// A verified `resetActivationEntry` retires this device's old-generation leaf (`CHAT_PROTOCOL`
+/// §6: every old leaf but the activator only closes), from exactly the state this device holds
+/// and only under an active admin of its verified roster. Alice renames the conversation (seq 2)
+/// and Bob syncs it; Alice then activates a reset (seq 3). With no verified roster Bob's sync
+/// fails `RosterUnverified`; with Alice recorded only as a member it fails as not an admin; with
+/// her an active admin, an activation retiring a coordinate Bob already left, and one opening
+/// its successor on the retired group ID, fail too: each with nothing changed. The genuine one
+/// moves his conversation to the successor generation's group, coordinate and cursor in one
+/// step, erases the old group and acknowledges nothing. Retired, he reads nothing past the
+/// reset: an old-generation message after it, and the activation replayed there, leave his
+/// cursor at the reset.
+///
+/// Fail-before (web `7be78145`): `verify_control_entry` took a reset activation as cursor-only
+/// (`binds_only`) under any participant device, so Bob's sync passed it without any roster,
+/// kept the retired group as current and went on applying old-generation entries.
+#[wasm_bindgen_test]
+async fn reset_activation_retires_the_old_leaf_from_exactly_its_current_state() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("resetalice"), did("resetbob"));
+    let cid = "00000000-0000-4000-8000-0000000c001a";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    alice_client
+        .update_group_metadata(cid.into(), "before the reset".into(), String::new())
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let before = conversation_row(&bob_client, cid);
+    drop((alice_client, bob_client));
+    let prior = stored_coords(&bob, cid).expect("Bob recorded the rename");
+    let generation = prior["generation"].as_i64().unwrap();
+    let alice_signer = device_signer(&account_db(&alice));
+    let alice_key = alice_signer.public().to_vec();
+    let successor_group = [0x5a_u8; 32];
+    let activation = |prior: &Value, successor_group: &[u8]| {
+        let mut retired = prior.clone();
+        retired["stateVersion"] = json!(prior["stateVersion"].as_i64().unwrap() + 1);
+        retired["lifecycle"] = json!("superseded");
+        let bytes = |byte: u8| json!({ "$bytes": STANDARD.encode([byte; 32]) });
+        let successor = json!({
+            "conversationId": cid, "generation": generation + 1, "stateVersion": 0,
+            "groupId": { "$bytes": STANDARD.encode(successor_group) }, "epoch": 0,
+            "groupContextHash": bytes(0x61), "confirmationTag": bytes(0x62),
+            "lifecycle": "active",
+        });
+        let transition = uuid::Uuid::new_v4().to_string();
+        let (ciphertext, group_info) = ([0x63_u8; 48], [0x64_u8; 64]);
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#resetActivationBody",
+            "signatureDomain": "CATBIRD-CHAT-RESET-ACTIVATE\0",
+            "resetRequestId": uuid::Uuid::new_v4().to_string(), "transitionId": transition,
+            "idempotencyKey": transition, "actorDid": alice, "actorDeviceId": ALICE_DEVICE,
+            "conversationKind": "group", "authGeneration": 1,
+            "prior": prior, "retired": retired, "successor": successor,
+            "manifest": {
+                "participants": [
+                    { "userDid": alice, "role": "admin", "status": "active" },
+                    { "userDid": bob, "role": "member", "status": "active" },
+                ],
+                "actorLeaf": { "userDid": alice, "deviceId": ALICE_DEVICE, "leafOrigin": "genesis" },
+            },
+            "genesisGroupInfo": {
+                "framing": "mlsMessage", "contentType": "groupInfo",
+                "bytes": { "$bytes": STANDARD.encode(group_info) },
+                "sha256": STANDARD.encode(Sha256::digest(group_info)),
+            },
+            "metadataSnapshot": {
+                "authorProof": {
+                    "authGenerationAtOrigin": 1, "authorDeviceId": ALICE_DEVICE,
+                    "authorDid": alice, "authorKeyId": derive_key_id(&alice_key),
+                    "deviceStatusAtOrigin": "active", "originSeq": 1,
+                    "originTransitionId": transition, "roleAtOrigin": "admin",
+                    "signaturePublicKey": { "$bytes": STANDARD.encode(&alice_key) },
+                },
+                "ciphertext": { "$bytes": STANDARD.encode(ciphertext) },
+                "ciphertextSha256": STANDARD.encode(Sha256::digest(ciphertext)),
+                "ciphertextSize": ciphertext.len(),
+                "coordinate": {
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(cid).unwrap().as_bytes()),
+                    "generation": generation + 1, "epoch": 0,
+                    "groupId": { "$bytes": STANDARD.encode(successor_group) },
+                    "groupContextHash": bytes(0x61), "confirmationTag": bytes(0x62),
+                },
+                "metadataVersion": 2, "nonce": { "$bytes": STANDARD.encode([0x65_u8; 12]) },
+                "originTransitionId": transition,
+            },
+            "signedAt": "2026-11-07T00:00:00.000Z",
+        });
+        json!({
+            "$type": "blue.catbird.chat.defs#resetActivationEntry", "seq": 3,
+            "entryId": transition, "conversationId": cid,
+            "receivedAt": "2026-11-07T00:00:00.000Z",
+            "signedRequest": signed(CanonicalOperation::ActivateReset, body, &alice_signer),
+        })
+    };
+    // Bob's verified roster, as a creation, verified reset or roster attestation records it.
+    let record_roster = |alice_role: &str| {
+        let mut roster = json!({});
+        roster[alice.as_str()] = json!({ "role": alice_role, "status": "active" });
+        roster[bob.as_str()] = json!({ "role": "member", "status": "active" });
+        account_db(&bob)
+            .write_tx(|tx| {
+                tx.put_account_meta(
+                    &chat_wire::conversation_roster_key(cid),
+                    &roster.to_string(),
+                    0,
+                )
+            })
+            .unwrap();
+    };
+    let members = |client: &WasmMlsClient| {
+        serde_wasm_bindgen::from_value::<Vec<Value>>(client.list_members(cid.into()).unwrap())
+            .unwrap()
+            .len()
+    };
+
+    let genuine = activation(&prior, &successor_group);
+    let mut left = prior.clone();
+    left["stateVersion"] = json!(prior["stateVersion"].as_i64().unwrap() - 1);
+    let retired_group = chat_wire::json_bytes(&prior["groupId"]).unwrap();
+    assert_eq!(appendEntry(cid, &genuine.to_string()), 3);
+    for (case, roster, entry, reason) in [
+        (
+            "no verified roster",
+            None,
+            genuine.clone(),
+            format!("no verified roster for conversation {cid}"),
+        ),
+        (
+            "a member activator",
+            Some("member"),
+            genuine.clone(),
+            format!("{alice} is not an active admin"),
+        ),
+        (
+            "a prior Bob already left",
+            Some("admin"),
+            activation(&left, &successor_group),
+            "prior is not this device's current coordinate".to_owned(),
+        ),
+        (
+            "a successor on the retired group",
+            Some("admin"),
+            activation(&prior, &retired_group),
+            "successor is not a fresh group".to_owned(),
+        ),
+    ] {
+        if let Some(role) = roster {
+            record_roster(role);
+        }
+        setEntry(cid, &entry.to_string());
+        let bob_client = open(&bob, BOB_DEVICE).await;
+        let error = bob_client
+            .sync()
+            .await
+            .expect_err(case)
+            .as_string()
+            .unwrap_or_default();
+        assert!(error.contains(&reason), "{case}: {error}");
+        assert_eq!(
+            (conversation_row(&bob_client, cid), members(&bob_client)),
+            (before.clone(), 2),
+            "{case}"
+        );
+        drop(bob_client);
+        assert_eq!(stored_coords(&bob, cid), Some(prior.clone()), "{case}");
+    }
+
+    setEntry(cid, &genuine.to_string());
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    bob_client
+        .sync()
+        .await
+        .expect("the genuine activation retires Bob's leaf");
+    let retired = conversation_row(&bob_client, cid);
+    assert_eq!(
+        (
+            retired.generation,
+            retired.group_id.as_slice(),
+            retired.epoch,
+            retired.last_seq
+        ),
+        (generation + 1, successor_group.as_slice(), 0, 3)
+    );
+    assert_eq!(members(&bob_client), 0, "the old group is erased");
+    assert!(send(&bob_client, cid, 9, "retired").await.is_err());
+    assert_eq!(
+        ackedUpTo(cid, BOB_DEVICE),
+        2,
+        "nothing acknowledged past the reset"
+    );
+    bob_client
+        .sync()
+        .await
+        .expect("nothing past the reset is read");
+    drop(bob_client);
+    let successor = canonical(&genuine["signedRequest"]["body"]["successor"], cid);
+    assert_eq!(stored_coords(&bob, cid), Some(successor));
+
+    // Alice's old-generation message is sequenced after the reset (seq 4).
+    let alice_client = open(&alice, ALICE_DEVICE).await;
+    let _ = send(&alice_client, cid, 1, "old generation").await;
+    drop(alice_client);
+    let old_generation = entry_at(cid, 4);
+    assert_eq!(
+        old_generation["$type"],
+        "blue.catbird.chat.defs#applicationEntry"
+    );
+    let mut replayed = genuine;
+    replayed["seq"] = json!(4);
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    for (case, entry) in [
+        ("an old-generation message", old_generation),
+        ("the activation replayed", replayed),
+    ] {
+        setEntry(cid, &entry.to_string());
+        bob_client
+            .sync()
+            .await
+            .unwrap_or_else(|error| panic!("{case} is never read: {error:?}"));
+        assert_eq!(conversation_row(&bob_client, cid).last_seq, 3, "{case}");
+    }
+}
+
+/// Leaf-recovery fulfillment adds only the requester of a pending invitation this device
+/// verified: the add request of a participant acceptance whose invitation verified, for exactly
+/// that device, key, auth generation and KeyPackage, at exactly the coordinate the acceptance
+/// bound it to, and only once. mls-ds lists Alice a request for Carol, whom nobody invited yet,
+/// with one of her own enrolled KeyPackages at the current coordinate, in Alice's inbox and in
+/// the conversation state alike: Alice commits nothing and nothing moves. Alice then invites
+/// Carol and Carol accepts; mls-ds lists her request with Bob's KeyPackage, Bob's key, another
+/// auth generation and Bob's device: each fails that conversation's sync with no Commit sent
+/// and Alice's MLS state unchanged. The genuine request adds Carol once; listed again at the
+/// new coordinate, it adds nothing.
+///
+/// Fail-before (web `7be78145`): `fulfill_leaf_recovery_inbox` fulfilled every request
+/// `getLeafRecoveryInbox` listed whose KeyPackage was the requesting account's own, so a
+/// delivery service could get anyone with a registered device added.
+#[wasm_bindgen_test]
+async fn leaf_recovery_fulfills_only_a_verified_pending_acceptance() {
+    let _restore = install_ds();
+    let (alice, bob, carol) = (did("recoveralice"), did("recoverbob"), did("recovercarol"));
+    let cid = "00000000-0000-4000-8000-0000000c001b";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(bob_client);
+    enroll(&carol, CAROL_DEVICE).await;
+    let key_id = |account: &str| derive_key_id(device_signer(&account_db(account)).public());
+    let package =
+        |device: &str| -> Value { serde_json::from_str(&takeKeyPackage(device)).unwrap() };
+    let (bob_key_id, bob_package) = (key_id(&bob), package(BOB_DEVICE));
+    let (carol_key_id, carol_package) = (key_id(&carol), package(CAROL_DEVICE));
+    let fulfillments = || {
+        serde_json::from_str::<Vec<String>>(&dsTransitions())
+            .unwrap()
+            .iter()
+            .filter(|text| text.contains("leafRecoveryFulfillmentBody"))
+            .count()
+    };
+    let local = |client: &WasmMlsClient| {
+        let row = conversation_row(client, cid);
+        (fulfillments(), row.epoch, row.last_seq)
+    };
+
+    // A request for a device nobody invited is no work: nothing is sent or moves.
+    let current = group_coords(&bob, cid);
+    let injected_id = uuid::Uuid::new_v4().to_string();
+    let injected = json!([{
+        "$type": "blue.catbird.chat.defs#leafRecoveryView",
+        "conversationId": cid, "recoveryRequestId": injected_id,
+        "requesterDid": carol, "requesterDeviceId": CAROL_DEVICE,
+        "recoveryKind": "add", "boundCoordinate": current, "status": "open",
+        "requestedAt": "2026-11-07T00:00:00.000Z", "expiresAt": "2099-01-01T00:00:00.000Z",
+        "reservation": {
+            "conversationId": cid, "recoveryRequestId": injected_id, "boundCoordinate": current,
+            "requesterDid": carol, "requesterDeviceId": CAROL_DEVICE,
+            "requesterKeyId": carol_key_id, "requesterAuthGeneration": 1,
+            "keyPackageRef": carol_package["keyPackageRef"],
+            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+            "purpose": "leafRecovery", "status": "active",
+            "expiresAt": "2099-01-01T00:00:00.000Z", "keyPackage": carol_package,
+        },
+    }])
+    .to_string();
+    serveInbox(ALICE_DEVICE, &injected);
+    serveRecoveries(cid, &injected);
+    let before = local(&alice_client);
+    alice_client
+        .sync()
+        .await
+        .expect("a request this device cannot authorize is no error");
+    assert_eq!(local(&alice_client), before, "nobody invited Carol");
+    serveInbox(ALICE_DEVICE, "[]");
+    serveRecoveries(cid, "[]");
+
+    // Alice invites Carol and Carol accepts; mls-ds lists her request with any field the
+    // acceptance did not authorize.
+    accept_invitation(&alice_client, &carol, CAROL_DEVICE, cid).await;
+    let genuine = serde_json::from_str::<Vec<Value>>(&recoveriesJson(cid))
+        .unwrap()
+        .pop()
+        .expect("Carol's request");
+    assert_eq!(genuine["requesterDid"], carol);
+    let forged = |edit: &dyn Fn(&mut Value)| {
+        let mut request = genuine.clone();
+        edit(&mut request);
+        json!([request]).to_string()
+    };
+    let variants = [
+        (
+            "another device's KeyPackage",
+            forged(&|request| {
+                request["reservation"]["keyPackage"] = bob_package.clone();
+                request["reservation"]["keyPackageRef"] = bob_package["keyPackageRef"].clone();
+            }),
+            "not the authorized device's own",
+        ),
+        (
+            "another key",
+            forged(&|request| request["reservation"]["requesterKeyId"] = json!(bob_key_id)),
+            "not the authorized request",
+        ),
+        (
+            "another auth generation",
+            forged(&|request| request["reservation"]["requesterAuthGeneration"] = json!(2)),
+            "not the authorized request",
+        ),
+        (
+            "another device",
+            forged(&|request| {
+                request["requesterDeviceId"] = json!(BOB_DEVICE);
+                request["reservation"]["requesterDeviceId"] = json!(BOB_DEVICE);
+            }),
+            "not the authorized request",
+        ),
+    ];
+    for (case, requests, reason) in variants {
+        serveRecoveries(cid, &requests);
+        let error = alice_client
+            .sync()
+            .await
+            .expect_err(case)
+            .as_string()
+            .unwrap_or_default();
+        assert!(
+            error.contains(&format!("conversation {cid}: ")) && error.contains(reason),
+            "{case}: {error}"
+        );
+        // The acceptance itself applied once; nothing else moved.
+        assert_eq!(local(&alice_client), (before.0, before.1, 3), "{case}");
+    }
+
+    serveRecoveries(cid, &json!([genuine]).to_string());
+    alice_client.sync().await.expect("the authorized add");
+    assert_eq!(local(&alice_client), (before.0 + 1, before.1 + 1, 4));
+    // Listed again at the new coordinate, the consumed request adds nothing.
+    let current = entry_at(cid, 4)["signedRequest"]["body"]["next"].clone();
+    let mut again = genuine;
+    again["boundCoordinate"] = current.clone();
+    again["reservation"]["boundCoordinate"] = current;
+    serveRecoveries(cid, &json!([again]).to_string());
+    alice_client
+        .sync()
+        .await
+        .expect("a consumed request is no work");
+    assert_eq!(local(&alice_client), (before.0 + 1, before.1 + 1, 4));
 }

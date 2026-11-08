@@ -111,7 +111,10 @@ export function installDs(respond, accept, didDocs, preparation) {
         return reply({items: ds.inventory[param('actorDeviceId')] || [], hasMore: false});
       case 'blue.catbird.chat.getPendingWelcomes':
         return reply({items: ds.welcomes[param('actorDeviceId')] || [], hasMore: false});
-      case 'blue.catbird.chat.getLeafRecoveryInbox': return reply({items: [], hasMore: false});
+      // No leaf recovery is pending in any conversation here.
+      case 'blue.catbird.chat.getConversationState':
+        return reply({state: {conversationId: param('conversationId')},
+          pendingLeafRecoveryRequests: []});
       case 'blue.catbird.chat.getEntries': {
         const after = Number(param('afterSeq'));
         return reply({entries: (ds.entries[param('conversationId')] || []).filter((e) => e.seq > after),
@@ -1102,7 +1105,11 @@ async fn a_synced_acceptance_changes_nothing_until_it_verifies() {
     ] {
         serveEntries(cid, &json!([entry]).to_string());
         let error = sync(&alice_client).await.expect_err(case);
-        assert!(error.starts_with("Cryptography error:"), "{case}: {error}");
+        // The conversation fails alone, inside the typed aggregate.
+        assert!(
+            error.contains(&format!("conversation {cid}: Cryptography error:")),
+            "{case}: {error}"
+        );
         assert_eq!(
             request(&alice_client, cid).consent,
             "outgoingPending",
@@ -1172,7 +1179,7 @@ async fn a_relabeled_acceptance_never_accepts_the_request() {
             .await
             .expect_err(&format!("{entry_kind} around {body_kind}"));
         assert!(
-            error.starts_with("Cryptography error:"),
+            error.contains(&format!("conversation {cid}: Cryptography error:")),
             "{entry_kind} around {body_kind}: {error}"
         );
         assert_eq!(conversation(&alice_client, cid).last_seq, 1, "{entry_kind}");

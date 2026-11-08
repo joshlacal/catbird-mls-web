@@ -144,10 +144,10 @@ impl SqliteConn {
             code: SQLITE_CANTOPEN,
             message: format!("OPFS initialization failed: {error}"),
         })?;
-        // The library's six-file default cannot hold several accounts plus
-        // SQLite journals. Reserve bounded persistent capacity without deleting
-        // retained databases or falling back to ephemeral storage.
-        pool.reserve_minimum_capacity(64)
+        // DELETE releases the journal entry after each transaction, so the
+        // original 128 slots still hold 128 persistent account databases.
+        // reserve_minimum_capacity grows existing smaller pools in place.
+        pool.reserve_minimum_capacity(128)
             .await
             .map_err(|error| WasmSqliteError::Sqlite {
                 code: SQLITE_CANTOPEN,
@@ -169,7 +169,7 @@ impl SqliteConn {
 
     /// Open a database at the given path with sqlite3mc ChaCha20 encryption
     /// (`PRAGMA cipher = 'chacha20';` BEFORE `PRAGMA key = "x'<64-hex>'";`,
-    /// rollback journal `DELETE`, never `WAL`) and ensure the unified 15-table schema.
+    /// rollback journal `DELETE` (retained-journal modes corrupt rollback on this VFS, never `WAL`)
     pub fn open(db_path: &str, key: &str) -> Result<Self, WasmSqliteError> {
         crate::browser_session::check()
             .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
@@ -226,8 +226,10 @@ impl SqliteConn {
         // 1. PRAGMA cipher = 'chacha20';
         // 2. PRAGMA key = "x'<64-hex>'";
         // 3. PRAGMA page_size = 4096;
-        // 4. PRAGMA journal_mode = DELETE; (never WAL on opfs-sahpool)
+        // 4. PRAGMA journal_mode = DELETE; (retained-journal modes corrupt rollback)
         // 5. PRAGMA synchronous = FULL;
+        // DELETE has a residual crash window because rsqlite-vfs ignores xDelete's syncDir
+        // flag and sahpool does not flush its logical filename-header deletion.
         let init_pragmas = catbird_mls::storage::wasm_sqlite3mc_init_pragmas(&key_bytes);
         conn.exec_raw(&init_pragmas)?;
         // Force key validation now, before callers can reserve remote work.

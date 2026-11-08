@@ -71,10 +71,104 @@ fn uuid_v4(raw: &str, field: &str) -> Result<uuid::Uuid, MLSError> {
         })
         .ok_or_else(|| MLSError::invalid_input(format!("{field} must be a UUIDv4")))
 }
+/// Encrypted `account_meta` journal and global operation-id index for exact creation replay.
+fn group_creation_key(operation_id: &str) -> String {
+    format!("group_creation:{operation_id}")
+}
 
-/// Send journal: the exact signed body and archive copy of one reserved MLS generation, written in
-/// the write transaction that advances the sender ratchet and `sendCounter`, before any HTTP.
-/// Retries resubmit these bytes; only `StaleSend` replaces them with a fresh frame.
+const GROUP_CREATIONS_KEY: &str = "group_creations";
+
+fn group_creation_operation_ids(tx: &impl WasmSqlBackend) -> Result<Vec<String>, MLSError> {
+    tx.get_account_meta(GROUP_CREATIONS_KEY)?
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()
+        .map(Option::unwrap_or_default)
+        .map_err(|e| MLSError::Internal(format!("parse group creation journal index: {e}")))
+}
+
+fn group_creation_for_conversation(
+    tx: &impl WasmSqlBackend,
+    conversation_id: &str,
+) -> Result<Option<(String, String)>, MLSError> {
+    let mut found = None;
+    for operation_id in group_creation_operation_ids(tx)? {
+        let Some(raw) = tx.get_account_meta(&group_creation_key(&operation_id))? else {
+            continue;
+        };
+        let pending: chat_wire::PendingGroupCreation = serde_json::from_str(&raw)
+            .map_err(|e| MLSError::Internal(format!("parse group creation journal: {e}")))?;
+        if pending.conversation_id == conversation_id {
+            if found.is_some() {
+                return Err(MLSError::InvalidState(
+                    "multiple pending creations for one conversation".into(),
+                ));
+            }
+            found = Some((operation_id, raw));
+        }
+    }
+    Ok(found)
+}
+
+fn put_group_creation(
+    tx: &impl WasmSqlBackend,
+    pending: &chat_wire::PendingGroupCreation,
+) -> Result<bool, MLSError> {
+    if group_creation_for_conversation(tx, &pending.conversation_id)?.is_some() {
+        return Ok(false);
+    }
+    let key = group_creation_key(&pending.operation_id);
+    if tx.get_account_meta(&key)?.is_some() {
+        return Err(MLSError::InvalidState(
+            "group creation operation id already exists".into(),
+        ));
+    }
+    tx.put_account_meta(
+        &key,
+        &serde_json::to_string(pending)?,
+        pending.created_at_ms,
+    )?;
+    let mut operation_ids = group_creation_operation_ids(tx)?;
+    operation_ids.push(pending.operation_id.clone());
+    operation_ids.sort();
+    tx.put_account_meta(
+        GROUP_CREATIONS_KEY,
+        &serde_json::to_string(&operation_ids)?,
+        pending.created_at_ms,
+    )?;
+    Ok(true)
+}
+
+fn remove_group_creation_operation(
+    tx: &impl WasmSqlBackend,
+    operation_id: &str,
+) -> Result<(), MLSError> {
+    tx.delete_account_meta(&group_creation_key(operation_id))?;
+    let mut operation_ids = group_creation_operation_ids(tx)?;
+    operation_ids.retain(|id| id != operation_id);
+    if operation_ids.is_empty() {
+        tx.delete_account_meta(GROUP_CREATIONS_KEY)
+    } else {
+        tx.put_account_meta(
+            GROUP_CREATIONS_KEY,
+            &serde_json::to_string(&operation_ids)?,
+            now_ms(),
+        )
+    }
+}
+
+pub(crate) fn remove_group_creation_journal(
+    tx: &impl WasmSqlBackend,
+    conversation_id: &str,
+) -> Result<(), MLSError> {
+    if let Some((operation_id, _)) = group_creation_for_conversation(tx, conversation_id)? {
+        remove_group_creation_operation(tx, &operation_id)?;
+    }
+    Ok(())
+}
+
+/// Send journal: the exact signed body and archive copy of one candidate MLS generation, written
+/// with the sender-ratchet advance before HTTP. The accepted-counter watermark advances only
+/// after a verified response/echo or `StaleSend` proof.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingApplicationSend {
     pub(crate) body: Value,
@@ -219,7 +313,7 @@ pub(crate) fn is_terminal_refusal(error: &MLSError) -> bool {
 /// `conversationCloseEntry` of `conversation_id` carrying exactly that signed request. Returns
 /// the entry seq.
 fn verify_own_close_answer(
-    answer: &[u8],
+    answer: &Value,
     sent: &Value,
     conversation_id: &str,
 ) -> Result<i64, MLSError> {
@@ -229,11 +323,12 @@ fn verify_own_close_answer(
         dr_transcript::normalize_read_presentation(&serde_json::to_vec(value)?, name, false)
             .map_err(|e| refused(format!("{name}: {e}")))
     };
-    let answer: Value = serde_json::from_slice(answer).map_err(|e| refused(e.to_string()))?;
-    let mut entry = answer["result"]["entry"].clone();
-    let tag = entry
+    let answer = answer.get("result").unwrap_or(answer);
+    let mut entry = answer["entry"].clone();
+    let (tag, _) = entry
         .as_object_mut()
-        .and_then(|fields| fields.remove("$type"));
+        .map(|fields| (fields.remove("$type"), fields.remove("sequencerReceipt")))
+        .unwrap_or_default();
     let entry = read(&entry, "conversationCloseEntry")?;
     if tag != Some(json!("blue.catbird.chat.defs#conversationCloseEntry"))
         || entry["conversationId"] != conversation_id
@@ -649,6 +744,21 @@ impl WasmMlsClient {
                 .map_err(|e| MLSError::invalid_input(format!("invalid peer DID `{peer}`: {e}")))?;
         }
         let canonical_convo_id = convo_uuid.hyphenated().to_string();
+        if let Some(conversation) = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(&canonical_convo_id)?
+        {
+            return Ok(conversation);
+        }
+        if group_creation_for_conversation(self.require_db_mls()?.backend(), &canonical_convo_id)?
+            .is_some()
+        {
+            return self
+                .resume_pending_group_creation(&session_token, &canonical_convo_id)
+                .await?
+                .ok_or_else(|| MLSError::Internal("group creation journal disappeared".into()));
+        }
 
         let is_untitle_one_to_one =
             peers.len() == 1 && title.as_deref().unwrap_or("").trim().is_empty();
@@ -862,76 +972,224 @@ impl WasmMlsClient {
             "metadataSnapshot": meta_snap_json,
             "signedAt": chat_wire::now_rfc3339_millis(),
         });
-        // The roster this manifest names becomes this device's verified roster once the
-        // creation's answer verifies; every later verified transition keeps it current.
-        let roster = chat_wire::roster_from_participants(&create_body["manifest"]["participants"])?;
-        let resp = self
-            .submit_signed_chat_op(
+        let prepared = chat_wire::sign_clean_chat_mutation(
+            &self.account_did,
+            canonical_dev_id,
+            Some(auth_gen),
+            CanonicalOperation::CreateConversation,
+            &create_body,
+            &signer,
+        )?;
+        let request = prepared.body.unwrap_or_default();
+        let request_value: Value = serde_json::from_slice(&request)?;
+        let request_body = &request_value["signedRequest"]["body"];
+        let pending = chat_wire::PendingGroupCreation {
+            version: chat_wire::GROUP_CREATION_JOURNAL_VERSION,
+            conversation_id: canonical_convo_id.to_string(),
+            operation_id: transition_id,
+            sequencer_did: sequencer_did.to_string(),
+            group_id: group_id_bytes,
+            signer_public_key: signer.public().to_vec(),
+            request,
+            next: request_body["next"].clone(),
+            metadata_snapshot: request_body["metadataSnapshot"].clone(),
+            kv_batch,
+            title,
+            description,
+            new_signer_json: None,
+            created_at_ms: ts,
+        };
+        db.write_tx(|tx| put_group_creation(tx, &pending).map(|_| ()))?;
+        self.resume_pending_group_creation(session_token, canonical_convo_id)
+            .await?
+            .ok_or_else(|| MLSError::Internal("group creation journal disappeared".into()))
+    }
+
+    /// Replay one exact creation and atomically adopt the journaled genesis state.
+    async fn resume_pending_group_creation(
+        &self,
+        session_token: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationRow>, MLSError> {
+        let db = self.require_db_mls()?;
+        let Some((operation_id, raw)) =
+            group_creation_for_conversation(db.backend(), conversation_id)?
+        else {
+            return Ok(None);
+        };
+        let key = group_creation_key(&operation_id);
+        let pending: chat_wire::PendingGroupCreation = serde_json::from_str(&raw)
+            .map_err(|e| MLSError::Internal(format!("parse group creation journal: {e}")))?;
+        if pending.version != chat_wire::GROUP_CREATION_JOURNAL_VERSION
+            || pending.conversation_id != conversation_id
+            || pending.operation_id != operation_id
+        {
+            return Err(MLSError::InvalidState(
+                "unsupported or mismatched group creation journal".into(),
+            ));
+        }
+
+        let submitted: Value = serde_json::from_slice(&pending.request)
+            .map_err(|e| MLSError::Internal(format!("parse group creation request: {e}")))?;
+        let (verified_body, _) = chat_wire::verify_signed_mutation_body_and_digest(
+            &submitted["signedRequest"],
+            SignedMutationKind::Creation,
+            &pending.signer_public_key,
+        )?;
+        let signed_next = chat_wire::canonicalize_wire_coordinate(&verified_body["next"], None)?;
+        let journaled_next = chat_wire::canonicalize_wire_coordinate(&pending.next, None)?;
+        if verified_body["conversationId"] != pending.conversation_id
+            || verified_body["transitionId"] != pending.operation_id
+            || verified_body["idempotencyKey"] != pending.operation_id
+            || verified_body["actorDid"] != self.account_did
+            || verified_body["metadataSnapshot"] != pending.metadata_snapshot
+            || chat_wire::json_bytes(&signed_next["groupId"])? != pending.group_id
+            || signed_next != journaled_next
+        {
+            return Err(MLSError::Cryptography(
+                "group creation journal does not match its signed request".into(),
+            ));
+        }
+
+        let answer = match self
+            .submit_prepared_signed_chat_op_for_authority(
                 session_token,
-                canonical_dev_id,
-                Some(auth_gen),
                 CanonicalOperation::CreateConversation,
-                &create_body,
-                &signer,
+                "blue.catbird.chat.createConversation",
+                pending.request.clone(),
+                &pending.signer_public_key,
+                Some(&pending.sequencer_did),
             )
-            .await?;
+            .await
+        {
+            Ok(answer) => answer,
+            Err(error) => {
+                if is_terminal_refusal(&error) {
+                    db.write_tx(|tx| {
+                        if tx.get_account_meta(&key)?.as_deref() == Some(raw.as_str()) {
+                            remove_group_creation_operation(tx, &operation_id)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                return Err(error);
+            }
+        };
+        let server_seq = answer["result"]["entry"]["seq"]
+            .as_i64()
+            .ok_or_else(|| MLSError::Cryptography("creation answer missing entry seq".into()))?;
+        if server_seq != 1 {
+            return Err(MLSError::Cryptography(format!(
+                "own creation answer: seq {server_seq} is not the first entry"
+            )));
+        }
 
-        // Verified as the creation signed here, its coordinates as its signed `next`. A creation
-        // is its conversation's first entry: the cursor takes no other seq.
-        let last_seq = i64::from(resp["result"]["entry"]["seq"] == 1);
-        let generation = next_coords["generation"].as_i64().unwrap_or(0);
-        let coords_str =
-            serde_json::to_string(&next_coords).map_err(|e| MLSError::Internal(e.to_string()))?;
-        let snap_str = serde_json::to_string(&meta_snap_json)
-            .map_err(|e| MLSError::Internal(e.to_string()))?;
-
-        db.write_tx(|tx| {
-            kv_batch.apply(tx)?;
-            if title.is_some() || description.is_some() {
-                let meta_v1 = GroupMetadataV1 {
+        let roster =
+            chat_wire::roster_from_participants(&verified_body["manifest"]["participants"])?;
+        let generation = pending.next["generation"].as_i64().unwrap_or_default();
+        let epoch = pending.next["epoch"].as_i64().unwrap_or_default();
+        let coords = serde_json::to_string(&pending.next)?;
+        let snapshot = serde_json::to_string(&pending.metadata_snapshot)?;
+        let title_str = pending.title.clone().unwrap_or_default();
+        let description_str = pending.description.clone().unwrap_or_default();
+        let ts = pending.created_at_ms;
+        let conversation = db.write_tx(|tx| {
+            if tx.get_account_meta(&key)?.as_deref() != Some(raw.as_str()) {
+                if let Some(conversation) = tx.get_conversation(conversation_id)? {
+                    return Ok(conversation);
+                }
+                return Err(MLSError::InvalidState(
+                    "GroupCreationOwnershipChanged".into(),
+                ));
+            }
+            pending.kv_batch.apply(tx)?;
+            let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
+            let group = MlsGroup::load(
+                provider.storage(),
+                &GroupId::from_slice(&pending.group_id),
+            )
+            .map_err(|e| MLSError::Internal(format!("load journaled genesis group: {e:?}")))?
+            .ok_or_else(|| MLSError::group_not_found(conversation_id))?;
+            chat_wire::require_coordinate_names_group(&pending.next, &group, &provider)?;
+            if pending.title.is_some() || pending.description.is_some() {
+                let metadata = GroupMetadataV1 {
                     version: 1,
                     title: title_str.clone(),
-                    description: desc_str.clone(),
+                    description: description_str.clone(),
                     avatar_blob_locator: None,
                     avatar_content_type: None,
                     space_avatar: None,
                 };
-                let meta_row =
-                    chat_wire::group_metadata_row_from_v1(canonical_convo_id, 1, 0, &meta_v1, ts)?;
-                tx.upsert_group_metadata(&meta_row)?;
+                tx.upsert_group_metadata(&chat_wire::group_metadata_row_from_v1(
+                    conversation_id,
+                    1,
+                    0,
+                    &metadata,
+                    ts,
+                )?)?;
             }
             let row = ConversationRow {
-                conversation_id: canonical_convo_id.to_string(),
-                group_id: group_id_bytes,
+                conversation_id: conversation_id.to_string(),
+                group_id: pending.group_id.clone(),
                 generation,
-                epoch: 0,
-                last_seq,
-                sequencer_did: sequencer_did.to_string(),
+                epoch,
+                last_seq: server_seq,
+                sequencer_did: pending.sequencer_did.clone(),
                 space_uri: Some(format!(
-                    "at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{canonical_convo_id}-{generation}"
+                    "at://{}/space/blue.catbird.labyrinth.conversation/{conversation_id}-{generation}",
+                    pending.sequencer_did
                 )),
-                title,
+                title: pending.title.clone(),
                 unread_count: 0,
                 updated_at_ms: ts,
             };
             tx.upsert_conversation(&row)?;
             tx.put_account_meta(
-                &format!("conversation_coords:{canonical_convo_id}"),
-                &coords_str,
+                &format!("conversation_coords:{conversation_id}"),
+                &coords,
                 ts,
             )?;
             tx.put_account_meta(
-                &format!("metadata_snapshot_json:{canonical_convo_id}"),
-                &snap_str,
+                &format!("metadata_snapshot_json:{conversation_id}"),
+                &snapshot,
                 ts,
             )?;
             tx.put_account_meta(
-                &chat_wire::conversation_roster_key(canonical_convo_id),
+                &chat_wire::conversation_roster_key(conversation_id),
                 &roster.to_string(),
                 ts,
             )?;
+            remove_group_creation_operation(tx, &operation_id)?;
             Ok(row)
-        })
+        })?;
+        Ok(Some(conversation))
+    }
+
+    /// Complete every indexed creation before inventory can request leaf recovery for it.
+    pub(crate) async fn complete_pending_group_creations(
+        &self,
+        session_token: &str,
+    ) -> Result<u32, MLSError> {
+        let db = self.require_db_mls()?;
+        let operation_ids = group_creation_operation_ids(db.backend())?;
+        let mut completed = 0u32;
+        for operation_id in operation_ids {
+            let key = group_creation_key(&operation_id);
+            let Some(raw) = db.backend().get_account_meta(&key)? else {
+                db.write_tx(|tx| remove_group_creation_operation(tx, &operation_id))?;
+                continue;
+            };
+            let pending: chat_wire::PendingGroupCreation = serde_json::from_str(&raw)
+                .map_err(|e| MLSError::Internal(format!("parse group creation journal: {e}")))?;
+            if self
+                .resume_pending_group_creation(session_token, &pending.conversation_id)
+                .await?
+                .is_some()
+            {
+                completed = completed.saturating_add(1);
+            }
+        }
+        Ok(completed)
     }
 
     pub(crate) async fn add_group_members_impl(
@@ -1070,12 +1328,26 @@ impl WasmMlsClient {
                 &frame_json,
             )
         };
-        // `StaleSend` refuses those exact bytes for good: their journal goes, in its own write,
-        // before anything else can fail, so no later retry of this message id resubmits them.
+        // A definitive refusal retires these exact bytes. `StaleSend` also proves that this
+        // counter is covered by the sequencer's accepted watermark.
         let journal_key = pending_send_key(&convo_uuid.hyphenated().to_string(), &canonical_msg_id);
-        let discard_refused = || -> Result<(), MLSError> {
-            self.require_db_mls()?
-                .write_tx(|tx| tx.delete_account_meta(&journal_key))
+        let discard_refused = |pending: &PendingApplicationSend,
+                               stale_send: bool|
+         -> Result<(), MLSError> {
+            self.require_db_mls()?.write_tx(|tx| {
+                if stale_send {
+                    let send_counter = pending.body["sendCounter"].as_u64().ok_or_else(|| {
+                        MLSError::Internal("send journal missing valid sendCounter".into())
+                    })?;
+                    let counter_key = chat_wire::send_counter_key(&pending.archive.conversation_id);
+                    let confirmed = chat_wire::confirmed_send_counter(
+                        tx.get_account_meta(&counter_key)?.as_deref(),
+                        send_counter,
+                    )?;
+                    tx.put_account_meta(&counter_key, &confirmed.to_string(), now_ms())?;
+                }
+                tx.delete_account_meta(&journal_key)
+            })
         };
 
         let (mut signer, mut auth_gen, mut pending) = reserve()?;
@@ -1089,10 +1361,8 @@ impl WasmMlsClient {
             )
             .await
         {
-            // `mls-ds` already sequenced a newer send from this device and refuses these bytes
-            // for good. Send the same message id once more as a fresh frame and counter.
             Err(error) if chat_wire::is_stale_send(&error) => {
-                discard_refused()?;
+                discard_refused(&pending, true)?;
                 (signer, auth_gen, pending) = reserve()?;
                 match self
                     .submit_application_send(
@@ -1105,13 +1375,25 @@ impl WasmMlsClient {
                     .await
                 {
                     Err(error) if chat_wire::is_stale_send(&error) => {
-                        discard_refused()?;
+                        discard_refused(&pending, true)?;
                         return Err(error);
                     }
-                    result => result?,
+                    Err(error) => {
+                        if is_terminal_refusal(&error) {
+                            discard_refused(&pending, false)?;
+                        }
+                        return Err(error);
+                    }
+                    Ok(response) => response,
                 }
             }
-            result => result?,
+            Err(error) => {
+                if is_terminal_refusal(&error) {
+                    discard_refused(&pending, false)?;
+                }
+                return Err(error);
+            }
+            Ok(response) => response,
         };
 
         // Mandatory `I13` ES256 `sequencerReceipt`, verified under the method its `kid` names.
@@ -1182,10 +1464,10 @@ impl WasmMlsClient {
         })
     }
 
-    /// Reserve the sender generation, `sendCounter` and send journal in one write transaction
-    /// before any HTTP. A lost response can still publish the ciphertext, so rolling the ratchet
-    /// back would reuse its key and nonce. An existing journal for the message is returned
-    /// unchanged: only a `StaleSend` refusal discards one (those exact bytes are refused for good).
+    /// Reserve the sender generation, candidate `sendCounter` and send journal in one write
+    /// transaction before HTTP. A lost response can still publish the ciphertext, so rolling the
+    /// ratchet back would reuse its key and nonce. An existing journal stays byte-identical; the
+    /// accepted-counter watermark changes only after verified sequencing.
     fn reserve_application_send(
         &self,
         convo_uuid: uuid::Uuid,
@@ -1241,8 +1523,8 @@ impl WasmMlsClient {
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(1)
                 .max(1);
-            // Strictly above every counter this device signed here, so `mls-ds` sequences its
-            // sends in MLS generation order; persisted with this frame's ratchet advance below.
+            // The candidate after this device's last confirmed send. An uncertain attempt keeps
+            // this exact journal; reservation itself must not burn the accepted-send watermark.
             let counter_key = chat_wire::send_counter_key(&canonical_convo_id);
             let send_counter =
                 chat_wire::next_send_counter(tx.get_account_meta(&counter_key)?.as_deref())?;
@@ -1365,7 +1647,6 @@ impl WasmMlsClient {
             };
             let journal = serde_json::to_string(&pending)
                 .map_err(|e| MLSError::Internal(format!("serialize send journal: {e}")))?;
-            tx.put_account_meta(&counter_key, &send_counter.to_string(), ts)?;
             tx.put_account_meta(&journal_key, &journal, ts)?;
             Ok((signer, auth_gen, pending))
         })
@@ -1383,6 +1664,9 @@ impl WasmMlsClient {
         receipt_key_sec1: &[u8],
         ordered_seq: Option<i64>,
     ) -> Result<(MessageRow, Option<ConversationRow>), MLSError> {
+        let send_counter = pending.body["sendCounter"]
+            .as_u64()
+            .ok_or_else(|| MLSError::Internal("send journal missing valid sendCounter".into()))?;
         let mut queued = pending.archive;
         let group_id = hex::decode(&queued.group_id_hex)
             .map_err(|e| MLSError::Internal(format!("send journal group_id: {e}")))?;
@@ -1459,6 +1743,12 @@ impl WasmMlsClient {
                 created_at_ms: queued.created_at_ms,
                 is_own: true,
             };
+            let counter_key = chat_wire::send_counter_key(&queued.conversation_id);
+            let confirmed = chat_wire::confirmed_send_counter(
+                tx.get_account_meta(&counter_key)?.as_deref(),
+                send_counter,
+            )?;
+            tx.put_account_meta(&counter_key, &confirmed.to_string(), ts)?;
             tx.insert_message(&row)?;
             let queued_bytes =
                 serde_json::to_vec(&queued).map_err(|e| MLSError::Internal(e.to_string()))?;
@@ -2142,7 +2432,35 @@ impl WasmMlsClient {
             }
         };
         let sent: Value = serde_json::from_str(raw)?;
+        let answer: Value = serde_json::from_slice(&answer)
+            .map_err(|error| MLSError::Cryptography(format!("parse close answer: {error}")))?;
         let seq = verify_own_close_answer(&answer, &sent, cid)?;
+        let entry = answer
+            .get("result")
+            .unwrap_or(&answer)
+            .get("entry")
+            .ok_or_else(|| MLSError::Cryptography("own close answer missing entry".into()))?;
+        let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
+        let (verified_body, request_digest) = chat_wire::verify_signed_mutation_body_and_digest(
+            &entry["signedRequest"],
+            SignedMutationKind::ConversationClose,
+            signer.public(),
+        )?;
+        let sequencer_did = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(cid)?
+            .map(|conversation| conversation.sequencer_did)
+            .unwrap_or_else(|| self.home_ds_did.clone());
+        self.verify_control_entry_receipt(
+            session_token,
+            &sequencer_did,
+            cid,
+            entry,
+            &verified_body,
+            &request_digest,
+        )
+        .await?;
         let retired = chat_wire::canonicalize_wire_coordinate(&sent["body"]["retired"], None)?;
         let last_seq = self
             .require_db_mls()?

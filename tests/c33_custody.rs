@@ -18,6 +18,9 @@ use catbird_mls::chat_v2::transcript::direct_request::{
     direct_request_acceptance_entry_hash, direct_request_receipt_key_id_for_authority,
     direct_request_signing_bytes, DirectRequestKind,
 };
+use catbird_mls::chat_v2::transcript::{
+    decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+};
 use catbird_mls::client::chat_wire::{self, StoredArchivedReceipt};
 use catbird_mls::client::{QueuedLabyrinthArchivePayload, REQUIRED_LABYRINTH_OAUTH_SCOPES};
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
@@ -38,14 +41,12 @@ use wasm_bindgen_test::*;
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 #[wasm_bindgen(inline_js = r#"
-let originalFetch;
-let publishResponse;
-let acceptResponse;
-let ds;
-export function installDs(respond, accept, didDocs, preparation) {
+let originalFetch, ds, publishResponse, acceptResponse, controlReceipt;
+export function installDs(respond, accept, receipt, didDocs, preparation) {
   originalFetch = globalThis.fetch;
   publishResponse = respond;
   acceptResponse = accept;
+  controlReceipt = receipt;
   const docs = JSON.parse(didDocs);
   ds = {records: {}, keys: {}, prepares: [], publishes: [], lose: 0, reply: 'signed', accept: 'signed',
     inventory: {}, welcomes: {}, entries: {}, calls: {}, accepts: [], transitions: [], transition: 'echo',
@@ -131,13 +132,15 @@ export function installDs(respond, accept, didDocs, preparation) {
       case 'blue.catbird.chat.submitTransition': {
         ds.transitions.push(text);
         const signedRequest = JSON.parse(text).signedRequest;
+        const coordinates = structuredClone(b.next);
         const entry = {$type: `blue.catbird.chat.defs#${b.$type.split('#')[1].replace(/(Transition)?Body$/, 'Entry')}`,
           entryId: b.transitionId, conversationId: b.next.conversationId, seq: 2,
-          signedRequest: structuredClone(signedRequest), receivedAt: b.signedAt};
+          signedRequest: structuredClone(signedRequest), receivedAt: b.signedAt,
+          sequencerReceipt: JSON.parse(controlReceipt(JSON.stringify({
+            body: b, seq: 2, coordinate: b.next})))};
         ds.sequenced = structuredClone(entry);
-        const coordinates = structuredClone(b.next);
         if (ds.transition === 'lose') throw new TypeError('submitTransition response lost');
-        if (ds.transition === 'stale') return reply({error: 'StaleCoordinates', message: 'stale'}, 409);
+        if (ds.transition === 'stale') return reply({error:'StaleCoordinates'}, 409);
         if (ds.transition === 'foreignEntry') entry.signedRequest.body.signedAt = '2026-11-07T00:00:00.000Z';
         if (ds.transition === 'foreignCoordinates') coordinates.epoch += 1;
         return reply({coordinates, entry, welcomes: []});
@@ -149,11 +152,13 @@ export function installDs(respond, accept, didDocs, preparation) {
         const tombstone = {conversationId: b.prior.conversationId, conversationKind: b.conversationKind,
           retired: b.retired, closedByDid: b.actorDid, closedByDeviceId: b.actorDeviceId, terminalSeq: 2,
           closedAt: b.signedAt};
-        const entry = {$type: 'blue.catbird.chat.defs#conversationCloseEntry', entryId: b.transitionId,
-          conversationId: b.prior.conversationId, seq: 2, signedRequest: JSON.parse(text).signedRequest,
-          tombstone, receivedAt: b.signedAt};
-        if (ds.close === 'lose') throw new TypeError('closeConversation response lost');
+        const entry = {$type:'blue.catbird.chat.defs#conversationCloseEntry',
+          entryId:b.transitionId, conversationId:b.prior.conversationId, seq:2, tombstone,
+          signedRequest:JSON.parse(text).signedRequest, receivedAt:b.signedAt,
+          sequencerReceipt:JSON.parse(controlReceipt(JSON.stringify({
+            body:b, seq:2, coordinate:b.retired})))};
         if (ds.close === 'forged') entry.signedRequest.body.signedAt = '2026-11-07T00:00:00.000Z';
+        if (ds.close === 'lose') throw new TypeError('closeConversation response lost');
         return reply({result: {entry, tombstone}});
       }
       default: return reply({error: 'NotFound', message: nsid}, 404);
@@ -183,6 +188,7 @@ extern "C" {
     fn installDs(
         respond: &js_sys::Function,
         accept: &js_sys::Function,
+        receipt: &js_sys::Function,
         did_docs: &str,
         preparation: &str,
     );
@@ -412,14 +418,14 @@ fn publish_response(request: String, reply: String) -> String {
 
 /// The coordinator's answer to `acceptConversation` `request` (`{"directRequest": ...}`): a
 /// `directRequestAcceptanceProof` sequencing that signed acceptance at seq 2 (`signed`) or seq 3
-/// (`gap`), its acceptance-commit receipt signed by the coordinator, or by a key behind none of
-/// its request-receipt methods (`forged`).
+/// (`gap`), its legacy acceptance-commit receipt, and its Task 5 outer I13 control receipt.
+/// `forged` signs the legacy receipt with the wrong key; `noI13` omits only the outer receipt.
 fn accept_response(request: String, kind: String) -> String {
     let request: Value = serde_json::from_str(&request).unwrap();
     let wrapper = &request["directRequest"];
     let body = &wrapper["body"];
     let seq = if kind == "gap" { 3 } else { 2 };
-    let entry = json!({
+    let mut entry = json!({
         "entryId": body["transitionId"], "conversationId": body["prior"]["conversationId"],
         "seq": seq, "signedRequest": wrapper,
         "receivedAt": body["signedAt"],
@@ -446,22 +452,111 @@ fn accept_response(request: String, kind: String) -> String {
         coordinator_key()
     };
     let signature = es256(&signer, DirectRequestKind::AcceptanceCommit, &receipt);
+    if kind != "noI13" {
+        let key = coordinator_key();
+        let kid = receipt_kid(SEQUENCER, 1);
+        entry["sequencerReceipt"] = signed_control_receipt(
+            body,
+            &body["next"],
+            seq,
+            control_request_digest(body),
+            (SEQUENCER, &key, &kid),
+        );
+    }
     json!({"coordinates": body["next"], "acceptanceProof": {"entry": entry,
         "receipt": {"body": receipt, "signature": signature}}})
+    .to_string()
+}
+
+fn control_request_digest(body: &Value) -> [u8; 32] {
+    if let Some(kind) = body["$type"]
+        .as_str()
+        .and_then(SignedMutationKind::from_type_id)
+    {
+        let strict = decode_strict_json(&serde_json::to_vec(body).unwrap()).unwrap();
+        let projected = project_signed_body(kind, &strict).unwrap();
+        return *SigningTranscript::build_for(kind, &projected)
+            .unwrap()
+            .request_digest();
+    }
+    assert_eq!(
+        body["$type"],
+        "blue.catbird.chat.defs#directRequestAcceptanceBody"
+    );
+    Sha256::digest(
+        direct_request_signing_bytes(
+            DirectRequestKind::Accept,
+            &serde_json::to_vec(body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .into()
+}
+
+fn signed_control_receipt(
+    body: &Value,
+    coordinate: &Value,
+    seq: u64,
+    request_digest: [u8; 32],
+    receipt_signer: (&str, &SigningKey, &str),
+) -> Value {
+    let (sequencer_did, signer, kid) = receipt_signer;
+    let payload = SequencerReceiptPayload {
+        sequencer_did: sequencer_did.into(),
+        conversation_id: coordinate["conversationId"].as_str().unwrap().into(),
+        group_id: chat_wire::json_bytes(&coordinate["groupId"]).unwrap(),
+        epoch: coordinate["epoch"].as_u64().unwrap(),
+        sender_device_did_url: format!(
+            "{}#{}",
+            body["actorDid"].as_str().unwrap(),
+            body["actorDeviceId"].as_str().unwrap()
+        ),
+        entry_id: body["transitionId"].as_str().unwrap().into(),
+        archive_commitment: request_digest,
+        seq,
+        issued_at_ms: js_sys::Date::now() as i64,
+    };
+    let signed = sign_sequencer_receipt(signer, kid, &payload).unwrap();
+    json!({
+        "sequencerDid": sequencer_did, "conversationId": payload.conversation_id,
+        "generation": coordinate["generation"], "groupId": STANDARD.encode(payload.group_id),
+        "epoch": payload.epoch, "senderDid": body["actorDid"], "senderDeviceId": body["actorDeviceId"],
+        "entryId": payload.entry_id, "archiveCommitment": STANDARD.encode(payload.archive_commitment),
+        "seq": payload.seq, "issuedAtMs": payload.issued_at_ms, "kid": kid,
+        "signature": STANDARD.encode(signed.signature),
+    })
+}
+
+/// `I13` receipt for a normal control transition sequenced by the fixture.
+fn control_receipt(request: String) -> String {
+    let request: Value = serde_json::from_str(&request).unwrap();
+    let body = &request["body"];
+    let key = coordinator_key();
+    let kid = receipt_kid(SEQUENCER, 1);
+    signed_control_receipt(
+        body,
+        &request["coordinate"],
+        request["seq"].as_u64().unwrap(),
+        control_request_digest(body),
+        (SEQUENCER, &key, &kid),
+    )
     .to_string()
 }
 
 fn install_ds() -> RestoreFetch {
     let respond = Closure::<dyn Fn(String, String) -> String>::new(publish_response);
     let accept = Closure::<dyn Fn(String, String) -> String>::new(accept_response);
+    let receipt = Closure::<dyn Fn(String) -> String>::new(control_receipt);
     installDs(
         respond.as_ref().unchecked_ref(),
         accept.as_ref().unchecked_ref(),
+        receipt.as_ref().unchecked_ref(),
         &did_documents(),
         &preparation(),
     );
     respond.forget();
     accept.forget();
+    receipt.forget();
     RestoreFetch
 }
 
@@ -686,16 +781,22 @@ fn signed_acceptance(mut body: Value, signer: &SignatureKeyPair) -> Value {
     serde_json::from_slice(&wrapper).unwrap()
 }
 
-/// The coordinator's acceptance-commit receipt over acceptance request `raw` at seq 2,
-/// `signed` by the coordinator or `forged` under a key behind none of its methods.
-fn acceptance_receipt(raw: &str, kind: &str) -> Value {
-    let mut answer: Value =
-        serde_json::from_str(&accept_response(raw.into(), kind.into())).unwrap();
-    answer["acceptanceProof"]["receipt"].take()
+/// A valid Task 5 outer I13 receipt for `wrapper`'s seq-2 acceptance.
+fn acceptance_i13(wrapper: &Value) -> Value {
+    let body = &wrapper["body"];
+    let key = coordinator_key();
+    let kid = receipt_kid(SEQUENCER, 1);
+    signed_control_receipt(
+        body,
+        &body["next"],
+        2,
+        control_request_digest(body),
+        (SEQUENCER, &key, &kid),
+    )
 }
 
 /// `getEntries`' seq-2 `directRequestAcceptanceEntry` carrying acceptance `wrapper`, with
-/// `receipt` as its `sequencerReceipt` when given.
+/// outer Task 5 I13 `receipt` when given.
 fn acceptance_entry(wrapper: &Value, receipt: Option<&Value>) -> Value {
     let body = &wrapper["body"];
     let mut entry = json!({
@@ -894,6 +995,26 @@ async fn a_direct_request_welcome_joins_only_through_the_checked_import() {
     assert_eq!(dsCalls("blue.catbird.chat.acknowledgeWelcome"), 0);
 
     serveWelcomes(BOB_DEVICE, "[]");
+    let mut request_value: Value = serde_json::from_str(&raws[0]).unwrap();
+    let outcome = published_outcome(&raws[0], (&coordinator_key(), &receipt_kid(SEQUENCER, 1)));
+    let mut receiptless = opening_entry(&outcome, Some(request_value["signedRequest"].take()));
+    receiptless
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
+    serveEntries(cid, &json!([receiptless]).to_string());
+    serveInventory(
+        BOB_DEVICE,
+        &json!([direct_state(cid, &alice, &bob)]).to_string(),
+    );
+    let error = sync(&bob_client)
+        .await
+        .expect_err("a direct opening without its I13 receipt");
+    assert!(error.contains("missing I13 sequencerReceipt"), "{error}");
+    assert!(conversations(&bob_client).is_empty());
+    assert!(requests(&bob_client).is_empty());
+    assert!(messages(&bob_client, cid).is_empty());
+
     serve_openings(&raws, &alice, &bob);
     sync(&bob_client).await.unwrap();
     assert_eq!(conversation(&bob_client, cid).last_seq, 1);
@@ -965,13 +1086,11 @@ async fn a_pruned_openings_participants_come_from_its_signed_outcome() {
     assert!(conversations(&bob_client).is_empty());
 }
 
-/// Accepting moves the cursor only over its own verified entry: the coordinator's
-/// acceptance-commit receipt over the sequenced entry carrying Bob's signed acceptance, and
-/// only when that entry is the next one. An answer the coordinator did not sign is refused
-/// with nothing changed; a verified acceptance at seq 2 moves the cursor from 1 to 2; one at
-/// seq 3 is accepted but leaves the unverified seq 2 to sync.
-///
-/// Fail-before: accepting set `last_seq` to 2 from any 2xx answer, signed or not.
+/// Accepting moves the cursor and coordinates only over its own verified entry: the legacy
+/// acceptance-commit receipt over the sequenced entry carrying Bob's signed acceptance, plus
+/// that entry's mandatory Task 5 I13 receipt, and only when the entry is next. Missing I13 or a
+/// legacy receipt the coordinator did not sign changes nothing. A verified acceptance at seq 2
+/// moves the cursor from 1 to 2; one at seq 3 leaves the unverified seq 2 to sync.
 #[wasm_bindgen_test]
 async fn accepting_moves_the_cursor_only_over_its_verified_entry() {
     let _restore = install_ds();
@@ -985,6 +1104,19 @@ async fn accepting_moves_the_cursor_only_over_its_verified_entry() {
     sync(&bob_client).await.unwrap();
     assert_eq!(conversation(&bob_client, next).last_seq, 1);
     assert_eq!(conversation(&bob_client, gap).last_seq, 1);
+    drop(bob_client);
+    let (next_before, gap_before) = (stored_coords(&bob, next), stored_coords(&bob, gap));
+    let bob_client = open(&bob, BOB_DEVICE).await;
+
+    answerAccept("noI13");
+    let error = accept(&bob_client, next).await.unwrap_err();
+    assert!(error.contains("missing sequencerReceipt"), "{error}");
+    assert_eq!(conversation(&bob_client, next).last_seq, 1);
+    assert_eq!(request(&bob_client, next).consent, "incomingPending");
+    drop(bob_client);
+    assert_eq!(stored_coords(&bob, next), next_before);
+    assert_eq!(stored_coords(&bob, gap), gap_before);
+    let bob_client = open(&bob, BOB_DEVICE).await;
 
     answerAccept("forged");
     let error = accept(&bob_client, next).await.unwrap_err();
@@ -1005,6 +1137,16 @@ async fn accepting_moves_the_cursor_only_over_its_verified_entry() {
         "seq 2 is not verified yet"
     );
     assert_eq!(request(&bob_client, gap).consent, "accepted");
+    let accepts = sent(dsAccepts());
+    let next_acceptance = sent_acceptance(&accepts[2]);
+    let gap_acceptance = sent_acceptance(&accepts[3]);
+    drop(bob_client);
+    for (id, acceptance) in [(next, next_acceptance), (gap, gap_acceptance)] {
+        assert_eq!(
+            stored_coords(&bob, id),
+            chat_wire::canonicalize_wire_coordinate(&acceptance["body"]["next"], Some(id)).unwrap()
+        );
+    }
 }
 
 /// `C33` import verifies the opening's `I13` receipt under the method its own `kid` names. The
@@ -1049,17 +1191,12 @@ async fn c33_import_verifies_the_receipt_under_its_own_kid() {
     assert_eq!(messages(&bob_client, cid).len(), 1);
 }
 
-/// Contract A: an acceptance met in sync changes nothing until it verifies. Bob accepts Alice's
-/// two requests; Alice, the sender, then syncs a seq-2 `directRequestAcceptanceEntry` that is
-/// Bob's acceptance altered after signing, stripped of its signature, signed by a device of
-/// Bob's that is no leaf of the group, signed by Bob for his other request, or carrying an
-/// acceptance-commit receipt its coordinator did not sign. Each fails her sync and leaves her
-/// request pending, her cursor at 1 and her coordinates as they were. Bob's genuine acceptances,
-/// one bare and one with the coordinator's receipt, then move her exactly to seq 2 at their
-/// signed coordinates.
-///
-/// Fail-before: sync applied any entry labelled an acceptance unverified, so the altered one
-/// accepted the request, moved the cursor and wrote its coordinates.
+/// Contract A: an acceptance met in sync changes nothing until its actor signature and mandatory
+/// Task 5 I13 receipt verify. Bob signs Alice's two acceptances; Alice then sees entries with a
+/// changed/absent actor signature, a non-leaf signer, another request, no I13, or a receipt bound
+/// to another seq, actor digest, kid or sequencer. Each fails and leaves her request pending,
+/// cursor at 1 and coordinates unchanged. Genuine receipts under both retained sequencer methods
+/// then move her exactly to seq 2 at the actor-signed successor coordinates.
 #[wasm_bindgen_test]
 async fn a_synced_acceptance_changes_nothing_until_it_verifies() {
     let _restore = install_ds();
@@ -1071,10 +1208,14 @@ async fn a_synced_acceptance_changes_nothing_until_it_verifies() {
     let (bob_client, raws) = published(&alice, &bob, &[cid, other]).await;
     serve_openings(&raws, &alice, &bob);
     sync(&bob_client).await.unwrap();
-    accept(&bob_client, cid).await.unwrap();
-    accept(&bob_client, other).await.unwrap();
+    // These calls only obtain Bob's signed wrappers. Their deliberately receiptless answers are
+    // refused by the fixed client and accepted by the pristine source used for fail-before.
+    answerAccept("noI13");
+    let _ = accept(&bob_client, cid).await;
+    let _ = accept(&bob_client, other).await;
     drop(bob_client);
     let accepts = sent(dsAccepts());
+    assert_eq!(accepts.len(), 2);
     let (genuine, genuine_other) = (sent_acceptance(&accepts[0]), sent_acceptance(&accepts[1]));
     let coordinates = stored_coords(&alice, cid);
 
@@ -1091,52 +1232,134 @@ async fn a_synced_acceptance_changes_nothing_until_it_verifies() {
     let mut other_request = genuine["body"].clone();
     other_request["requestId"] = genuine_other["body"]["requestId"].clone();
     let other_request = signed_acceptance(other_request, &device_signer(&bob));
-    let forged_receipt = acceptance_receipt(&accepts[0], "forged");
+    let genuine_i13 = acceptance_i13(&genuine);
+    let altered_i13 = acceptance_i13(&altered);
+    let stranger_i13 = acceptance_i13(&stranger);
+    let other_request_i13 = acceptance_i13(&other_request);
+
+    let key = coordinator_key();
+    let kid = receipt_kid(SEQUENCER, 1);
+    let wrong_seq = signed_control_receipt(
+        &genuine["body"],
+        &genuine["body"]["next"],
+        3,
+        control_request_digest(&genuine["body"]),
+        (SEQUENCER, &key, &kid),
+    );
+    let wrong_digest = signed_control_receipt(
+        &genuine["body"],
+        &genuine["body"]["next"],
+        2,
+        [0x5a; 32],
+        (SEQUENCER, &key, &kid),
+    );
+    let wrong_kid = receipt_kid(SEQUENCER, 2);
+    let wrong_kid = signed_control_receipt(
+        &genuine["body"],
+        &genuine["body"]["next"],
+        2,
+        control_request_digest(&genuine["body"]),
+        (SEQUENCER, &key, &wrong_kid),
+    );
+    let attacker = attacker_key();
+    let attacker_kid = receipt_kid(ATTACKER, 1);
+    let wrong_sequencer = signed_control_receipt(
+        &genuine["body"],
+        &genuine["body"]["next"],
+        2,
+        control_request_digest(&genuine["body"]),
+        (ATTACKER, &attacker, &attacker_kid),
+    );
+
     let alice_client = open(&alice, ALICE_DEVICE).await;
+    let mut refusals = Vec::new();
     for (case, entry) in [
-        ("altered", acceptance_entry(&altered, None)),
-        ("unsigned", acceptance_entry(&unsigned, None)),
-        ("not a leaf", acceptance_entry(&stranger, None)),
-        ("other request", acceptance_entry(&other_request, None)),
+        ("altered", acceptance_entry(&altered, Some(&altered_i13))),
+        ("unsigned", acceptance_entry(&unsigned, Some(&genuine_i13))),
         (
-            "forged receipt",
-            acceptance_entry(&genuine, Some(&forged_receipt)),
+            "not a leaf",
+            acceptance_entry(&stranger, Some(&stranger_i13)),
+        ),
+        (
+            "other request",
+            acceptance_entry(&other_request, Some(&other_request_i13)),
+        ),
+        ("missing I13", acceptance_entry(&genuine, None)),
+        (
+            "receipt for another seq",
+            acceptance_entry(&genuine, Some(&wrong_seq)),
+        ),
+        (
+            "receipt for another digest",
+            acceptance_entry(&genuine, Some(&wrong_digest)),
+        ),
+        (
+            "receipt for another kid",
+            acceptance_entry(&genuine, Some(&wrong_kid)),
+        ),
+        (
+            "receipt for another sequencer",
+            acceptance_entry(&genuine, Some(&wrong_sequencer)),
         ),
     ] {
         serveEntries(cid, &json!([entry]).to_string());
-        let error = sync(&alice_client).await.expect_err(case);
-        // The conversation fails alone, inside the typed aggregate.
-        assert!(
-            error.contains(&format!("conversation {cid}: Cryptography error:")),
-            "{case}: {error}"
-        );
-        assert_eq!(
-            request(&alice_client, cid).consent,
-            "outgoingPending",
-            "{case}"
-        );
-        assert_eq!(conversation(&alice_client, cid).last_seq, 1, "{case}");
+        refusals.push((case, sync(&alice_client).await));
     }
+    let pending_after_refusals = request(&alice_client, cid).consent;
+    let cursor_after_refusals = conversation(&alice_client, cid).last_seq;
     drop(alice_client);
-    assert_eq!(stored_coords(&alice, cid), coordinates);
+    let coordinates_after_refusals = stored_coords(&alice, cid);
 
-    serveEntries(cid, &json!([acceptance_entry(&genuine, None)]).to_string());
-    let receipt = acceptance_receipt(&accepts[1], "signed");
+    let rotated = rotated_key();
+    let rotated_kid = receipt_kid(SEQUENCER, 2);
+    let rotated_i13 = signed_control_receipt(
+        &genuine_other["body"],
+        &genuine_other["body"]["next"],
+        2,
+        control_request_digest(&genuine_other["body"]),
+        (SEQUENCER, &rotated, &rotated_kid),
+    );
+    serveEntries(
+        cid,
+        &json!([acceptance_entry(&genuine, Some(&genuine_i13))]).to_string(),
+    );
     serveEntries(
         other,
-        &json!([acceptance_entry(&genuine_other, Some(&receipt))]).to_string(),
+        &json!([acceptance_entry(&genuine_other, Some(&rotated_i13))]).to_string(),
     );
     let alice_client = open(&alice, ALICE_DEVICE).await;
-    sync(&alice_client).await.unwrap();
-    for id in [cid, other] {
-        assert_eq!(request(&alice_client, id).consent, "accepted");
-        assert_eq!(conversation(&alice_client, id).last_seq, 2);
-    }
+    let valid_sync = sync(&alice_client).await;
+    let final_states = [cid, other].map(|id| {
+        (
+            request(&alice_client, id).consent,
+            conversation(&alice_client, id).last_seq,
+        )
+    });
     drop(alice_client);
-    for (id, acceptance) in [(cid, &genuine), (other, &genuine_other)] {
-        let next = chat_wire::canonicalize_wire_coordinate(&acceptance["body"]["next"], Some(id));
-        assert_eq!(stored_coords(&alice, id), next.unwrap());
-    }
+    let final_coordinates = [cid, other].map(|id| stored_coords(&alice, id));
+    let expected_coordinates =
+        [(cid, &genuine), (other, &genuine_other)].map(|(id, acceptance)| {
+            chat_wire::canonicalize_wire_coordinate(&acceptance["body"]["next"], Some(id)).unwrap()
+        });
+    let all_refused = refusals.iter().all(|(_, result)| {
+        result
+            .as_ref()
+            .is_err_and(|error| error.contains(&format!("conversation {cid}: Cryptography error:")))
+    });
+    assert!(
+        all_refused
+            && pending_after_refusals == "outgoingPending"
+            && cursor_after_refusals == 1
+            && coordinates_after_refusals == coordinates
+            && valid_sync.is_ok()
+            && final_states == [("accepted".to_string(), 2), ("accepted".to_string(), 2)]
+            && final_coordinates == expected_coordinates,
+        "refusals={refusals:?}; pending={pending_after_refusals}; \
+         cursor={cursor_after_refusals}; coordinates_unchanged={}; \
+         valid_sync={valid_sync:?}; final_states={final_states:?}; \
+         final_coordinates={final_coordinates:?}; expected={expected_coordinates:?}",
+        coordinates_after_refusals == coordinates
+    );
 }
 
 /// Contract A: only a verified `directRequestAcceptanceEntry` accepts a request. Bob's
@@ -1325,9 +1548,14 @@ async fn a_siblings_own_opening_imports_as_an_outgoing_request() {
     sync(&bob_client).await.unwrap();
     accept(&bob_client, cid).await.unwrap();
     let acceptance = sent_acceptance(&sent(dsAccepts())[0]);
+    let acceptance_receipt = acceptance_i13(&acceptance);
     serveEntries(
         cid,
-        &json!([opening, acceptance_entry(&acceptance, None)]).to_string(),
+        &json!([
+            opening,
+            acceptance_entry(&acceptance, Some(&acceptance_receipt))
+        ])
+        .to_string(),
     );
     sync(&sibling_client).await.unwrap();
     assert_eq!(request(&sibling_client, cid).consent, "accepted");

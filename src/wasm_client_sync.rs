@@ -44,7 +44,7 @@ use crate::sqlite_conn::SqliteConn;
 use crate::wasm_client::{now_ms, uuid_v4, WasmMlsClient};
 use crate::wasm_client_mutations::{
     conversation_close_key, get_commit_transition, is_terminal_refusal, pending_send_key,
-    prune_commit_transitions,
+    prune_commit_transitions, remove_group_creation_journal,
 };
 
 fn build_join_config() -> MlsGroupJoinConfig {
@@ -56,6 +56,14 @@ fn build_join_config() -> MlsGroupJoinConfig {
             catbird_mls::GroupConfig::default().sender_ratchet_configuration(),
         )
         .build()
+}
+
+/// Bare `I13` sequencing-authority DID named by a conversation state view.
+fn state_view_sequencer_did(state: &Value) -> Option<&str> {
+    state
+        .get("sequencerDid")
+        .and_then(Value::as_str)
+        .filter(|did| did.starts_with("did:") && !did.contains('#'))
 }
 
 /// Stage the MLS Welcome message `welcome` against `provider`, with the bytes of its GroupInfo's
@@ -159,40 +167,36 @@ fn acceptance_refused(what: impl std::fmt::Display) -> MLSError {
 fn verify_own_entry_answer(answer: &Value, submitted: &Value) -> Result<i64, MLSError> {
     let refused =
         |what: String| MLSError::Cryptography(format!("unverified answer to own request: {what}"));
-    let read = |value: &Value, name: &str| -> Result<Value, MLSError> {
-        dr_transcript::normalize_read_presentation(&serde_json::to_vec(value)?, name, false)
-            .map_err(|e| refused(format!("{name}: {e}")))
-    };
-    let (entry_kind, wrapper) = match submitted
-        .pointer("/signedRequest/body/$type")
+    let signed = &submitted["signedRequest"];
+    let kind = signed
+        .pointer("/body/$type")
         .and_then(Value::as_str)
         .and_then(SignedMutationKind::from_type_id)
-    {
-        Some(SignedMutationKind::Creation) => ("creationEntry", "signedCreation"),
-        Some(SignedMutationKind::CommitTransition) => ("commitEntry", "signedCommitTransition"),
-        Some(SignedMutationKind::PolicyTransition) => ("policyEntry", "signedPolicyTransition"),
-        Some(SignedMutationKind::MetadataTransition) => {
-            ("metadataEntry", "signedMetadataTransition")
-        }
-        Some(SignedMutationKind::LeafRecoveryFulfillment) => (
-            "leafRecoveryFulfillmentEntry",
-            "signedLeafRecoveryFulfillment",
-        ),
-        _ => return Err(refused("no sequenced own request".into())),
-    };
-    let own = read(&submitted["signedRequest"], wrapper)?;
-    let mut entry = answer["entry"].clone();
-    let tag = entry
-        .as_object_mut()
-        .and_then(|fields| fields.remove("$type"));
-    let entry = read(&entry, entry_kind)?;
-    if tag
-        != Some(Value::String(format!(
-            "blue.catbird.chat.defs#{entry_kind}"
-        )))
-        || entry["signedRequest"] != own
-        || entry["conversationId"] != own["body"]["next"]["conversationId"]
-        || read(&answer["coordinates"], "conversationCoordinates")? != own["body"]["next"]
+        .ok_or_else(|| refused("no sequenced own request".into()))?;
+    let entry_kind =
+        chat_wire::entry_kind_of(kind).ok_or_else(|| refused("no sequenced own request".into()))?;
+    let entry = answer
+        .get("entry")
+        .ok_or_else(|| refused("missing entry".into()))?;
+    let submitted_signed = serde_json::to_vec(&chat_wire::normalize_signed_mutation_presentation(
+        signed, kind,
+    )?)?;
+    let returned_signed = serde_json::to_vec(&chat_wire::normalize_signed_mutation_presentation(
+        &entry["signedRequest"],
+        kind,
+    )?)?;
+    let body = &signed["body"];
+    let expected_coordinate = body
+        .get("next")
+        .or_else(|| body.get("successor"))
+        .or_else(|| body.get("retired"))
+        .or_else(|| body.get("prior"))
+        .ok_or_else(|| refused("signed request has no coordinate".into()))?;
+    if entry["$type"] != entry_kind
+        || returned_signed != submitted_signed
+        || entry["conversationId"] != expected_coordinate["conversationId"]
+        || chat_wire::canonicalize_wire_coordinate(&answer["coordinates"], None)?
+            != chat_wire::canonicalize_wire_coordinate(expected_coordinate, None)?
     {
         return Err(refused(
             "its entry or coordinates are not this device's signed request".into(),
@@ -201,6 +205,14 @@ fn verify_own_entry_answer(answer: &Value, submitted: &Value) -> Result<i64, MLS
     entry["seq"]
         .as_i64()
         .ok_or_else(|| refused("entry seq".into()))
+}
+
+struct SignedChatSubmission<'a> {
+    device_id: &'a str,
+    auth_generation: Option<i64>,
+    operation: CanonicalOperation,
+    body_value: &'a Value,
+    signer: &'a SignatureKeyPair,
 }
 
 /// One conversation's sync pass, as its control-entry checks read it.
@@ -436,9 +448,8 @@ impl WasmMlsClient {
     }
 
     /// POST one signed clean-chat mutation and return its 2xx answer. An answer that sequences
-    /// this device's own transition or creation must verify first ([`verify_own_entry_answer`]):
-    /// any other answer is an error, so no caller moves its cursor, writes coordinates or merges
-    /// a staged commit from it (contract B).
+    /// this device's own control must verify first ([`verify_own_entry_answer`]): any other answer
+    /// is an error, so no caller moves its cursor, writes coordinates or merges a staged commit.
     pub(crate) async fn submit_signed_chat_op(
         &self,
         session_token: &str,
@@ -448,6 +459,33 @@ impl WasmMlsClient {
         body_value: &Value,
         signer: &SignatureKeyPair,
     ) -> Result<Value, MLSError> {
+        self.submit_signed_chat_op_for_authority(
+            session_token,
+            SignedChatSubmission {
+                device_id,
+                auth_generation,
+                operation,
+                body_value,
+                signer,
+            },
+            None,
+        )
+        .await
+    }
+
+    async fn submit_signed_chat_op_for_authority(
+        &self,
+        session_token: &str,
+        submission: SignedChatSubmission<'_>,
+        receipt_authority: Option<&str>,
+    ) -> Result<Value, MLSError> {
+        let SignedChatSubmission {
+            device_id,
+            auth_generation,
+            operation,
+            body_value,
+            signer,
+        } = submission;
         let prepared = chat_wire::sign_clean_chat_mutation(
             &self.account_did,
             device_id,
@@ -459,30 +497,89 @@ impl WasmMlsClient {
         let nsid = prepared
             .path
             .strip_prefix("/xrpc/")
-            .unwrap_or(&prepared.path);
-        let request = prepared.body.unwrap_or_default();
+            .unwrap_or(&prepared.path)
+            .to_string();
+        self.submit_prepared_signed_chat_op_for_authority(
+            session_token,
+            operation,
+            &nsid,
+            prepared.body.unwrap_or_default(),
+            signer.public(),
+            receipt_authority,
+        )
+        .await
+    }
+
+    /// Submit already-signed bytes without rebuilding them. Group-creation recovery uses this
+    /// after reopening so the DS sees exactly the request whose genesis state was journaled.
+    pub(crate) async fn submit_prepared_signed_chat_op_for_authority(
+        &self,
+        session_token: &str,
+        operation: CanonicalOperation,
+        nsid: &str,
+        request: Vec<u8>,
+        signer_public_key: &[u8],
+        receipt_authority: Option<&str>,
+    ) -> Result<Value, MLSError> {
         let own_request = matches!(
             operation,
-            CanonicalOperation::SubmitTransition | CanonicalOperation::CreateConversation
+            CanonicalOperation::SubmitTransition
+                | CanonicalOperation::CreateConversation
+                | CanonicalOperation::AcceptConversation
         )
         .then(|| serde_json::from_slice::<Value>(&request))
         .transpose()?;
         let bytes = self.ds_post_json(session_token, nsid, request).await?;
-        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
             return Err(MLSError::Internal(format!(
                 "POST {nsid} returned empty response body"
             )));
         }
-        let val: Value = serde_json::from_slice(&bytes)
+        let answer_value: Value = serde_json::from_slice(&bytes)
             .map_err(|e| MLSError::Internal(format!("parse {operation:?} JSON: {e}")))?;
         if let Some(submitted) = &own_request {
             let answer = match operation {
-                CanonicalOperation::CreateConversation => &val["result"],
-                _ => &val,
+                CanonicalOperation::CreateConversation => &answer_value["result"],
+                _ => &answer_value,
             };
             verify_own_entry_answer(answer, submitted)?;
+            let signed = &submitted["signedRequest"];
+            let kind = signed
+                .pointer("/body/$type")
+                .and_then(Value::as_str)
+                .and_then(SignedMutationKind::from_type_id)
+                .ok_or_else(|| MLSError::Cryptography("own answer has no control kind".into()))?;
+            let (verified_body, request_digest) =
+                chat_wire::verify_signed_mutation_body_and_digest(signed, kind, signer_public_key)?;
+            let cid = verified_body
+                .get("next")
+                .or_else(|| verified_body.get("prior"))
+                .or_else(|| verified_body.get("successor"))
+                .and_then(|coordinate| coordinate["conversationId"].as_str())
+                .or_else(|| verified_body["conversationId"].as_str())
+                .ok_or_else(|| {
+                    MLSError::Cryptography("own control has no conversationId".into())
+                })?;
+            let sequencer_did = match receipt_authority {
+                Some(authority) => authority.to_owned(),
+                None => self
+                    .require_db_mls()?
+                    .backend()
+                    .get_conversation(cid)?
+                    .map(|conversation| conversation.sequencer_did)
+                    .unwrap_or_else(|| self.home_ds_did.clone()),
+            };
+            self.verify_control_entry_receipt(
+                session_token,
+                &sequencer_did,
+                cid,
+                &answer["entry"],
+                &verified_body,
+                &request_digest,
+            )
+            .await?;
         }
-        Ok(val)
+        Ok(answer_value)
     }
 
     pub(crate) async fn ds_signed_get(
@@ -621,10 +718,11 @@ impl WasmMlsClient {
         Ok(None)
     }
 
-    pub(crate) async fn verify_peer_device_keys_via_pds(
+    async fn fetch_peer_device_keys_via_pds(
         &self,
         session_token: &str,
         did: &str,
+        persist: bool,
     ) -> Result<Vec<(String, Vec<u8>)>, MLSError> {
         let pds_endpoint = self
             .resolve_did_document(session_token, did)
@@ -658,25 +756,38 @@ impl WasmMlsClient {
                 "I4: zero valid blue.catbird.chat.device records on PDS for `{did}`"
             )));
         }
-        let db = self.require_db_mls()?;
-        let ts = now_ms();
-        let cached_json = serde_json::to_string(
-            &pairs
-                .iter()
-                .map(|(dev_id, pk)| {
-                    json!({
-                        "did": did,
-                        "deviceId": dev_id,
-                        "signaturePublicKey": STANDARD.encode(pk),
+        if persist {
+            let cached_json = serde_json::to_string(
+                &pairs
+                    .iter()
+                    .map(|(dev_id, pk)| {
+                        json!({
+                            "did": did,
+                            "deviceId": dev_id,
+                            "signaturePublicKey": STANDARD.encode(pk),
+                        })
                     })
-                })
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| MLSError::Internal(e.to_string()))?;
-        db.write_tx(|tx| {
-            tx.put_account_meta(&format!("authorized_device_keys:{did}"), &cached_json, ts)
-        })?;
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| MLSError::Internal(e.to_string()))?;
+            self.require_db_mls()?.write_tx(|tx| {
+                tx.put_account_meta(
+                    &format!("authorized_device_keys:{did}"),
+                    &cached_json,
+                    now_ms(),
+                )
+            })?;
+        }
         Ok(pairs)
+    }
+
+    pub(crate) async fn verify_peer_device_keys_via_pds(
+        &self,
+        session_token: &str,
+        did: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, MLSError> {
+        self.fetch_peer_device_keys_via_pds(session_token, did, true)
+            .await
     }
 
     pub(crate) async fn resolve_peer_home_ds_did(
@@ -734,11 +845,12 @@ impl WasmMlsClient {
             .map_err(|e| MLSError::Cryptography(format!("C33 coordinator: {e}")))
     }
 
-    pub(crate) async fn fetch_sequencer_receipt_key_sec1(
+    async fn resolve_sequencer_receipt_key_sec1(
         &self,
         session_token: &str,
         sequencer_did: &str,
         kid_hint: &str,
+        persist: bool,
     ) -> Result<Vec<u8>, MLSError> {
         let clean_did = sequencer_did.split('#').next().unwrap_or(sequencer_did);
         let cache_key = format!("receipt_pub_sec1_b64:{clean_did}:{kid_hint}");
@@ -759,9 +871,20 @@ impl WasmMlsClient {
                 ))
             })?;
         let sec1 = chat_wire::decode_p256_sec1_from_did_doc(&doc_bytes, clean_did, kid_hint)?;
-        let ts = now_ms();
-        db.write_tx(|tx| tx.put_account_meta(&cache_key, &STANDARD.encode(&sec1), ts))?;
+        if persist {
+            db.write_tx(|tx| tx.put_account_meta(&cache_key, &STANDARD.encode(&sec1), now_ms()))?;
+        }
         Ok(sec1)
+    }
+
+    pub(crate) async fn fetch_sequencer_receipt_key_sec1(
+        &self,
+        session_token: &str,
+        sequencer_did: &str,
+        kid_hint: &str,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.resolve_sequencer_receipt_key_sec1(session_token, sequencer_did, kid_hint, true)
+            .await
     }
 
     pub(crate) fn load_or_build_conversation_coords(
@@ -910,9 +1033,10 @@ impl WasmMlsClient {
         Ok(())
     }
 
-    /// The `acceptConversation` answer's `acceptanceProof`, verified
+    /// The `acceptConversation` answer's legacy `acceptanceProof`, verified
     /// ([`Self::verify_acceptance_proof`]) over this device's signed acceptance of
-    /// `publication`'s request. Returns that entry's seq and the receipt's next coordinates.
+    /// `publication`'s request, plus the entry's outer `I13` receipt. Returns that entry's seq
+    /// and the actor-signed successor coordinates.
     async fn verify_direct_request_acceptance(
         &self,
         session_token: &str,
@@ -925,8 +1049,25 @@ impl WasmMlsClient {
         let proof = response
             .get("acceptanceProof")
             .ok_or_else(|| acceptance_refused("missing acceptanceProof"))?;
+        let mut legacy_proof = proof.clone();
+        legacy_proof
+            .get_mut("entry")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| acceptance_refused("entry is not an object"))?
+            .remove("sequencerReceipt");
+        let sequencer_did = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(conversation_id)?
+            .ok_or_else(|| MLSError::group_not_found(conversation_id))?
+            .sequencer_did;
         let verified = self
-            .verify_acceptance_proof(session_token, conversation_id, proof, own_signature_key)
+            .verify_acceptance_proof(
+                session_token,
+                &sequencer_did,
+                &legacy_proof,
+                own_signature_key,
+            )
             .await?;
         let accepted = &verified["entry"]["signedRequest"]["body"];
         if accepted["requestId"] != publication["requestId"]
@@ -934,34 +1075,40 @@ impl WasmMlsClient {
         {
             return Err(acceptance_refused("proof is for another request"));
         }
+        let request_digest: [u8; 32] =
+            chat_wire::json_bytes(&verified["receipt"]["body"]["acceptanceDigest"])?
+                .try_into()
+                .map_err(|_| acceptance_refused("acceptance digest length"))?;
+        self.verify_control_entry_receipt(
+            session_token,
+            &sequencer_did,
+            conversation_id,
+            &proof["entry"],
+            accepted,
+            &request_digest,
+        )
+        .await?;
         let seq = verified["entry"]["seq"]
             .as_i64()
             .ok_or_else(|| acceptance_refused("entry seq"))?;
-        let next = chat_wire::canonicalize_wire_coordinate(
-            &verified["receipt"]["body"]["next"],
-            Some(conversation_id),
-        )?;
+        let next =
+            chat_wire::canonicalize_wire_coordinate(&accepted["next"], Some(conversation_id))?;
         Ok((seq, next))
     }
 
-    /// `proof` (`{entry, receipt}`) verified: the conversation coordinator's acceptance-commit
-    /// receipt, under the method its `keyId` names, over the exact sequenced entry carrying an
-    /// acceptance signed under `accepter_key`. Returns the verified proof.
+    /// Legacy `proof` (`{entry, receipt}`) verified: the conversation coordinator's
+    /// acceptance-commit receipt, under the method its `keyId` names, over the exact sequenced
+    /// entry carrying an acceptance signed under `accepter_key`. The Task 5 outer I13 extension
+    /// must be detached by the caller and verified separately.
     async fn verify_acceptance_proof(
         &self,
         session_token: &str,
-        conversation_id: &str,
+        authority: &str,
         proof: &Value,
         accepter_key: &[u8],
     ) -> Result<Value, MLSError> {
-        let authority = self
-            .require_db_mls()?
-            .backend()
-            .get_conversation(conversation_id)?
-            .ok_or_else(|| MLSError::group_not_found(conversation_id))?
-            .sequencer_did;
         let document = self
-            .resolve_did_document(session_token, &authority)
+            .resolve_did_document(session_token, authority)
             .await?
             .ok_or_else(|| acceptance_refused("coordinator document unavailable"))?;
         let method = proof
@@ -969,11 +1116,11 @@ impl WasmMlsClient {
             .and_then(Value::as_str)
             .ok_or_else(|| acceptance_refused("receipt keyId"))?;
         let key = dr_transcript::resolve_direct_request_receipt_key_for_authority(
-            &authority, &document, method,
+            authority, &document, method,
         )
         .map_err(acceptance_refused)?;
         dr_transcript::verify_received_direct_request_acceptance_proof_for_authority(
-            &authority,
+            authority,
             &serde_json::to_vec(proof)?,
             &key,
             accepter_key,
@@ -985,8 +1132,8 @@ impl WasmMlsClient {
     /// must be exactly that entry for `cid` at `entry_seq`; its signer a current leaf of the
     /// local group ([`Self::control_signer_key`]); its acceptance signed under that leaf's key
     /// for this conversation, changing only `stateVersion`, by the local request's recipient for
-    /// that request; and a `sequencerReceipt` it carries the coordinator's acceptance proof over
-    /// it. Returns the coordinates it moves the conversation to.
+    /// that request; and its mandatory outer `sequencerReceipt` a Task 5 I13 control receipt over
+    /// that actor digest, sequence and successor coordinate. Returns the verified successor.
     #[allow(clippy::too_many_arguments)]
     async fn verify_synced_direct_request_acceptance(
         &self,
@@ -1002,24 +1149,25 @@ impl WasmMlsClient {
         let fields = presented
             .as_object_mut()
             .ok_or_else(|| acceptance_refused("entry is not an object"))?;
-        let receipt = fields.remove("sequencerReceipt");
+        // The outer Task 5 I13 extension is not part of the actor-signed closed projection.
+        fields.remove("sequencerReceipt");
         if fields.remove("$type")
             != Some(json!("blue.catbird.chat.defs#directRequestAcceptanceEntry"))
         {
             return Err(acceptance_refused("not a directRequestAcceptanceEntry"));
         }
-        let entry = dr_transcript::normalize_read_presentation(
+        let presented = dr_transcript::normalize_read_presentation(
             &serde_json::to_vec(&presented)?,
             "directRequestAcceptanceEntry",
             false,
         )
         .map_err(acceptance_refused)?;
-        if entry["conversationId"] != cid || entry["seq"] != entry_seq {
+        if presented["conversationId"] != cid || presented["seq"] != entry_seq {
             return Err(acceptance_refused(
                 "entry is for another conversation or seq",
             ));
         }
-        let signed = &entry["signedRequest"];
+        let signed = &presented["signedRequest"];
         let key = self.control_signer_key(
             cid,
             signed["body"]["actorDid"].as_str(),
@@ -1034,6 +1182,7 @@ impl WasmMlsClient {
             &key,
         )
         .map_err(acceptance_refused)?;
+        let request_digest = *acceptance.request_digest();
         let body = acceptance.body();
         let mut next = body["prior"].clone();
         next["stateVersion"] = body["prior"]["stateVersion"]
@@ -1059,13 +1208,21 @@ impl WasmMlsClient {
                 "not the recipient's acceptance of this request",
             ));
         }
-        if let Some(receipt) = receipt {
-            let proof = json!({ "entry": entry, "receipt": receipt });
-            let verified = self
-                .verify_acceptance_proof(session_token, cid, &proof, &key)
-                .await?;
-            next = verified["receipt"]["body"]["next"].clone();
-        }
+        let sequencer_did = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(cid)?
+            .ok_or_else(|| MLSError::group_not_found(cid))?
+            .sequencer_did;
+        self.verify_control_entry_receipt(
+            session_token,
+            &sequencer_did,
+            cid,
+            entry,
+            body,
+            &request_digest,
+        )
+        .await?;
         chat_wire::canonicalize_wire_coordinate(&next, Some(cid))
     }
 
@@ -1270,12 +1427,15 @@ impl WasmMlsClient {
         let Some((session_token, canonical_dev_id)) = self.live_session() else {
             return Ok(0);
         };
+        let mut applied = self
+            .complete_pending_group_creations(&session_token)
+            .await?;
         let Ok((signer, auth_gen)) = self.load_enrolled_signer_and_auth_gen() else {
-            return Ok(0);
+            return Ok(applied);
         };
         let mut failures = Vec::new();
         let mut owed = Vec::new();
-        let (mut applied, inventory_session_id) = self
+        let (inventory_applied, inventory_session_id) = self
             .sync_conversations_list(
                 &session_token,
                 &canonical_dev_id,
@@ -1285,6 +1445,7 @@ impl WasmMlsClient {
                 &mut failures,
             )
             .await?;
+        applied = applied.saturating_add(inventory_applied);
         let mut welcomed = BTreeSet::new();
         applied = applied.saturating_add(
             self.sync_pending_welcomes(
@@ -1560,6 +1721,7 @@ impl WasmMlsClient {
                             signer,
                             auth_gen,
                             cid,
+                            state_view_sequencer_did(state),
                             coords,
                             provenance,
                         )
@@ -1590,6 +1752,7 @@ impl WasmMlsClient {
         signer: &SignatureKeyPair,
         auth_gen: i64,
         cid: &str,
+        state_sequencer_did: Option<&str>,
         coords: &Value,
         invitation_provenance: &Value,
     ) -> Result<(), MLSError> {
@@ -1613,14 +1776,25 @@ impl WasmMlsClient {
             "next": next,
             "invitationProvenance": invitation_provenance,
         });
+        let sequencer_did = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(cid)?
+            .map(|conversation| conversation.sequencer_did)
+            .filter(|authority| !authority.is_empty())
+            .or_else(|| state_sequencer_did.map(|authority| authority.to_owned()))
+            .unwrap_or_else(|| self.home_ds_did.clone());
         let answer = self
-            .submit_signed_chat_op(
+            .submit_signed_chat_op_for_authority(
                 session_token,
-                canonical_dev_id,
-                Some(auth_gen),
-                CanonicalOperation::AcceptConversation,
-                &body,
-                signer,
+                SignedChatSubmission {
+                    device_id: canonical_dev_id,
+                    auth_generation: Some(auth_gen),
+                    operation: CanonicalOperation::AcceptConversation,
+                    body_value: &body,
+                    signer,
+                },
+                Some(&sequencer_did),
             )
             .await?;
         let record = self.own_request_record(
@@ -2537,10 +2711,11 @@ impl WasmMlsClient {
     /// Join `cid` from a generic Welcome only as the verified Welcome of the signed
     /// `leafRecoveryFulfillmentEntry` sequenced at its `transition_seq` (mls-ds makes the added
     /// device a recipient of that entry), so a direct request's Welcome, which has none, never
-    /// joins here. Staged without consuming it, the Welcome's group must hold the fulfiller
-    /// `actorDid#actorDeviceId` under its PDS-authorized key; the body verifies under that key
-    /// and must deliver exactly these Welcome bytes to this device under the request whose
-    /// `addLeafByRecovery` adds it. A `retired` row (its group erased by a verified reset)
+    /// joins here. Its I13 receipt must verify under the retained sequencer and bind that exact
+    /// entry sequence and signed request. Staged without consuming it, the Welcome's group must
+    /// hold the fulfiller `actorDid#actorDeviceId` under its PDS-authorized key; the body verifies
+    /// under that key and must deliver exactly these Welcome bytes to this device under the
+    /// request whose `addLeafByRecovery` adds it. A `retired` row (its group erased by a verified reset)
     /// rejoins only at its generation or a later one, in place: its history, unread count and
     /// pinned sequencer stay. Joined, every leaf is PDS-authorized (`I4`) and the body's signed
     /// `next` must name the group: it becomes the conversation's coordinates, with the cursor at
@@ -2642,7 +2817,7 @@ impl WasmMlsClient {
                 "the fulfiller's leaf key is not its authorized key",
             ));
         }
-        let body = chat_wire::verify_signed_mutation_body(
+        let (body, request_digest) = chat_wire::verify_signed_mutation_body_and_digest(
             signed,
             SignedMutationKind::LeafRecoveryFulfillment,
             &fulfiller_key,
@@ -2678,6 +2853,15 @@ impl WasmMlsClient {
             .map(|row| row.sequencer_did.as_str())
             .filter(|pinned| !pinned.is_empty())
             .unwrap_or(sequencer_did);
+        self.verify_control_entry_receipt(
+            session_token,
+            sequencer_did,
+            cid,
+            entry,
+            &body,
+            &request_digest,
+        )
+        .await?;
         let ts = now_ms();
         db.write_tx(|tx| {
             let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
@@ -3192,6 +3376,194 @@ impl WasmMlsClient {
         self.fetch_sequencer_receipt_key_sec1(session_token, sequencer_did, kid)
             .await
     }
+    pub(crate) async fn verify_control_entry_receipt(
+        &self,
+        session_token: &str,
+        sequencer_did: &str,
+        cid: &str,
+        entry: &Value,
+        verified_body: &Value,
+        request_digest: &[u8; 32],
+    ) -> Result<(), MLSError> {
+        let entry_seq = entry["seq"]
+            .as_i64()
+            .ok_or_else(|| MLSError::Cryptography("control entry missing seq".into()))?;
+        let entry_id = entry["entryId"]
+            .as_str()
+            .ok_or_else(|| MLSError::Cryptography("control entry missing entryId".into()))?;
+        let receipt = entry
+            .get("sequencerReceipt")
+            .filter(|receipt| receipt.is_object())
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!(
+                    "I13: control entry at seq {entry_seq} missing sequencerReceipt"
+                ))
+            })?;
+        let coordinate = ["next", "successor", "retired", "prior"]
+            .iter()
+            .find_map(|field| verified_body.get(field))
+            .cloned()
+            .or_else(|| self.local_coordinates(cid).ok().flatten())
+            .ok_or_else(|| {
+                MLSError::Cryptography("control entry has no receipt coordinate".into())
+            })?;
+        let actor_did = verified_body["actorDid"]
+            .as_str()
+            .ok_or_else(|| MLSError::Cryptography("control body missing actorDid".into()))?;
+        let actor_device_id = verified_body["actorDeviceId"]
+            .as_str()
+            .ok_or_else(|| MLSError::Cryptography("control body missing actorDeviceId".into()))?;
+        let key = self
+            .receipt_key_for(session_token, sequencer_did, receipt)
+            .await?;
+        chat_wire::verify_control_sequencer_receipt(
+            receipt,
+            &key,
+            sequencer_did,
+            cid,
+            entry_id,
+            entry_seq,
+            actor_did,
+            actor_device_id,
+            &coordinate,
+            request_digest,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_application_prior_or_flag_fork(
+        &self,
+        session_token: &str,
+        cid: &str,
+        entry_seq: i64,
+        entry_id: &str,
+        body: &Value,
+        receipt: &Value,
+        peer_map: &BTreeMap<String, Vec<(String, Vec<u8>)>>,
+        canonical_dev_id: &str,
+        signer: &SignatureKeyPair,
+    ) -> Result<(), MLSError> {
+        let Some(local) = self.local_coordinates(cid)? else {
+            return Ok(());
+        };
+        let prior = chat_wire::canonicalize_wire_coordinate(&body["prior"], Some(cid))?;
+        let local_epoch = local["epoch"]
+            .as_i64()
+            .ok_or_else(|| MLSError::Internal("local coordinate missing epoch".into()))?;
+        let prior_epoch = prior["epoch"]
+            .as_i64()
+            .ok_or_else(|| MLSError::Cryptography("application prior missing epoch".into()))?;
+        if prior_epoch < local_epoch {
+            return Ok(());
+        }
+        if prior_epoch > local_epoch || prior["generation"] != local["generation"] {
+            return Err(MLSError::Cryptography(format!(
+                "WrongEpoch: signed application prior is generation {}, epoch {}, local is generation {}, epoch {}",
+                prior["generation"], prior_epoch, local["generation"], local_epoch
+            )));
+        }
+        if chat_wire::json_bytes(&prior["groupContextHash"])?
+            == chat_wire::json_bytes(&local["groupContextHash"])?
+            && chat_wire::json_bytes(&prior["confirmationTag"])?
+                == chat_wire::json_bytes(&local["confirmationTag"])?
+        {
+            return Ok(());
+        }
+
+        // Fork evidence is durable security state. Before any write, use the same current-leaf
+        // lookup as control entries and authenticate the receipt under the method its own `kid`
+        // names. PDS and receipt-key lookups deliberately do not populate their durable caches
+        // on this path until the entry has met both conditions.
+        let actor_did = body["actorDid"]
+            .as_str()
+            .ok_or_else(|| MLSError::Cryptography("applicationSendBody missing actorDid".into()))?;
+        let actor_device_id = body["actorDeviceId"].as_str().ok_or_else(|| {
+            MLSError::Cryptography("applicationSendBody missing actorDeviceId".into())
+        })?;
+        let leaf_key = self.control_signer_key(
+            cid,
+            Some(actor_did),
+            Some(actor_device_id),
+            peer_map,
+            canonical_dev_id,
+            signer,
+        )?;
+        let message_id = body["messageId"].as_str().ok_or_else(|| {
+            MLSError::Cryptography("applicationSendBody missing messageId".into())
+        })?;
+        let aad = canonical_application_aad_bytes(body.get("aad").ok_or_else(|| {
+            MLSError::Cryptography("signed application body missing MLS AAD".into())
+        })?)
+        .map_err(|error| {
+            MLSError::Cryptography(format!("invalid signed application AAD: {error}"))
+        })?;
+        let (commitment, attestation) =
+            verify_application_aad_archive_evidence(&aad, cid, message_id)?;
+        if attestation.sender_did != actor_did
+            || attestation.sender_device_id != actor_device_id
+            || attestation.sender_transport_public_key.as_slice() != leaf_key.as_slice()
+        {
+            return Err(MLSError::Cryptography(
+                "fork evidence sender is not the authenticated current leaf".into(),
+            ));
+        }
+        let convo = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(cid)?
+            .ok_or_else(|| MLSError::group_not_found(cid))?;
+        let kid = chat_wire::sequencer_receipt_kid(&convo.sequencer_did, receipt)?;
+        let receipt_key = self
+            .resolve_sequencer_receipt_key_sec1(session_token, &convo.sequencer_did, kid, false)
+            .await?;
+        let epoch = u64::try_from(prior_epoch)
+            .map_err(|_| MLSError::Cryptography("application prior epoch is negative".into()))?;
+        let (receipt_seq, receipt_generation, _) =
+            chat_wire::parse_and_verify_i13_sequencer_receipt(
+                receipt,
+                &receipt_key,
+                &convo.sequencer_did,
+                cid,
+                &convo.group_id,
+                epoch,
+                entry_id,
+                message_id,
+                &commitment,
+                Some(&attestation),
+            )?;
+        if i64::try_from(receipt_seq).ok() != Some(entry_seq)
+            || u64::try_from(convo.generation).ok() != Some(receipt_generation)
+        {
+            return Err(MLSError::Cryptography(
+                "I13: fork evidence receipt position mismatch".into(),
+            ));
+        }
+
+        // Known ceiling: today's application receipt does not sign the signed-request digest or
+        // the prior hash/tag, so this authenticates the position, sender and archive commitment,
+        // not the exact conflicting prior.
+        let generation = local["generation"].as_i64().unwrap_or_default();
+        let evidence = json!({
+            "entrySeq": entry_seq,
+            "generation": generation,
+            "epoch": local_epoch,
+            "localGroupContextHash": local["groupContextHash"],
+            "localConfirmationTag": local["confirmationTag"],
+            "signedPrior": prior,
+        });
+        self.require_db_mls()?.write_tx(|tx| {
+            tx.put_account_meta(
+                &chat_wire::fork_detected_key(cid),
+                &evidence.to_string(),
+                now_ms(),
+            )
+        })?;
+        Err(MLSError::ForkDetected {
+            conversation_id: cid.to_owned(),
+            generation,
+            epoch: local_epoch,
+        })
+    }
 
     /// Whether `cid` is closed: its terminal marker, or retired coordinates.
     pub(crate) fn is_conversation_closed(&self, cid: &str) -> Result<bool, MLSError> {
@@ -3238,6 +3610,7 @@ impl WasmMlsClient {
                 tx.upsert_conversation(&convo)?;
             }
             prune_commit_transitions(tx, cid, 0, 0, true)?;
+            remove_group_creation_journal(tx, cid)?;
             for key in [
                 conversation_close_key(cid),
                 format!("c33_pending_opening:{cid}"),
@@ -3599,6 +3972,22 @@ impl WasmMlsClient {
                     "I13: receipt generation mismatch".into(),
                 ));
             }
+            if evidence.sender_did != self.account_did
+                || evidence.sender_device_id != self.device_id
+            {
+                if let Some(send_counter) = evidence.send_counter {
+                    let key = chat_wire::peer_send_counter_key(
+                        cid,
+                        convo.generation,
+                        evidence.epoch,
+                        &evidence.sender_did,
+                        &evidence.sender_device_id,
+                    );
+                    let last = tx.get_account_meta(&key)?;
+                    chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
+                    tx.put_account_meta(&key, &send_counter.to_string(), evidence.recorded_at_ms)?;
+                }
+            }
             if tx.get_message(&evidence.message_id)?.is_none() {
                 let is_own = evidence.sender_did == self.account_did;
                 tx.insert_message(&evidence.gap_row(&convo.group_id, is_own)?)?;
@@ -3642,8 +4031,9 @@ impl WasmMlsClient {
     /// The `creationEntry` or `policyEntry` inviting it (the one whose signed `transitionId` an
     /// acceptance's `provenance` names, else any naming `invitee` as pending) is sought among
     /// this pass's entries before `before_seq`, then by paging `getEntries` from seq 0. Found,
-    /// it must verify under the PDS-authorized key of exactly its signing device and name
-    /// `invitee`'s pending row, with exactly `provenance` when given: anything else is an error.
+    /// it must verify under the PDS-authorized key of exactly its signing device, carry a valid
+    /// I13 receipt bound to its sequence, and name `invitee`'s pending row, with exactly
+    /// `provenance` when given: anything else is an error.
     /// Not found is an error when this device reads seq 1. Otherwise the invitation predates
     /// this device's readable history (mls-ds never makes a later joiner a recipient of earlier
     /// control entries), and the actor's device signature and coordinate step stand alone.
@@ -3653,6 +4043,7 @@ impl WasmMlsClient {
     async fn verify_invitation_chain(
         &self,
         pass: &SyncPass<'_>,
+        sequencer_did: &str,
         invitee: &str,
         provenance: Option<&Value>,
         before_seq: i64,
@@ -3745,14 +4136,27 @@ impl WasmMlsClient {
         let key = self
             .pds_device_key(pass.session_token, peer_map, did, device)
             .await?;
-        let verified =
-            chat_wire::verify_signed_mutation_body(&invitation["signedRequest"], kind, &key)?;
+        let (verified, request_digest) = chat_wire::verify_signed_mutation_body_and_digest(
+            &invitation["signedRequest"],
+            kind,
+            &key,
+        )?;
+        let invitation_seq = invitation["seq"]
+            .as_i64()
+            .ok_or_else(|| refused("the verified invitation has no seq"))?;
+        self.verify_control_entry_receipt(
+            pass.session_token,
+            sequencer_did,
+            pass.cid,
+            &invitation,
+            &verified,
+            &request_digest,
+        )
+        .await?;
         match chat_wire::invitation_provenance(kind, &verified, pass.cid, invitee) {
-            Some(named) if provenance.is_none_or(|provenance| *provenance == named) => invitation
-                ["seq"]
-                .as_i64()
-                .map(Some)
-                .ok_or_else(|| refused("the verified invitation has no seq")),
+            Some(named) if provenance.is_none_or(|provenance| *provenance == named) => {
+                Ok(Some(invitation_seq))
+            }
             _ => Err(refused(
                 "the invitation does not invite the actor as signed",
             )),
@@ -3787,6 +4191,12 @@ impl WasmMlsClient {
     ) -> Result<(Value, Option<Value>, Option<i64>), MLSError> {
         use SignedMutationKind as K;
         let cid = pass.cid;
+        let sequencer_did = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(cid)?
+            .ok_or_else(|| MLSError::group_not_found(cid))?
+            .sequencer_did;
         let signed = &entry["signedRequest"];
         let seq = entry["seq"].as_i64().unwrap_or_default();
         let actor = signed
@@ -3806,28 +4216,30 @@ impl WasmMlsClient {
             pass.signer,
         );
         let mut invitation_seq = None;
-        let body = match kind {
+        let (body, request_digest) = match kind {
             K::PolicyTransition | K::MetadataTransition | K::LeaveRequest => {
-                chat_wire::verify_signed_mutation_body(signed, kind, &leaf_key?)?
+                chat_wire::verify_signed_mutation_body_and_digest(signed, kind, &leaf_key?)?
             }
             K::ConversationClose if leaf_key.is_ok() => {
-                chat_wire::verify_signed_mutation_body(signed, kind, &leaf_key?)?
+                chat_wire::verify_signed_mutation_body_and_digest(signed, kind, &leaf_key?)?
             }
             K::ParticipantAcceptance => {
                 let key = self
                     .pds_device_key(pass.session_token, peer_map, actor, device)
                     .await?;
-                let body = chat_wire::verify_signed_mutation_body(signed, kind, &key)?;
+                let verified =
+                    chat_wire::verify_signed_mutation_body_and_digest(signed, kind, &key)?;
                 invitation_seq = self
                     .verify_invitation_chain(
                         pass,
+                        &sequencer_did,
                         actor,
-                        Some(&body["invitationProvenance"]),
+                        Some(&verified.0["invitationProvenance"]),
                         seq,
                         peer_map,
                     )
                     .await?;
-                body
+                verified
             }
             K::ConversationClose
             | K::ZeroLeafLeave
@@ -3838,18 +4250,19 @@ impl WasmMlsClient {
                 let key = self
                     .pds_device_key(pass.session_token, peer_map, actor, device)
                     .await?;
-                let body = chat_wire::verify_signed_mutation_body(signed, kind, &key)?;
-                if kind == K::ConversationClose && body["conversationKind"] != "direct" {
+                let verified =
+                    chat_wire::verify_signed_mutation_body_and_digest(signed, kind, &key)?;
+                if kind == K::ConversationClose && verified.0["conversationKind"] != "direct" {
                     return Err(MLSError::Cryptography(
                         "I4: only a current leaf closes a group conversation".into(),
                     ));
                 }
                 if !self.is_member_did(cid, actor)? {
                     invitation_seq = self
-                        .verify_invitation_chain(pass, actor, None, seq, peer_map)
+                        .verify_invitation_chain(pass, &sequencer_did, actor, None, seq, peer_map)
                         .await?;
                 }
-                body
+                verified
             }
             _ => {
                 return Err(MLSError::Cryptography(
@@ -3857,6 +4270,15 @@ impl WasmMlsClient {
                 ))
             }
         };
+        self.verify_control_entry_receipt(
+            pass.session_token,
+            &sequencer_did,
+            cid,
+            entry,
+            &body,
+            &request_digest,
+        )
+        .await?;
         let next = match kind {
             K::ConversationClose => Some(chat_wire::verify_coordinate_step(
                 &body["prior"],
@@ -3896,8 +4318,10 @@ impl WasmMlsClient {
     /// Commit is processed: at the local epoch, sent by exactly that leaf. Merged, its signed
     /// `next` must name the local MLS state at the local generation, one `stateVersion` past
     /// its `prior`. Its metadata snapshot comes from the verified body alone.
-    fn apply_synced_commit(
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_synced_commit(
         &self,
+        session_token: &str,
         cid: &str,
         entry: &Value,
         kind: SignedMutationKind,
@@ -3915,8 +4339,8 @@ impl WasmMlsClient {
         let own =
             actor_did == Some(self.account_did.as_str()) && actor_dev == Some(canonical_dev_id);
         // Actor labels only route: the complete body verifies before any effect.
-        let body = if own {
-            chat_wire::verify_own_commit_body(signed, signer.public())?
+        let (body, request_digest) = if own {
+            chat_wire::verify_own_commit_body_and_digest(signed, signer.public())?
         } else {
             let key = self.control_signer_key(
                 cid,
@@ -3926,8 +4350,23 @@ impl WasmMlsClient {
                 canonical_dev_id,
                 signer,
             )?;
-            chat_wire::verify_signed_mutation_body(signed, kind, &key)?
+            chat_wire::verify_signed_mutation_body_and_digest(signed, kind, &key)?
         };
+        let sequencer_did = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(cid)?
+            .ok_or_else(|| MLSError::group_not_found(cid))?
+            .sequencer_did;
+        self.verify_control_entry_receipt(
+            session_token,
+            &sequencer_did,
+            cid,
+            entry,
+            &body,
+            &request_digest,
+        )
+        .await?;
         if body["prior"]["conversationId"].as_str() != Some(cid)
             || body["next"]["conversationId"].as_str() != Some(cid)
         {
@@ -4210,7 +4649,11 @@ impl WasmMlsClient {
 
         let mut sorted_entries = all_raw_entries;
         sorted_entries.sort_by_key(|e| e.get("seq").and_then(|s| s.as_i64()).unwrap_or(0));
-        sorted_entries.dedup_by_key(|e| e.get("seq").and_then(|s| s.as_i64()).unwrap_or(0));
+        let mut expected_next_seq = convo
+            .last_seq
+            .max(0)
+            .checked_add(1)
+            .ok_or_else(|| MLSError::Cryptography("conversation sequence exhausted".into()))?;
 
         let db = self.require_db_mls()?;
         let mut candidate_dids = BTreeMap::new();
@@ -4233,7 +4676,7 @@ impl WasmMlsClient {
         let mut peer_map: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();
         for did in candidate_dids.keys() {
             let pairs = self
-                .verify_peer_device_keys_via_pds(session_token, did)
+                .fetch_peer_device_keys_via_pds(session_token, did, false)
                 .await?;
             peer_map.insert(did.clone(), pairs);
         }
@@ -4250,7 +4693,18 @@ impl WasmMlsClient {
             let entry_seq = entry
                 .get("seq")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(pass.max_seq);
+                .filter(|seq| *seq >= 1)
+                .ok_or_else(|| {
+                    MLSError::Cryptography("conversation entry missing a positive seq".into())
+                })?;
+            if entry_seq != expected_next_seq {
+                return Err(MLSError::Cryptography(format!(
+                    "non-contiguous conversation sequence: expected {expected_next_seq}, received {entry_seq}"
+                )));
+            }
+            expected_next_seq = expected_next_seq
+                .checked_add(1)
+                .ok_or_else(|| MLSError::Cryptography("conversation sequence exhausted".into()))?;
             let entry_type = entry
                 .get("$type")
                 .or_else(|| entry.get("entryKind"))
@@ -4377,6 +4831,20 @@ impl WasmMlsClient {
                     .get("entryId")
                     .and_then(|v| v.as_str())
                     .unwrap_or(msg_id);
+                if !is_pruned {
+                    self.verify_application_prior_or_flag_fork(
+                        session_token,
+                        cid,
+                        entry_seq,
+                        expected_rcpt_entry_id,
+                        body,
+                        rcpt_val,
+                        &peer_map,
+                        canonical_dev_id,
+                        signer,
+                    )
+                    .await?;
+                }
                 let rcpt_key = self
                     .receipt_key_for(session_token, &convo.sequencer_did, rcpt_val)
                     .await?;
@@ -4403,7 +4871,7 @@ impl WasmMlsClient {
                         let mut c = tx
                             .get_conversation(cid)?
                             .ok_or_else(|| MLSError::group_not_found(cid))?;
-                        chat_wire::verify_pruned_application_receipt(
+                        let pruned = chat_wire::verify_pruned_application_receipt(
                             rcpt_val,
                             rcpt_sec1,
                             &c.sequencer_did,
@@ -4412,6 +4880,35 @@ impl WasmMlsClient {
                             expected_rcpt_entry_id,
                             entry_seq,
                         )?;
+                        if pruned.generation != c.generation {
+                            return Err(MLSError::Cryptography(
+                                "I13: pruned receipt generation mismatch".into(),
+                            ));
+                        }
+                        if pruned.sender_did != self.account_did
+                            || pruned.sender_device_id != canonical_dev_id
+                        {
+                            let key = chat_wire::peer_send_counter_key(
+                                cid,
+                                pruned.generation,
+                                pruned.epoch,
+                                &pruned.sender_did,
+                                &pruned.sender_device_id,
+                            );
+                            if let Some(last) = tx.get_account_meta(&key)? {
+                                let next = last
+                                    .parse::<u64>()
+                                    .ok()
+                                    .and_then(|counter| counter.checked_add(1))
+                                    .ok_or_else(|| {
+                                        MLSError::Cryptography(
+                                            "peer sendCounter exhausted at pruned entry".into(),
+                                        )
+                                    })?;
+                                chat_wire::verify_next_peer_send_counter(Some(&last), next)?;
+                                tx.put_account_meta(&key, &next.to_string(), ts)?;
+                            }
+                        }
                         c.last_seq = c.last_seq.max(entry_seq);
                         c.updated_at_ms = ts;
                         tx.upsert_conversation(&c)
@@ -4420,6 +4917,36 @@ impl WasmMlsClient {
                     pass.applied = pass.applied.saturating_add(1);
                     continue;
                 }
+                let peer_counter = {
+                    let sender_did = body["actorDid"].as_str().unwrap_or_default();
+                    let sender_device_id = body["actorDeviceId"].as_str().unwrap_or_default();
+                    if sender_did == self.account_did && sender_device_id == canonical_dev_id {
+                        None
+                    } else {
+                        let send_counter = body["sendCounter"].as_u64().ok_or_else(|| {
+                            MLSError::Cryptography("applicationSendBody missing sendCounter".into())
+                        })?;
+                        let generation = body["prior"]["generation"].as_i64().ok_or_else(|| {
+                            MLSError::Cryptography(
+                                "applicationSendBody prior missing generation".into(),
+                            )
+                        })?;
+                        let epoch = body["prior"]["epoch"].as_i64().ok_or_else(|| {
+                            MLSError::Cryptography("applicationSendBody prior missing epoch".into())
+                        })?;
+                        let key = chat_wire::peer_send_counter_key(
+                            cid,
+                            generation,
+                            epoch,
+                            sender_did,
+                            sender_device_id,
+                        );
+                        let last = db.backend().get_account_meta(&key)?;
+                        chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
+                        Some((key, send_counter))
+                    }
+                };
+
                 let app_obj = body
                     .get("applicationMessage")
                     .or_else(|| entry.get("applicationMessage"))
@@ -4450,7 +4977,8 @@ impl WasmMlsClient {
                         ));
                     }
                     // Own MLS ciphertext is not decryptable. A send whose response was lost is
-                    // recovered only from its exact journal, with the same I13 receipt checks.
+                    // recovered only from its exact journal; receipt verification, accepted
+                    // `sendCounter` advancement and journal retirement share one transaction.
                     self.finish_application_send(
                         pending,
                         rcpt_val,
@@ -4469,6 +4997,11 @@ impl WasmMlsClient {
                     let mut c = tx
                         .get_conversation(cid)?
                         .ok_or_else(|| MLSError::group_not_found(cid))?;
+                    if let Some((key, send_counter)) = &peer_counter {
+                        let last = tx.get_account_meta(key)?;
+                        chat_wire::verify_next_peer_send_counter(last.as_deref(), *send_counter)?;
+                        tx.put_account_meta(key, &send_counter.to_string(), ts)?;
+                    }
                     let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
                     // No group, no roster to authenticate against: never store, advance or ACK.
                     let mut group =
@@ -4685,6 +5218,9 @@ impl WasmMlsClient {
                                 .as_str()
                                 .unwrap_or_default()
                                 .to_owned(),
+                            send_counter: peer_counter
+                                .as_ref()
+                                .map(|(_, send_counter)| *send_counter),
                             reason: reason.to_owned(),
                             recorded_at_ms: ts,
                         },
@@ -4714,14 +5250,17 @@ impl WasmMlsClient {
                     | SignedMutationKind::LeafRecoveryFulfillment
                     | SignedMutationKind::LeaveCommitFulfillment
             ) {
-                pass.was_kicked |= self.apply_synced_commit(
-                    cid,
-                    entry,
-                    kind,
-                    &peer_map,
-                    canonical_dev_id,
-                    signer,
-                )?;
+                pass.was_kicked |= self
+                    .apply_synced_commit(
+                        session_token,
+                        cid,
+                        entry,
+                        kind,
+                        &peer_map,
+                        canonical_dev_id,
+                        signer,
+                    )
+                    .await?;
                 pass.max_seq = pass.max_seq.max(entry_seq);
                 pass.applied = pass.applied.saturating_add(1);
                 continue;

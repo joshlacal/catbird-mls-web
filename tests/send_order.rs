@@ -11,6 +11,9 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use catbird_mls::chat_v2::transcript::{
+    decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+};
 use catbird_mls::client::{
     chat_wire, QueuedLabyrinthArchivePayload, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
@@ -74,13 +77,19 @@ function sequence(text) {
 }
 // A signed transition or acceptance is sequenced as the entry its body names, and its `next` is
 // the conversation's state coordinate.
-function transition(text) {
+function transition(text, sequencerDid) {
   ds.transitions.push(text);
-  const signedRequest = JSON.parse(text).signedRequest;
+  const submitted = JSON.parse(text).signedRequest;
+  const signedRequest = {...submitted, signature: {$bytes: bytes(submitted.signature)}};
   const b = signedRequest.body;
   const cid = (b.next || b.prior).conversationId;
+  const seq = ++ds.seq[cid];
+  const receiptInput = {
+    body: b, seq, entryId: b.transitionId, control: true, keyGeneration: ds.keyGeneration};
+  if (sequencerDid) receiptInput.sequencerDid = sequencerDid;
   const entry = {$type: `blue.catbird.chat.defs#${b.$type.split('#')[1].replace(/(Transition)?Body$/, 'Entry')}`,
-    entryId: b.transitionId, conversationId: cid, seq: ++ds.seq[cid], signedRequest, receivedAt: b.signedAt};
+    entryId: b.transitionId, conversationId: cid, seq, signedRequest, receivedAt: b.signedAt,
+    sequencerReceipt: JSON.parse(receiptFor(JSON.stringify(receiptInput)))};
   ds.entries[cid].push(entry);
   if (b.next) ds.coords[cid] = b.next;
   return entry;
@@ -102,13 +111,14 @@ function openRecovery(b) {
   return view;
 }
 const entryAt = (cid, seq) => ds.entries[cid].find((e) => e.seq === seq);
-export function installDs(receipt, didDoc) {
+export function installDs(receipt, didDoc, crossHomeDidDoc) {
   originalFetch = globalThis.fetch;
   receiptFor = receipt;
   ds = {records: {}, sends: [], accepted: {}, order: {}, seq: {}, entries: {}, held: [],
     hold: 0, lose: 0, refuse: false, enforce: true, keyGeneration: 1, acks: 0, repoReadAuth: [],
     transitions: [], loseTransition: 0, inventory: {}, welcomes: {}, inbox: {}, welcomeAcks: [],
-    floor: {}, kps: {}, coords: {}, recoveries: {}, acked: {}};
+    floor: {}, kps: {}, coords: {}, recoveries: {}, acked: {},
+    nextAcceptanceSequencer: null, nextAcceptanceEntry: null};
   globalThis.fetch = async (request) => {
     const reply = (body, status = 200) => {
       const r = new Response(JSON.stringify(body), {status, headers: {'content-type': 'application/json'}});
@@ -116,7 +126,8 @@ export function installDs(receipt, didDoc) {
       return r;
     };
     const url = new URL(request.url);
-    if (url.pathname === '/.well-known/did.json') return reply(JSON.parse(didDoc));
+    if (url.pathname === '/.well-known/did.json')
+      return reply(JSON.parse(url.hostname === 'home-b.catbird.test' ? crossHomeDidDoc : didDoc));
     const nsid = url.pathname.replace('/xrpc/', '');
     const text = request.method === 'POST' ? await request.clone().text() : '';
     const b = text ? JSON.parse(text).signedRequest?.body : undefined;
@@ -176,8 +187,12 @@ export function installDs(receipt, didDoc) {
         return reply({coordinates: entry.signedRequest.body.next, entry, welcomes: []});
       }
       case 'blue.catbird.chat.acceptConversation': {
-        const entry = transition(text);
-        return reply({coordinates: entry.signedRequest.body.next, entry, recovery: openRecovery(b)});
+        const sequencerDid = ds.nextAcceptanceSequencer;
+        ds.nextAcceptanceSequencer = null;
+        const entry = transition(text, sequencerDid);
+        const answerEntry = ds.nextAcceptanceEntry || entry;
+        ds.nextAcceptanceEntry = null;
+        return reply({coordinates: entry.signedRequest.body.next, entry: answerEntry, recovery: openRecovery(b)});
       }
       case 'blue.catbird.chat.acknowledgeWelcome': ds.welcomeAcks.push(b); return reply({});
       case 'blue.catbird.chat.getConversations':
@@ -207,8 +222,25 @@ export function useReceiptKey(generation) { ds.keyGeneration = generation; }
 export function appendEntry(cid, entry) {
   const e = JSON.parse(entry);
   e.seq = ++ds.seq[cid];
+  if (e.signedRequest && !e.sequencerReceipt) {
+    const body = e.signedRequest.body;
+    const control = e.$type !== 'blue.catbird.chat.defs#applicationEntry';
+    const coordinate = body.next || body.successor || body.retired || body.prior;
+    // Deliberately malformed fixtures have no receipt-binding fields.
+    if ((!control && body.messageId) || (control && coordinate)) {
+      e.sequencerReceipt = JSON.parse(receiptFor(JSON.stringify({
+        body, seq: e.seq, entryId: e.entryId, control,
+        keyGeneration: ds.keyGeneration})));
+    }
+  }
   ds.entries[cid].push(e);
   return e.seq;
+}
+// Remove and return one entry to model a delivery service dropping a tail row.
+export function dropEntry(cid, seq) {
+  const e = entryAt(cid, seq);
+  ds.entries[cid] = ds.entries[cid].filter((x) => x.seq !== seq);
+  return JSON.stringify(e);
 }
 // A receipt altered after signing: its signature no longer verifies.
 export function tamperReceipt(cid, seq) { entryAt(cid, seq).sequencerReceipt.issuedAtMs += 1; }
@@ -232,6 +264,8 @@ export function repoReadAuth() { return JSON.stringify(ds.repoReadAuth); }
 export function restoreFetch() { globalThis.fetch = originalFetch; }
 export function loseNextTransition() { ds.loseTransition += 1; }
 export function serveInventory(device, items) { ds.inventory[device] = JSON.parse(items); }
+export function nextAcceptanceSequencer(did) { ds.nextAcceptanceSequencer = did; }
+export function replayNextAcceptance(entry) { ds.nextAcceptanceEntry = JSON.parse(entry); }
 export function serveWelcomes(device, items) { ds.welcomes[device] = JSON.parse(items); }
 export function serveInbox(device, items) { ds.inbox[device] = JSON.parse(items); }
 // The leaf recoveries `getConversationState` lists for `cid`, replacing what it listed.
@@ -254,7 +288,7 @@ export function dsTransitions() { return JSON.stringify(ds.transitions); }
 export function welcomeAcks() { return JSON.stringify(ds.welcomeAcks); }
 "#)]
 extern "C" {
-    fn installDs(receipt: &js_sys::Function, did_doc: &str);
+    fn installDs(receipt: &js_sys::Function, did_doc: &str, cross_home_did_doc: &str);
     fn openConversation(cid: &str);
     fn holdNextSend();
     fn loseNextSendResponse();
@@ -263,6 +297,7 @@ extern "C" {
     fn enforceSendOrder(enforce: bool);
     fn useReceiptKey(generation: u32);
     fn appendEntry(cid: &str, entry: &str) -> u32;
+    fn dropEntry(cid: &str, seq: u32) -> String;
     fn tamperReceipt(cid: &str, seq: u32);
     fn pruneEntry(cid: &str, seq: u32);
     fn replayEntry(cid: &str, seq: u32) -> u32;
@@ -272,6 +307,8 @@ extern "C" {
     fn restoreFetch();
     fn loseNextTransition();
     fn serveInventory(device: &str, items: &str);
+    fn nextAcceptanceSequencer(did: &str);
+    fn replayNextAcceptance(entry: &str);
     fn serveWelcomes(device: &str, items: &str);
     fn serveInbox(device: &str, items: &str);
     fn serveRecoveries(cid: &str, items: &str);
@@ -292,6 +329,7 @@ impl Drop for RestoreFetch {
 }
 
 const SEQUENCER: &str = "did:web:ds.catbird.test";
+const CROSS_HOME_DS: &str = "did:web:home-b.catbird.test";
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 const ALICE_DEVICE: &str = "00000000-0000-4000-8000-00000000a001";
 const BOB_DEVICE: &str = "00000000-0000-4000-8000-00000000b001";
@@ -312,44 +350,73 @@ fn sequencer_key(generation: u64) -> p256::ecdsa::SigningKey {
     p256::ecdsa::SigningKey::from_slice(&[18 + generation as u8; 32]).unwrap()
 }
 
-fn receipt_kid(generation: u64) -> String {
-    format!("{SEQUENCER}#mls-receipt-{generation}")
+fn receipt_kid_for(sequencer_did: &str, generation: u64) -> String {
+    format!("{sequencer_did}#mls-receipt-{generation}")
 }
 
-/// `I13` receipt for a send the fixture sequenced:
-/// `{"body": <wire send body>, "seq": n, "keyGeneration": g}`.
+fn receipt_kid(generation: u64) -> String {
+    receipt_kid_for(SEQUENCER, generation)
+}
+
+/// `I13` receipt for a send or control entry the fixture sequenced.
 fn receipt_for(request: String) -> String {
     let request: Value = serde_json::from_str(&request).unwrap();
+    let sequencer_did = request["sequencerDid"].as_str().unwrap_or(SEQUENCER);
     let body = &request["body"];
     let generation = request["keyGeneration"].as_u64().unwrap();
+    let control = request["control"].as_bool().unwrap_or(false);
+    let coordinate = if control {
+        body.get("next")
+            .or_else(|| body.get("successor"))
+            .or_else(|| body.get("retired"))
+            .or_else(|| body.get("prior"))
+            .unwrap()
+    } else {
+        &body["prior"]
+    };
     let text = |v: &Value| v.as_str().unwrap().to_owned();
+    let (entry_id, archive_commitment) = if control {
+        let kind = body["$type"]
+            .as_str()
+            .and_then(SignedMutationKind::from_type_id)
+            .unwrap();
+        let strict = decode_strict_json(&serde_json::to_vec(body).unwrap()).unwrap();
+        let projected = project_signed_body(kind, &strict).unwrap();
+        let transcript = SigningTranscript::build_for(kind, &projected).unwrap();
+        (text(&request["entryId"]), *transcript.request_digest())
+    } else {
+        (
+            text(&body["messageId"]),
+            chat_wire::json_bytes(&body["aad"]["archiveCommitment"])
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+    };
     let payload = SequencerReceiptPayload {
-        sequencer_did: SEQUENCER.into(),
-        conversation_id: text(&body["prior"]["conversationId"]),
-        group_id: chat_wire::json_bytes(&body["prior"]["groupId"]).unwrap(),
-        epoch: body["prior"]["epoch"].as_u64().unwrap(),
+        sequencer_did: sequencer_did.into(),
+        conversation_id: text(&coordinate["conversationId"]),
+        group_id: chat_wire::json_bytes(&coordinate["groupId"]).unwrap(),
+        epoch: coordinate["epoch"].as_u64().unwrap(),
         sender_device_did_url: format!(
             "{}#{}",
             text(&body["actorDid"]),
             text(&body["actorDeviceId"])
         ),
-        entry_id: text(&body["messageId"]),
-        archive_commitment: chat_wire::json_bytes(&body["aad"]["archiveCommitment"])
-            .unwrap()
-            .try_into()
-            .unwrap(),
+        entry_id,
+        archive_commitment,
         seq: request["seq"].as_u64().unwrap(),
         issued_at_ms: js_sys::Date::now() as i64,
     };
     let signed = sign_sequencer_receipt(
         &sequencer_key(generation),
-        &receipt_kid(generation),
+        &receipt_kid_for(sequencer_did, generation),
         &payload,
     )
     .unwrap();
     json!({
-        "sequencerDid": SEQUENCER, "conversationId": payload.conversation_id,
-        "generation": body["prior"]["generation"], "groupId": STANDARD.encode(&payload.group_id),
+        "sequencerDid": payload.sequencer_did, "conversationId": payload.conversation_id,
+        "generation": coordinate["generation"], "groupId": STANDARD.encode(&payload.group_id),
         "epoch": payload.epoch, "senderDid": body["actorDid"], "senderDeviceId": body["actorDeviceId"],
         "entryId": payload.entry_id, "archiveCommitment": STANDARD.encode(payload.archive_commitment),
         "seq": payload.seq, "issuedAtMs": payload.issued_at_ms, "kid": signed.key_id,
@@ -357,34 +424,54 @@ fn receipt_for(request: String) -> String {
     })
     .to_string()
 }
+/// Rebind a fixture entry's `I13` receipt after a test deliberately re-signs its body.
+fn with_current_receipt(mut entry: Value) -> Value {
+    let control = entry["$type"] != "blue.catbird.chat.defs#applicationEntry";
+    let request = json!({
+        "body": entry["signedRequest"]["body"],
+        "seq": entry["seq"],
+        "entryId": entry["entryId"],
+        "control": control,
+        "keyGeneration": 1,
+    });
+    entry["sequencerReceipt"] = serde_json::from_str(&receipt_for(request.to_string())).unwrap();
+    entry
+}
 
 /// The sequencer DID document retains every receipt method it ever signed with (G3).
 fn install_ds() -> RestoreFetch {
-    let methods: Vec<Value> = (1..=2)
-        .map(|generation| {
-            let point = sequencer_key(generation)
-                .verifying_key()
-                .to_encoded_point(false);
-            json!({
-                "id": receipt_kid(generation), "type": "JsonWebKey2020", "controller": SEQUENCER,
-                "publicKeyJwk": {"kty": "EC", "crv": "P-256",
-                    "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
-                    "y": URL_SAFE_NO_PAD.encode(point.y().unwrap())},
+    let did_doc = |sequencer_did: &str| {
+        let methods: Vec<Value> = (1..=2)
+            .map(|generation| {
+                let point = sequencer_key(generation)
+                    .verifying_key()
+                    .to_encoded_point(false);
+                json!({
+                    "id": receipt_kid_for(sequencer_did, generation),
+                    "type": "JsonWebKey2020", "controller": sequencer_did,
+                    "publicKeyJwk": {"kty": "EC", "crv": "P-256",
+                        "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                        "y": URL_SAFE_NO_PAD.encode(point.y().unwrap())},
+                })
             })
-        })
-        .collect();
-    let did_doc = json!({"id": SEQUENCER, "verificationMethod": methods});
+            .collect();
+        json!({"id": sequencer_did, "verificationMethod": methods})
+    };
     let receipt = Closure::<dyn Fn(String) -> String>::new(receipt_for);
-    installDs(receipt.as_ref().unchecked_ref(), &did_doc.to_string());
+    installDs(
+        receipt.as_ref().unchecked_ref(),
+        &did_doc(SEQUENCER).to_string(),
+        &did_doc(CROSS_HOME_DS).to_string(),
+    );
     receipt.forget();
     RestoreFetch
 }
 
-async fn open(did: &str, device_id: &str) -> WasmMlsClient {
+async fn open_at_home(did: &str, device_id: &str, home_ds_did: &str) -> WasmMlsClient {
     let client = WasmMlsClient::open_async(
         did.into(),
         device_id.into(),
-        SEQUENCER.into(),
+        home_ds_did.into(),
         "https://ds.catbird.test".into(),
         "https://pds.catbird.test".into(),
         "ab".repeat(32),
@@ -393,6 +480,10 @@ async fn open(did: &str, device_id: &str) -> WasmMlsClient {
     .unwrap();
     client.set_auth_token(Some("session".into()));
     client
+}
+
+async fn open(did: &str, device_id: &str) -> WasmMlsClient {
+    open_at_home(did, device_id, SEQUENCER).await
 }
 
 /// The account database a closed client left behind.
@@ -429,11 +520,16 @@ fn capabilities() -> Capabilities {
     )
 }
 
-/// Enroll `did#device_id`, then close its client.
-async fn enroll(did: &str, device_id: &str) {
-    let client = open(did, device_id).await;
+/// Enroll `did#device_id` at `home_ds_did`, then close its client.
+async fn enroll_at_home(did: &str, device_id: &str, home_ds_did: &str) {
+    let client = open_at_home(did, device_id, home_ds_did).await;
     let scopes = serde_wasm_bindgen::to_value(&REQUIRED_LABYRINTH_OAUTH_SCOPES).unwrap();
     client.enroll_device(true, scopes).await.unwrap();
+}
+
+/// Enroll `did#device_id`, then close its client.
+async fn enroll(did: &str, device_id: &str) {
+    enroll_at_home(did, device_id, SEQUENCER).await;
 }
 
 /// Enroll every member, then leave each account database the way `createGroup` and the
@@ -514,6 +610,20 @@ async fn group(members: &[(&str, &str)], cid: &str) -> Vec<WasmMlsClient> {
                 .unwrap();
         }
         for db in &dbs {
+            let mls = db.openmls_provider().unwrap();
+            let stored = MlsGroup::load(mls.storage(), &GroupId::from_slice(&group_id))
+                .unwrap()
+                .unwrap();
+            let (gch, ctag) = chat_wire::compute_group_context_hash_and_tag(&stored, &mls).unwrap();
+            let coordinates = canonical(
+                &json!({
+                    "conversationId": cid, "generation": 0, "stateVersion": 0,
+                    "lifecycle": "active", "groupId": STANDARD.encode(&group_id),
+                    "epoch": 1, "groupContextHash": STANDARD.encode(gch),
+                    "confirmationTag": STANDARD.encode(ctag),
+                }),
+                cid,
+            );
             db.write_tx(|tx| {
                 tx.upsert_conversation(&ConversationRow {
                     conversation_id: cid.into(),
@@ -526,7 +636,12 @@ async fn group(members: &[(&str, &str)], cid: &str) -> Vec<WasmMlsClient> {
                     title: None,
                     unread_count: 0,
                     updated_at_ms: 0,
-                })
+                })?;
+                tx.put_account_meta(
+                    &format!("conversation_coords:{cid}"),
+                    &coordinates.to_string(),
+                    0,
+                )
             })
             .unwrap();
         }
@@ -576,7 +691,7 @@ fn resigned(
     let mut body = entry["signedRequest"]["body"].take();
     edit(&mut body);
     entry["signedRequest"] = signed(operation, body, signer);
-    entry
+    with_current_receipt(entry)
 }
 
 /// `entry` altered after signing: its signature no longer verifies.
@@ -589,6 +704,162 @@ fn altered(entry: &Value) -> Value {
 fn canonical(coordinate: &Value, cid: &str) -> Value {
     chat_wire::canonicalize_wire_coordinate(coordinate, Some(cid)).unwrap()
 }
+const RECEIPT_ABSENCE_KINDS: [&str; 3] = [
+    "blue.catbird.chat.defs#metadataEntry",
+    "blue.catbird.chat.defs#zeroLeafLeaveEntry",
+    "blue.catbird.chat.defs#leaveCommitFulfillmentEntry",
+];
+
+fn receipt_absence_operation(kind: &str) -> CanonicalOperation {
+    match kind {
+        "blue.catbird.chat.defs#metadataEntry"
+        | "blue.catbird.chat.defs#leaveCommitFulfillmentEntry" => {
+            CanonicalOperation::SubmitTransition
+        }
+        "blue.catbird.chat.defs#zeroLeafLeaveEntry" => CanonicalOperation::RequestLeave,
+        _ => unreachable!("receipt-absence fixture kind"),
+    }
+}
+
+fn wire_fixture_value(value: &Value, schema: &Value, defs: &Value) -> Value {
+    match schema["type"].as_str().expect("fixture schema type") {
+        "ref" => {
+            let name = schema["ref"].as_str().unwrap().strip_prefix('#').unwrap();
+            wire_fixture_value(value, &defs[name], defs)
+        }
+        "union" => {
+            let name = value["$type"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("blue.catbird.chat.defs#")
+                .unwrap();
+            assert!(schema["refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reference| reference.as_str() == Some(&format!("#{name}"))));
+            wire_fixture_value(value, &defs[name], defs)
+        }
+        "object" => Value::Object(
+            value
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(name, value)| {
+                    let converted = if name == "$type" {
+                        value.clone()
+                    } else {
+                        wire_fixture_value(value, &schema["properties"][name], defs)
+                    };
+                    (name.clone(), converted)
+                })
+                .collect(),
+        ),
+        "array" => Value::Array(
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| wire_fixture_value(item, &schema["items"], defs))
+                .collect(),
+        ),
+        "bytes" => {
+            let marker = value.as_object().expect("semantic source bytes marker");
+            let raw = if let Some(encoded) = marker.get("$bytesHex") {
+                hex::decode(encoded.as_str().unwrap()).unwrap()
+            } else {
+                uuid::Uuid::parse_str(marker["$uuid"].as_str().unwrap())
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec()
+            };
+            json!(STANDARD.encode(raw))
+        }
+        "string" if value.is_object() => json!(value["$uuid"].as_str().unwrap()),
+        "string" | "integer" | "boolean" => value.clone(),
+        other => panic!("unsupported source schema {other}"),
+    }
+}
+
+fn rewrite_conversation_ids(value: &mut Value, cid: &str) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                rewrite_conversation_ids(value, cid);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key == "conversationId" {
+                    *value = if value.is_object() {
+                        json!({ "$uuid": cid })
+                    } else {
+                        json!(cid)
+                    };
+                } else {
+                    rewrite_conversation_ids(value, cid);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+fn rewrite_fixture_dids(value: &mut Value, actor: &str) {
+    match value {
+        Value::String(did) if did.starts_with("did:") => *did = actor.to_owned(),
+        Value::Array(values) => {
+            for value in values {
+                rewrite_fixture_dids(value, actor);
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values_mut() {
+                rewrite_fixture_dids(value, actor);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn receiptless_corpus_entry(
+    kind: &str,
+    cid: &str,
+    actor: &str,
+    device: &str,
+    signer: &SignatureKeyPair,
+) -> Value {
+    let corpus: Value = serde_json::from_str(include_str!(
+        "fixtures/mls_chat_control_fingerprint_source.json"
+    ))
+    .unwrap();
+    let case = corpus["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["entryKind"] == kind)
+        .unwrap_or_else(|| panic!("no control corpus case for {kind}"));
+    let mut source_body = case["body"].clone();
+    rewrite_conversation_ids(&mut source_body, cid);
+    rewrite_fixture_dids(&mut source_body, actor);
+    source_body["actorDid"] = json!(actor);
+    source_body["actorDeviceId"] = json!(device);
+    let lexicon: Value =
+        serde_json::from_str(include_str!("../src/generated/blue.catbird.chat.defs.json")).unwrap();
+    let body_name = source_body["$type"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("blue.catbird.chat.defs#")
+        .unwrap();
+    let body = wire_fixture_value(&source_body, &lexicon["defs"][body_name], &lexicon["defs"]);
+    json!({
+        "$type": kind,
+        "entryId": case["entryId"],
+        "conversationId": cid,
+        "seq": 2,
+        "receivedAt": case["receivedAt"],
+        "signedRequest": signed(receipt_absence_operation(kind), body, signer),
+    })
+}
 
 /// `account`'s stored coordinates of `cid`, canonical, from its closed database.
 fn stored_coords(account: &str, cid: &str) -> Option<Value> {
@@ -597,6 +868,12 @@ fn stored_coords(account: &str, cid: &str) -> Option<Value> {
         .get_account_meta(&format!("conversation_coords:{cid}"))
         .unwrap()
         .map(|raw| canonical(&serde_json::from_str(&raw).unwrap(), cid))
+}
+fn fork_marker(account: &str, cid: &str) -> Option<String> {
+    account_db(account)
+        .backend()
+        .get_account_meta(&chat_wire::fork_detected_key(cid))
+        .unwrap()
 }
 
 /// The current coordinate of `account`'s MLS group for `cid`, from its closed database, at
@@ -676,6 +953,53 @@ fn timeline_of(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
         .map(|(seq, text)| (*seq, text.to_string()))
         .collect()
 }
+/// The three control kinds that previously had no client-side negative evidence each stop at
+/// their missing I13 receipt before state, cursor, coordinate or acknowledgement changes.
+#[wasm_bindgen_test]
+async fn mandatory_control_kinds_require_receipts() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("kindalice"), did("kindbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0022";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(bob_client);
+    let signer = device_signer(&account_db(&bob));
+    let initial_row = conversation_row(&alice_client, cid);
+    drop(alice_client);
+    let initial_coords = stored_coords(&alice, cid).unwrap();
+    let mut alice_client = open(&alice, ALICE_DEVICE).await;
+
+    for kind in RECEIPT_ABSENCE_KINDS {
+        let entry = receiptless_corpus_entry(kind, cid, &bob, BOB_DEVICE, &signer);
+        setEntry(cid, &entry.to_string());
+        let error = alice_client
+            .sync()
+            .await
+            .expect_err(kind)
+            .as_string()
+            .unwrap_or_default();
+        assert!(
+            error.contains("missing sequencerReceipt"),
+            "{kind} stopped before its I13 gate: {error}"
+        );
+        assert_eq!(
+            conversation_row(&alice_client, cid),
+            initial_row,
+            "{kind} changed conversation state"
+        );
+        assert_eq!(ackedUpTo(cid, ALICE_DEVICE), 0, "{kind} was acknowledged");
+        assert!(
+            timeline(&alice_client, cid).is_empty(),
+            "{kind} wrote a row"
+        );
+        drop(alice_client);
+        assert_eq!(
+            stored_coords(&alice, cid),
+            Some(initial_coords.clone()),
+            "{kind} changed coordinates"
+        );
+        alice_client = open(&alice, ALICE_DEVICE).await;
+    }
+}
 
 /// The counter is reserved with the ratchet advance in one transaction and persists in
 /// `account_meta`, so every signed send carries a strictly larger value, across a reopen too.
@@ -705,12 +1029,253 @@ async fn send_counter_strictly_increases_across_sends_and_reopen() {
     );
 }
 
+/// A delivery service cannot move the cursor over a missing sequence. Peer counters need only
+/// increase within an epoch: reservations may leave holes, but duplicates and rewinds are refused.
+/// Restoring the dropped row proves the contiguous batch still applies.
+///
+/// Fail-before: sync rejected a valid counter jump that the sequencer accepts.
+#[wasm_bindgen_test]
+async fn sync_requires_contiguous_entry_seq_and_increasing_peer_send_counter() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("contiguousalice"), did("contiguousbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0020";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    send(&bob_client, cid, 1, "one").await.unwrap();
+    send(&bob_client, cid, 2, "two").await.unwrap();
+
+    let dropped = dropEntry(cid, 2);
+    let error = alice_client
+        .sync()
+        .await
+        .expect_err("seq 3 cannot cover a missing seq 2")
+        .as_string()
+        .unwrap_or_default();
+    assert!(
+        error.contains("non-contiguous conversation sequence"),
+        "{error}"
+    );
+    assert_eq!(
+        (
+            conversation_row(&alice_client, cid).last_seq,
+            ackedUpTo(cid, ALICE_DEVICE)
+        ),
+        (1, 0)
+    );
+
+    setEntry(cid, &dropped);
+    alice_client.sync().await.expect("the contiguous batch");
+    assert_eq!(
+        (
+            conversation_row(&alice_client, cid).last_seq,
+            ackedUpTo(cid, ALICE_DEVICE)
+        ),
+        (3, 3)
+    );
+
+    drop(bob_client);
+    let bob_db = account_db(&bob);
+    let bob_signer = device_signer(&bob_db);
+    bob_db
+        .write_tx(|tx| tx.put_account_meta(&chat_wire::send_counter_key(cid), "3", 0))
+        .unwrap();
+    drop(bob_db);
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    send(&bob_client, cid, 3, "counter four").await.unwrap();
+    // Counters are monotone reservations, not a gap-free delivery sequence.
+    alice_client
+        .sync()
+        .await
+        .expect("peer sendCounter 2 -> 4 advances");
+    assert_eq!(
+        (
+            conversation_row(&alice_client, cid).last_seq,
+            ackedUpTo(cid, ALICE_DEVICE)
+        ),
+        (4, 4)
+    );
+
+    send(&bob_client, cid, 4, "counter five").await.unwrap();
+    let genuine = entry_at(cid, 5);
+    for (counter, label) in [(4, "distinct duplicate"), (3, "rewind")] {
+        setEntry(
+            cid,
+            &resigned(
+                &genuine,
+                CanonicalOperation::SendMessage,
+                &bob_signer,
+                |body| body["sendCounter"] = json!(counter),
+            )
+            .to_string(),
+        );
+        let error = alice_client
+            .sync()
+            .await
+            .expect_err(&format!("{label} peer counter is refused"))
+            .as_string()
+            .unwrap_or_default();
+        assert!(
+            error.contains("non-increasing peer sendCounter"),
+            "{label}: {error}"
+        );
+        assert_eq!(
+            (
+                conversation_row(&alice_client, cid).last_seq,
+                ackedUpTo(cid, ALICE_DEVICE)
+            ),
+            (4, 4),
+            "{label}"
+        );
+    }
+    setEntry(cid, &genuine.to_string());
+    alice_client
+        .sync()
+        .await
+        .expect("the genuine increasing counter applies");
+    assert_eq!(
+        (
+            conversation_row(&alice_client, cid).last_seq,
+            ackedUpTo(cid, ALICE_DEVICE)
+        ),
+        (5, 5)
+    );
+}
+
+/// A conflicting application prior becomes durable fork evidence only after the actor is a
+/// PDS-authorized current leaf and the application receipt verifies under its own `kid`, binding
+/// this sender, conversation, entry, sequence and archive commitment. An outsider with a valid
+/// PDS device and receipt, and a leaf with a forged receipt, are ordinary invalid entries and
+/// write no marker. A valid leaf+receipt still records the fork. Restoring the genuine row applies.
+#[wasm_bindgen_test]
+async fn same_epoch_coordinate_mismatch_is_a_fork_not_an_aead_gap() {
+    let _restore = install_ds();
+    let (alice, bob, dave) = (did("forkalice"), did("forkbob"), did("forkdave"));
+    let cid = "00000000-0000-4000-8000-0000000c0021";
+    let (mut alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    send(&bob_client, cid, 1, "genuine").await.unwrap();
+    drop(bob_client);
+    enroll(&dave, DAVE_DEVICE).await;
+    let genuine = entry_at(cid, 2);
+    let (bob_signer, dave_signer) = (
+        device_signer(&account_db(&bob)),
+        device_signer(&account_db(&dave)),
+    );
+    let valid_fork = resigned(
+        &genuine,
+        CanonicalOperation::SendMessage,
+        &bob_signer,
+        |body| body["prior"]["groupContextHash"] = json!(STANDARD.encode([91_u8; 32])),
+    );
+    let outsider = resigned(
+        &genuine,
+        CanonicalOperation::SendMessage,
+        &dave_signer,
+        |body| {
+            body["actorDid"] = json!(dave);
+            body["actorDeviceId"] = json!(DAVE_DEVICE);
+            body["prior"]["groupContextHash"] = json!(STANDARD.encode([91_u8; 32]));
+        },
+    );
+    let mut forged_receipt = valid_fork.clone();
+    forged_receipt["sequencerReceipt"]["signature"] = json!(STANDARD.encode([0_u8; 64]));
+
+    let mut invalid_failures = Vec::new();
+    for (case, entry, expected) in [
+        (
+            "a PDS-authorized outsider",
+            outsider,
+            "not an authorized active participant device",
+        ),
+        (
+            "a leaf with a forged receipt",
+            forged_receipt,
+            "I13 sequencerReceipt verify failed",
+        ),
+    ] {
+        setEntry(cid, &entry.to_string());
+        let result = alice_client.sync().await;
+        let failed = result.is_err();
+        let error = result
+            .err()
+            .and_then(|error| error.as_string())
+            .unwrap_or_else(|| "sync unexpectedly succeeded".to_owned());
+        let cursor = (
+            conversation_row(&alice_client, cid).last_seq,
+            ackedUpTo(cid, ALICE_DEVICE),
+        );
+        let timeline_empty = timeline(&alice_client, cid).is_empty();
+        drop(alice_client);
+        let marker = fork_marker(&alice, cid);
+        if !failed
+            || !error.contains(expected)
+            || error.contains("fork detected")
+            || cursor != (1, 0)
+            || !timeline_empty
+            || marker.is_some()
+        {
+            invalid_failures.push(format!(
+                "{case}: error={error}; cursor={cursor:?}; timeline_empty={timeline_empty}; marker={marker:?}"
+            ));
+        }
+        if marker.is_some() {
+            account_db(&alice)
+                .write_tx(|tx| tx.delete_account_meta(&chat_wire::fork_detected_key(cid)))
+                .unwrap();
+        }
+        alice_client = open(&alice, ALICE_DEVICE).await;
+    }
+
+    setEntry(cid, &valid_fork.to_string());
+    let error = alice_client
+        .sync()
+        .await
+        .expect_err("a current leaf with a valid receipt records the fork")
+        .as_string()
+        .unwrap_or_default();
+    assert!(error.contains("fork detected"), "{error}");
+    assert_eq!(
+        (
+            conversation_row(&alice_client, cid).last_seq,
+            ackedUpTo(cid, ALICE_DEVICE)
+        ),
+        (1, 0)
+    );
+    assert!(timeline(&alice_client, cid).is_empty());
+    drop(alice_client);
+    assert!(fork_marker(&alice, cid).is_some(), "fork marker");
+    alice_client = open(&alice, ALICE_DEVICE).await;
+
+    let tag_fork = resigned(
+        &genuine,
+        CanonicalOperation::SendMessage,
+        &bob_signer,
+        |body| body["prior"]["confirmationTag"] = json!(STANDARD.encode([92_u8; 32])),
+    );
+    setEntry(cid, &tag_fork.to_string());
+    let error = alice_client
+        .sync()
+        .await
+        .expect_err("a confirmation-tag divergence is also a fork")
+        .as_string()
+        .unwrap_or_default();
+    assert!(error.contains("fork detected"), "{error}");
+
+    setEntry(cid, &genuine.to_string());
+    alice_client.sync().await.expect("the genuine entry");
+    assert_eq!(timeline(&alice_client, cid), timeline_of(&[(2, "genuine")]));
+    assert_eq!(ackedUpTo(cid, ALICE_DEVICE), 2);
+    assert!(
+        invalid_failures.is_empty(),
+        "{}",
+        invalid_failures.join("\n")
+    );
+}
+
 /// A send held in the network keeps its journal; after a newer send is sequenced, the caller's
 /// retry resubmits those exact bytes, `mls-ds` refuses them (`StaleSend`), and the same message
-/// id goes out once more as a fresh frame with a new counter. The refused bytes are never
-/// sequenced, and a second `StaleSend` is returned rather than retried. Every refusal discards
-/// its journal: fail-before, a later retry after the second refusal resubmitted those refused
-/// bytes and `mls-ds` sequenced them.
+/// id goes out once more as a fresh frame. A reservation alone does not advance the confirmed
+/// counter, while each `StaleSend` proves that its counter is already covered by the sequencer.
+/// The refused bytes are never sequenced, and a second `StaleSend` is returned rather than
+/// retried. Every refusal discards its journal.
 #[wasm_bindgen_test]
 async fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
     let _restore = install_ds();
@@ -728,7 +1293,7 @@ async fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
         held.iter()
             .map(|(counter, outcome, _)| (*counter, outcome.as_str()))
             .collect::<Vec<_>>(),
-        [(1, "held"), (1, "stale"), (3, "accepted")]
+        [(1, "held"), (1, "stale"), (2, "accepted")]
     );
     assert_eq!(
         held[0].2, held[1].2,
@@ -753,7 +1318,7 @@ async fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
             .into_iter()
             .map(|(counter, outcome, _)| (counter, outcome))
             .collect::<Vec<_>>(),
-        [(4, "stale"), (5, "stale")].map(|(c, o)| (c, o.to_owned())),
+        [(3, "stale"), (4, "stale")].map(|(c, o)| (c, o.to_owned())),
         "exactly one fresh re-encryption"
     );
 
@@ -767,7 +1332,7 @@ async fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
             .iter()
             .map(|(counter, outcome, _)| (*counter, outcome.as_str()))
             .collect::<Vec<_>>(),
-        [(4, "stale"), (5, "stale"), (6, "accepted")]
+        [(3, "stale"), (4, "stale"), (5, "accepted")]
     );
     assert!(
         tries[2].2 != tries[0].2 && tries[2].2 != tries[1].2,
@@ -776,9 +1341,9 @@ async fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
     assert_eq!((row.message_id, row.seq), (message_id(4), 4));
 }
 
-/// `mls-ds` sequenced a send whose response was lost. The generation was reserved before
-/// HTTP, so the next send uses the next one (a reused generation would reach Alice as
-/// `SecretReuse`), and Bob recovers his own entry from the send journal.
+/// `mls-ds` sequenced a send whose response was lost. The accepted watermark is unchanged, so
+/// the next message first uses the same candidate counter with a new sender generation.
+/// `StaleSend` proves the lost send was accepted, and the fresh retry advances to the next counter.
 #[wasm_bindgen_test]
 async fn lost_send_response_never_reuses_the_reserved_generation() {
     let _restore = install_ds();
@@ -790,8 +1355,24 @@ async fn lost_send_response_never_reuses_the_reserved_generation() {
         .await
         .unwrap_err();
     send(&bob_client, cid, 2, "after the loss").await.unwrap();
-    assert_eq!(attempts(1)[0].0, 1);
-    assert_eq!(attempts(2)[0].0, 2);
+    let lost = attempts(1);
+    let after_loss = attempts(2);
+    assert_eq!(lost[0].0, 1);
+    assert_eq!(
+        after_loss
+            .iter()
+            .map(|(counter, outcome, _)| (*counter, outcome.as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "stale"), (2, "accepted")]
+    );
+    assert_ne!(
+        lost[0].2, after_loss[0].2,
+        "the next reservation uses a fresh sender generation"
+    );
+    assert_ne!(
+        after_loss[0].2, after_loss[1].2,
+        "the stale candidate is freshly encrypted at the confirmed counter"
+    );
     alice_client.sync().await.unwrap();
     let expected = timeline_of(&[(2, "response lost"), (3, "after the loss")]);
     assert_eq!(timeline(&alice_client, cid), expected);
@@ -826,6 +1407,16 @@ async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_appl
             .unwrap();
     }
     deliverHeld();
+    drop(bob_client);
+    let bob_signer = device_signer(&account_db(&bob));
+    let late = resigned(
+        &entry_at(cid, 12),
+        CanonicalOperation::SendMessage,
+        &bob_signer,
+        |body| body["sendCounter"] = json!(11),
+    );
+    setEntry(cid, &late.to_string());
+    let bob_client = open(&bob, BOB_DEVICE).await;
     bob_client
         .remove_group_member(true, cid.into(), carol.clone())
         .await
@@ -979,6 +1570,15 @@ async fn an_undecryptable_entry_with_a_forged_receipt_is_never_tombstoned() {
             .unwrap();
     }
     deliverHeld();
+    drop(bob_client);
+    let bob_signer = device_signer(&account_db(&bob));
+    let late = resigned(
+        &entry_at(cid, 12),
+        CanonicalOperation::SendMessage,
+        &bob_signer,
+        |body| body["sendCounter"] = json!(11),
+    );
+    setEntry(cid, &late.to_string());
     tamperReceipt(cid, 12);
     let error = alice_client
         .sync()
@@ -992,17 +1592,40 @@ async fn an_undecryptable_entry_with_a_forged_receipt_is_never_tombstoned() {
     assert_eq!(conversation_row(&alice_client, cid).last_seq, 11);
 }
 
-/// A pruned entry keeps only its signed receipt, which must sequence exactly that entry before
-/// the cursor passes it. Fail-before: any `payloadPruned` entry moved the cursor unverified.
+/// A full application entry with its receipt removed is refused without state, cursor,
+/// coordinate or acknowledgement change. A pruned entry keeps only its signed receipt, which
+/// must sequence exactly that entry before the cursor passes it.
 #[wasm_bindgen_test]
 async fn a_pruned_entry_moves_the_cursor_only_under_its_verified_receipt() {
     let _restore = install_ds();
     let (alice, bob) = (did("prunealice"), did("prunebob"));
     let cid = "00000000-0000-4000-8000-0000000c0007";
     let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(alice_client);
+    let initial_coords = stored_coords(&alice, cid);
+    let mut alice_client = open(&alice, ALICE_DEVICE).await;
     send(&bob_client, cid, 1, "pruned before delivery")
         .await
         .unwrap();
+    let genuine = entry_at(cid, 2);
+    let mut receiptless = genuine.clone();
+    receiptless
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
+    setEntry(cid, &receiptless.to_string());
+    alice_client
+        .sync()
+        .await
+        .expect_err("a full application entry without its receipt");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 1);
+    assert_eq!(ackedUpTo(cid, ALICE_DEVICE), 0);
+    assert!(timeline(&alice_client, cid).is_empty());
+    drop(alice_client);
+    assert_eq!(stored_coords(&alice, cid), initial_coords);
+    alice_client = open(&alice, ALICE_DEVICE).await;
+
+    setEntry(cid, &genuine.to_string());
     pruneEntry(cid, 2);
     alice_client
         .sync()
@@ -1264,14 +1887,13 @@ async fn an_unclassifiable_entry_stops_sync_below_it() {
     }
 }
 
-/// A peer Commit applies only from its verified signed body: the body verifies under its
-/// actor's current leaf, the MLS Commit in it is that very leaf's, and once merged its signed
-/// `next` names the local MLS state one `stateVersion` on. Bob removes Carol; Alice is served
-/// that entry altered after signing, Bob's Commit in a body Carol (another leaf) signed, and
-/// Bob's body re-signed with a `next` two state versions on: each fails her sync with nothing
-/// merged, her cursor at 1 and no coordinates. The genuine entry then merges and writes its
-/// signed `next`. Fail-before: sync processed whatever Commit an entry carried and wrote its
-/// unverified `next`.
+/// A peer Commit applies only from its verified signed body and `I13` receipt: the receipt is
+/// present, signed, bound to this entry's seq and request digest; the body verifies under its
+/// actor's current leaf; the MLS Commit is that very leaf's; and its signed `next` names the
+/// merged local state one `stateVersion` on. Missing, forged and wrong-seq receipts, a body
+/// altered after signing, another leaf's signature and a skipped state version all leave Alice
+/// at seq 1. The genuine entry then merges. Fail-before: control entries needed no receipt and
+/// sync processed whatever Commit an entry carried.
 #[wasm_bindgen_test]
 async fn a_peer_commit_applies_only_from_its_verified_body() {
     let _restore = install_ds();
@@ -1291,6 +1913,48 @@ async fn a_peer_commit_applies_only_from_its_verified_body() {
         .unwrap();
     drop(bob_client);
     let genuine = entry_at(cid, 2);
+    let mut missing_receipt = genuine.clone();
+    missing_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
+    let mut forged_receipt = genuine.clone();
+    forged_receipt["sequencerReceipt"]["signature"] = json!(STANDARD.encode([0_u8; 64]));
+    let mut wrong_seq_receipt = genuine.clone();
+    wrong_seq_receipt["sequencerReceipt"] = serde_json::from_str(&receipt_for(
+        json!({
+            "body": genuine["signedRequest"]["body"],
+            "seq": 3,
+            "entryId": genuine["entryId"],
+            "control": true,
+            "keyGeneration": 1,
+        })
+        .to_string(),
+    ))
+    .unwrap();
+    for (case, entry) in [
+        ("missing I13 receipt", missing_receipt),
+        ("forged I13 receipt", forged_receipt),
+        ("I13 receipt bound to another seq", wrong_seq_receipt),
+    ] {
+        setEntry(cid, &entry.to_string());
+        let error = alice_client
+            .sync()
+            .await
+            .expect_err(case)
+            .as_string()
+            .unwrap_or_default();
+        assert!(error.contains("I13"), "{case}: {error}");
+        assert_eq!(
+            (
+                conversation_row(&alice_client, cid).epoch,
+                conversation_row(&alice_client, cid).last_seq
+            ),
+            (1, 1),
+            "{case}"
+        );
+        assert_eq!(ackedUpTo(cid, ALICE_DEVICE), 0, "{case}");
+    }
     let (bob_signer, carol_signer) = (
         device_signer(&account_db(&bob)),
         device_signer(&account_db(&carol)),
@@ -1333,15 +1997,18 @@ async fn a_peer_commit_applies_only_from_its_verified_body() {
 
 /// A policy entry applies only under a current leaf, one `stateVersion` on. Alice invites
 /// Dave; Bob is served her policy altered after signing, signed by Dave (no leaf), and re-signed
-/// with a `next` two versions on: each fails his sync with his cursor at 1 and no coordinates.
-/// The genuine policy then writes its signed `next`. Fail-before: any policy entry moved the
-/// cursor and none wrote its coordinates.
+/// with a `next` two versions on: each fails his sync with his cursor at 1 and his initial
+/// coordinates unchanged. The genuine policy then writes its signed `next`. Fail-before: any
+/// policy entry moved the cursor and none wrote its coordinates.
 #[wasm_bindgen_test]
 async fn a_policy_entry_applies_only_under_a_current_leaf() {
     let _restore = install_ds();
     let (alice, bob, dave) = (did("policyalice"), did("policybob"), did("policydave"));
     let cid = "00000000-0000-4000-8000-0000000c0010";
     let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(bob_client);
+    let initial = stored_coords(&bob, cid);
+    let bob_client = open(&bob, BOB_DEVICE).await;
     enroll(&dave, DAVE_DEVICE).await;
     alice_client
         .add_group_members(cid.into(), serde_wasm_bindgen::to_value(&[&dave]).unwrap())
@@ -1379,7 +2046,7 @@ async fn a_policy_entry_applies_only_under_a_current_leaf() {
         assert_eq!(conversation_row(&bob_client, cid).last_seq, 1, "{case}");
     }
     drop(bob_client);
-    assert_eq!(stored_coords(&bob, cid), None);
+    assert_eq!(stored_coords(&bob, cid), initial);
     setEntry(cid, &genuine.to_string());
     let bob_client = open(&bob, BOB_DEVICE).await;
     bob_client.sync().await.unwrap();
@@ -1391,11 +2058,12 @@ async fn a_policy_entry_applies_only_under_a_current_leaf() {
     );
 }
 
-/// `inviter` invites `invitee` to `cid`, standing at seq 1 (the policy entry at seq 2), and
-/// `invitee`'s client on `device` accepts from its inventory (the participant acceptance at
-/// seq 3), whereupon mls-ds lists the acceptance's add recovery.
+/// `inviter` invites a cross-home `invitee` to `cid`, standing at seq 1 (the policy entry at
+/// seq 2), and `invitee`'s client on `device` accepts from its inventory (the participant
+/// acceptance at seq 3), whereupon mls-ds lists the acceptance's add recovery.
 async fn accept_invitation(inviter: &WasmMlsClient, invitee: &str, device: &str, cid: &str) {
-    enroll(invitee, device).await;
+    assert_ne!(CROSS_HOME_DS, SEQUENCER);
+    enroll_at_home(invitee, device, CROSS_HOME_DS).await;
     inviter
         .add_group_members(
             cid.into(),
@@ -1410,15 +2078,22 @@ async fn accept_invitation(inviter: &WasmMlsClient, invitee: &str, device: &str,
         "invitationProvenance": body["participantChanges"][0]["invitationProvenance"],
     });
     let state = json!({
-        "conversationKind": "group", "coordinates": body["next"], "participants": [pending],
+        "conversationKind": "group", "sequencerDid": SEQUENCER,
+        "coordinates": body["next"], "participants": [pending],
     });
     serveInventory(device, &json!([{ "state": state }]).to_string());
-    open(invitee, device).await.sync().await.unwrap();
+    open_at_home(invitee, device, CROSS_HOME_DS)
+        .await
+        .sync()
+        .await
+        .unwrap();
     serveInventory(device, "[]");
+    let acceptance = entry_at(cid, 3);
     assert_eq!(
-        entry_at(cid, 3)["$type"],
+        acceptance["$type"],
         "blue.catbird.chat.defs#participantAcceptanceEntry"
     );
+    assert_eq!(acceptance["sequencerReceipt"]["sequencerDid"], SEQUENCER);
 }
 
 /// Alice and Bob's conversation, in which Alice invites Dave and Dave accepts
@@ -1431,12 +2106,14 @@ async fn invitation_accepted(alice: &str, bob: &str, dave: &str, cid: &str) -> W
 
 /// A participant acceptance applies only under its actor's PDS-authorized device, one
 /// `stateVersion` on, and only when the invitation its signed provenance names verifies under
-/// its inviter's device and invites exactly that actor with exactly that provenance (found by
-/// paging history once it lies before this pass). Bob is served Dave's acceptance altered after
-/// signing, re-signed by Erin (never invited), re-signed naming Bob as the inviter, and
-/// re-signed two versions on: each fails his sync with his cursor and coordinates at Alice's
-/// policy. The genuine acceptance then writes its signed `next`. Fail-before: any participant
-/// acceptance moved the cursor and the coordinates unverified.
+/// its inviter's device, its historical `I13` receipt and sequence, and names exactly that actor
+/// and provenance. Bob's cursor already stands after Alice's policy, so missing, forged and
+/// closure-crossing relabelled policy receipts are exercised only through the historical lookup.
+/// Those, plus altered or wrongly attributed acceptances, fail with cursor, coordinates and
+/// roster unchanged. The genuine pending invitation then succeeds.
+///
+/// Fail-before: the historical lookup ignored its invitation receipt, and an otherwise invalid
+/// participant acceptance could move the cursor and coordinates.
 #[wasm_bindgen_test]
 async fn a_participant_acceptance_applies_only_under_its_verified_invitation() {
     let _restore = install_ds();
@@ -1448,8 +2125,104 @@ async fn a_participant_acceptance_applies_only_under_its_verified_invitation() {
     );
     let cid = "00000000-0000-4000-8000-0000000c0011";
     let bob_client = invitation_accepted(&alice, &bob, &dave, cid).await;
+    drop(bob_client);
+    let policy = entry_at(cid, 2);
+    let policy_next = canonical(&policy["signedRequest"]["body"]["next"], cid);
+    account_db(&bob)
+        .write_tx(|tx| {
+            let mut row = tx.get_conversation(cid)?.unwrap();
+            row.last_seq = 2;
+            tx.upsert_conversation(&row)?;
+            tx.put_account_meta(
+                &format!("conversation_coords:{cid}"),
+                &policy_next.to_string(),
+                0,
+            )
+        })
+        .unwrap();
     enroll(&erin, ERIN_DEVICE).await;
     let genuine = entry_at(cid, 3);
+    let local_state = || {
+        let db = account_db(&bob);
+        let backend = db.backend();
+        (
+            backend.get_conversation(cid).unwrap().unwrap().last_seq,
+            backend
+                .get_account_meta(&format!("conversation_coords:{cid}"))
+                .unwrap(),
+            backend
+                .get_account_meta(&chat_wire::conversation_roster_key(cid))
+                .unwrap(),
+            backend
+                .get_account_meta(&chat_wire::leaf_recovery_authorization_key(cid))
+                .unwrap(),
+        )
+    };
+    let mut historical_missing = policy.clone();
+    historical_missing
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
+    let mut historical_forged = policy.clone();
+    historical_forged["sequencerReceipt"]["signature"] = json!(STANDARD.encode([9u8; 64]));
+    let mut relabelled_after_closure = policy.clone();
+    relabelled_after_closure["sequencerReceipt"] = serde_json::from_str(&receipt_for(
+        json!({
+            "body": policy["signedRequest"]["body"],
+            "seq": 1,
+            "entryId": policy["entryId"],
+            "control": true,
+            "keyGeneration": 1,
+        })
+        .to_string(),
+    ))
+    .unwrap();
+    for (case, invitation, closed) in [
+        (
+            "missing historical invitation receipt",
+            historical_missing,
+            false,
+        ),
+        (
+            "forged historical invitation receipt",
+            historical_forged,
+            false,
+        ),
+        (
+            "invitation relabelled after closure",
+            relabelled_after_closure,
+            true,
+        ),
+    ] {
+        setEntry(cid, &invitation.to_string());
+        if closed {
+            account_db(&bob)
+                .write_tx(|tx| {
+                    tx.put_account_meta(&chat_wire::invitation_closed_key(cid, &dave), "1", 0)
+                })
+                .unwrap();
+        }
+        let before = local_state();
+        let bob_client = open(&bob, BOB_DEVICE).await;
+        let error = bob_client
+            .sync()
+            .await
+            .expect_err(case)
+            .as_string()
+            .unwrap_or_default();
+        drop(bob_client);
+        assert!(error.contains("I13"), "{case}: {error}");
+        assert_eq!(local_state(), before, "{case}");
+        setEntry(cid, &policy.to_string());
+        account_db(&bob)
+            .write_tx(|tx| tx.delete_account_meta(&chat_wire::invitation_closed_key(cid, &dave)))
+            .unwrap();
+    }
+    let mut missing_receipt = genuine.clone();
+    missing_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
     let (dave_signer, erin_signer) = (
         device_signer(&account_db(&dave)),
         device_signer(&account_db(&erin)),
@@ -1466,7 +2239,9 @@ async fn a_participant_acceptance_applies_only_under_its_verified_invitation() {
     let skipping = resigned(&genuine, accept, &dave_signer, |body| {
         body["next"]["stateVersion"] = json!(3);
     });
+    let bob_client = open(&bob, BOB_DEVICE).await;
     for (case, entry) in [
+        ("missing I13 receipt", missing_receipt),
         ("altered after signing", altered(&genuine)),
         ("an actor nobody invited", uninvited),
         ("another inviter's provenance", misattributed),
@@ -1477,8 +2252,7 @@ async fn a_participant_acceptance_applies_only_under_its_verified_invitation() {
         assert_eq!(conversation_row(&bob_client, cid).last_seq, 2, "{case}");
     }
     drop(bob_client);
-    let policy_next = &entry_at(cid, 2)["signedRequest"]["body"]["next"];
-    assert_eq!(stored_coords(&bob, cid), Some(canonical(policy_next, cid)));
+    assert_eq!(stored_coords(&bob, cid), Some(policy_next));
     setEntry(cid, &genuine.to_string());
     // mls-ds lists no recovery for Dave here: the acceptance alone applies.
     serveRecoveries(cid, "[]");
@@ -1503,11 +2277,17 @@ async fn a_later_joiner_takes_an_acceptance_whose_invitation_predates_its_histor
     let (alice, bob, dave) = (did("joineralice"), did("joinerbob"), did("joinerdave"));
     let cid = "00000000-0000-4000-8000-0000000c0012";
     drop(invitation_accepted(&alice, &bob, &dave, cid).await);
+    let policy = canonical(&entry_at(cid, 2)["signedRequest"]["body"]["next"], cid);
     account_db(&bob)
         .write_tx(|tx| {
             let mut row = tx.get_conversation(cid)?.unwrap();
             row.last_seq = 2;
-            tx.upsert_conversation(&row)
+            tx.upsert_conversation(&row)?;
+            tx.put_account_meta(
+                &format!("conversation_coords:{cid}"),
+                &policy.to_string(),
+                0,
+            )
         })
         .unwrap();
     readableFrom(BOB_DEVICE, 3);
@@ -1548,14 +2328,18 @@ async fn a_later_joiner_takes_an_acceptance_whose_invitation_predates_its_histor
 /// A metadata entry applies only under a current leaf, one `stateVersion` on, and its snapshot
 /// only from the verified body. Bob renames the conversation; Alice is served his entry altered
 /// after signing, signed by Dave (no leaf), and re-signed two versions on: each fails her sync
-/// with no title, snapshot or coordinates and her cursor at 1. The genuine entry then applies.
-/// Fail-before: any metadata entry applied its snapshot and coordinates unverified.
+/// with no title or snapshot, her initial coordinates unchanged and her cursor at 1. The genuine
+/// entry then applies. Fail-before: any metadata entry applied its snapshot and coordinates
+/// unverified.
 #[wasm_bindgen_test]
 async fn forged_metadata_never_changes_the_snapshot_or_coordinates() {
     let _restore = install_ds();
     let (alice, bob, dave) = (did("metaalice"), did("metabob"), did("metadave"));
     let cid = "00000000-0000-4000-8000-0000000c0013";
     let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(alice_client);
+    let initial = stored_coords(&alice, cid);
+    let alice_client = open(&alice, ALICE_DEVICE).await;
     enroll(&dave, DAVE_DEVICE).await;
     bob_client
         .update_group_metadata(cid.into(), "renamed".into(), String::new())
@@ -1600,7 +2384,10 @@ async fn forged_metadata_never_changes_the_snapshot_or_coordinates() {
             .get_account_meta(&format!("metadata_snapshot_json:{cid}"))
             .unwrap()
     };
-    assert_eq!((stored_coords(&alice, cid), snapshot(&alice)), (None, None));
+    assert_eq!(
+        (stored_coords(&alice, cid), snapshot(&alice)),
+        (initial, None)
+    );
     setEntry(cid, &genuine.to_string());
     let alice_client = open(&alice, ALICE_DEVICE).await;
     alice_client.sync().await.unwrap();
@@ -1645,12 +2432,12 @@ async fn a_verified_close_is_applied_as_the_terminal_close() {
             "conversationKind": "group", "prior": prior, "retired": retired,
             "signedAt": chat_wire::now_rfc3339_millis(),
         });
-        let entry = json!({
+        let entry = with_current_receipt(json!({
             "$type": "blue.catbird.chat.defs#conversationCloseEntry", "seq": 2,
             "entryId": transition, "conversationId": cid,
             "receivedAt": "2026-11-07T00:00:00.000Z",
             "signedRequest": signed(CanonicalOperation::CloseConversation, body, &bob_signer),
-        });
+        }));
         (entry, retired)
     };
     let (skipping, _) = close(2);
@@ -1706,6 +2493,9 @@ async fn an_unmerged_own_commit_echo_applies_only_its_journal() {
     let (alice, bob) = (did("journalalice"), did("journalbob"));
     let cid = "00000000-0000-4000-8000-0000000c0015";
     let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(alice_client);
+    let initial = stored_coords(&alice, cid);
+    let alice_client = open(&alice, ALICE_DEVICE).await;
     drop(bob_client);
     loseNextTransition();
     alice_client
@@ -1734,7 +2524,7 @@ async fn an_unmerged_own_commit_echo_applies_only_its_journal() {
     let row = conversation_row(&alice_client, cid);
     assert_eq!((row.epoch, row.last_seq), (1, 1));
     drop(alice_client);
-    assert_eq!(stored_coords(&alice, cid), None);
+    assert_eq!(stored_coords(&alice, cid), initial);
 
     account_db(&alice)
         .write_tx(|tx| tx.put_account_meta(&key, &journal, 0))
@@ -1840,6 +2630,38 @@ async fn a_generic_welcome_joins_only_as_its_verified_fulfillment() {
     carol_client.sync().await.unwrap();
     assert!(joined(&carol_client).is_empty(), "no fulfillment at seq 1");
     assert_eq!(welcomeAcks(), "[]");
+    let genuine = fulfillment.clone();
+    for fault in ["absent", "forged", "relabelled"] {
+        let mut bad = genuine.clone();
+        let transition_seq = match fault {
+            "absent" => {
+                bad["sequencerReceipt"] = Value::Null;
+                4
+            }
+            "forged" => {
+                bad["sequencerReceipt"]["signature"] = json!(STANDARD.encode([0_u8; 64]));
+                4
+            }
+            "relabelled" => {
+                bad["seq"] = json!(5);
+                5
+            }
+            _ => unreachable!(),
+        };
+        setEntry(cid, &bad.to_string());
+        serveWelcomes(CAROL_DEVICE, &view(transition_seq));
+        assert_eq!(
+            carol_client.sync().await.unwrap(),
+            0,
+            "{fault}: unverified Welcome reported as joined"
+        );
+        assert!(joined(&carol_client).is_empty(), "{fault}: installed group");
+        assert_eq!(welcomeAcks(), "[]", "{fault}: acknowledged Welcome");
+        if transition_seq == 5 {
+            dropEntry(cid, 5);
+        }
+        setEntry(cid, &genuine.to_string());
+    }
 
     serveWelcomes(CAROL_DEVICE, &view(4));
     carol_client.sync().await.unwrap();
@@ -1994,12 +2816,12 @@ async fn reset_activation_retires_the_old_leaf_from_exactly_its_current_state() 
             },
             "signedAt": "2026-11-07T00:00:00.000Z",
         });
-        json!({
+        with_current_receipt(json!({
             "$type": "blue.catbird.chat.defs#resetActivationEntry", "seq": 3,
             "entryId": transition, "conversationId": cid,
             "receivedAt": "2026-11-07T00:00:00.000Z",
             "signedRequest": signed(CanonicalOperation::ActivateReset, body, &alice_signer),
-        })
+        }))
     };
     // Bob's verified roster, as a creation, verified reset or roster attestation records it.
     let record_roster = |alice_role: &str| {
@@ -2271,4 +3093,130 @@ async fn leaf_recovery_fulfills_only_a_verified_pending_acceptance() {
         .await
         .expect("a consumed request is no work");
     assert_eq!(local(&alice_client), (before.0 + 1, before.1 + 1, 4));
+}
+
+fn serve_own_pending_inventory(account: &str, device: &str, cid: &str, inventory_sequencer: &str) {
+    let coordinates = stored_coords(account, cid).unwrap();
+    let state = json!({
+        "conversationKind": "group",
+        "sequencerDid": inventory_sequencer,
+        "coordinates": coordinates,
+        "participants": [{
+            "userDid": account,
+            "status": "pending",
+            "invitationProvenance": {
+                "invitationTransitionId": message_id(0xacc),
+                "invitedByDid": account,
+                "invitedByDeviceId": device,
+            },
+        }],
+    });
+    serveInventory(device, &json!([{ "state": state }]).to_string());
+}
+
+fn web_own_acceptance_state(account: &str, cid: &str) -> (i64, Value, Option<String>, String) {
+    let db = account_db(account);
+    let backend = db.backend();
+    let row = backend.get_conversation(cid).unwrap().unwrap();
+    let coordinates = backend
+        .get_account_meta(&format!("conversation_coords:{cid}"))
+        .unwrap()
+        .map(|raw| canonical(&serde_json::from_str(&raw).unwrap(), cid))
+        .unwrap();
+    (
+        row.last_seq,
+        coordinates,
+        backend
+            .get_account_meta(&chat_wire::own_leaf_recovery_key(cid))
+            .unwrap(),
+        row.sequencer_did,
+    )
+}
+
+/// Unsigned inventory cannot replace a retained sequencer pin for this device's own acceptance.
+/// Another sequencer's genuine receipt changes nothing; the pinned sequencer's receipt succeeds.
+///
+/// Fail-before: the inventory `sequencerDid` selected the receipt authority and its recovery was
+/// persisted.
+#[wasm_bindgen_test]
+async fn own_acceptance_prefers_the_existing_sequencer_pin() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("pinalice"), did("pinbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0020";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(alice_client);
+    drop(bob_client);
+    serve_own_pending_inventory(&bob, BOB_DEVICE, cid, CROSS_HOME_DS);
+    nextAcceptanceSequencer(CROSS_HOME_DS);
+    let before = web_own_acceptance_state(&bob, cid);
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    bob_client
+        .sync()
+        .await
+        .expect_err("another sequencer's otherwise genuine receipt");
+    drop(bob_client);
+    assert_eq!(web_own_acceptance_state(&bob, cid), before);
+    assert_eq!(before.3, SEQUENCER);
+
+    let (alice, bob) = (did("pingoodalice"), did("pingoodbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0021";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(alice_client);
+    drop(bob_client);
+    serve_own_pending_inventory(&bob, BOB_DEVICE, cid, CROSS_HOME_DS);
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    bob_client
+        .sync()
+        .await
+        .expect("the pinned sequencer's genuine receipt");
+    drop(bob_client);
+    let state = web_own_acceptance_state(&bob, cid);
+    assert!(state.2.is_some());
+    assert_eq!(state.3, SEQUENCER);
+}
+
+/// An older genuinely signed and receipted acceptance cannot authorize the fresh recovery view
+/// returned for a new request. Refusal preserves recovery metadata; an exact answer succeeds.
+///
+/// Fail-before: the old entry and fresh view were checked independently and the view was kept.
+#[wasm_bindgen_test]
+async fn own_acceptance_receipt_is_bound_to_the_submitted_request() {
+    let _restore = install_ds();
+    let (alice, bob) = (did("boundalice"), did("boundbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0022";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(alice_client);
+    drop(bob_client);
+    serve_own_pending_inventory(&bob, BOB_DEVICE, cid, SEQUENCER);
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    bob_client.sync().await.expect("first exact acceptance");
+    drop(bob_client);
+    let older = entry_at(cid, 2);
+    serve_own_pending_inventory(&bob, BOB_DEVICE, cid, SEQUENCER);
+    replayNextAcceptance(&older.to_string());
+    let before = web_own_acceptance_state(&bob, cid).2;
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    let error = bob_client
+        .sync()
+        .await
+        .expect_err("an older acceptance cannot authorize the fresh recovery")
+        .as_string()
+        .unwrap_or_default();
+    drop(bob_client);
+    assert!(error.contains("signed request"), "{error}");
+    assert_eq!(web_own_acceptance_state(&bob, cid).2, before);
+
+    let (alice, bob) = (did("boundgoodalice"), did("boundgoodbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0023";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    drop(alice_client);
+    drop(bob_client);
+    serve_own_pending_inventory(&bob, BOB_DEVICE, cid, SEQUENCER);
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    bob_client
+        .sync()
+        .await
+        .expect("the exact acceptance answer");
+    drop(bob_client);
+    assert!(web_own_acceptance_state(&bob, cid).2.is_some());
 }

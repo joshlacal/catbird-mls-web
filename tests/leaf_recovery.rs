@@ -15,6 +15,9 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use catbird_mls::chat_v2::transcript::{
+    decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+};
 use catbird_mls::client::{chat_wire, REQUIRED_LABYRINTH_OAUTH_SCOPES};
 use catbird_mls::messaging::receive::PrivateMessagePlaintextEnvelope;
 use catbird_mls::metadata::derive_metadata_key_from_group;
@@ -70,8 +73,11 @@ function openRecovery(cid, b, bound, kind, signedRequest) {
 function sequence(cid, signedRequest) {
   const b = signedRequest.body;
   const kind = b.$type.split('#')[1].replace(/(Transition)?Body$/, 'Entry');
+  const seq = ++ds.seq[cid];
   const entry = {$type: `blue.catbird.chat.defs#${kind}`, entryId: b.transitionId, conversationId: cid,
-    seq: ++ds.seq[cid], signedRequest, receivedAt: b.signedAt};
+    seq, signedRequest, receivedAt: b.signedAt,
+    sequencerReceipt: JSON.parse(receiptFor(JSON.stringify({
+      body: b, seq, entryId: b.transitionId, control: true})))};
   ds.entries[cid].push(entry);
   const c = ds.convos[cid];
   if (kind === 'resetActivationEntry') {
@@ -131,11 +137,18 @@ function handlePost(nsid, text) {
       return [200, {acceptedCount: b.keyPackages.length}];
     case 'blue.catbird.chat.createConversation': {
       const id = b.conversationId;
+      ds.createCalls.push(text);
+      const completed = ds.creates[id];
+      if (completed)
+        return completed.text === text ? [200, structuredClone(completed.response)]
+          : [400, {error: 'IdempotencyConflict', message: 'creation bytes changed'}];
       ds.convos[id] = {coordinates: b.next, participants: structuredClone(b.manifest.participants),
         leaves: [b.manifest.actorLeaf]};
       ds.seq[id] = 0;
       ds.entries[id] = [];
-      return [200, {result: {entry: sequence(id, signedRequest), coordinates: b.next}}];
+      const response = {result: {entry: sequence(id, signedRequest), coordinates: b.next}};
+      ds.creates[id] = {text, response: structuredClone(response)};
+      return [200, response];
     }
     case 'blue.catbird.chat.submitTransition':
       if (stale()) return refused('StaleCoordinates');
@@ -207,7 +220,8 @@ export function installDs(receipt, didDoc) {
   originalFetch = globalThis.fetch;
   receiptFor = receipt;
   ds = {records: {}, devices: {}, kps: {}, seq: {}, entries: {}, convos: {}, recoveries: {}, welcomes: {},
-    inbox: {}, until: {}, reads: {}, acked: {}, welcomeAcks: [], transitions: [], requests: []};
+    inbox: {}, until: {}, reads: {}, acked: {}, welcomeAcks: [], transitions: [], requests: [],
+    creates: {}, createCalls: [], loseCreate: 0};
   globalThis.fetch = async (request) => {
     const url = new URL(request.url);
     const nsid = url.pathname.replace('/xrpc/', '');
@@ -215,12 +229,19 @@ export function installDs(receipt, didDoc) {
       : nsid === 'com.atproto.server.getServiceAuth' ? [200, {token: 'service-auth'}]
       : request.method === 'POST' ? handlePost(nsid, await request.clone().text())
       : handleGet(nsid, url.searchParams);
+    if (nsid === 'blue.catbird.chat.createConversation' && status === 200 && ds.loseCreate > 0) {
+      ds.loseCreate--;
+      throw new TypeError('createConversation response lost');
+    }
     const r = new Response(JSON.stringify(body), {status, headers: {'content-type': 'application/json'}});
     Object.defineProperty(r, 'url', {value: request.url});
     return r;
   };
 }
 export function restoreFetch() { globalThis.fetch = originalFetch; }
+export function loseNextCreateResponse() { ds.loseCreate++; }
+export function createCallsJson() { return JSON.stringify(ds.createCalls); }
+export function conversationCount() { return Object.keys(ds.convos).length; }
 // The fixture's `[status, body]` answer to a POST of `text` to `nsid`.
 export function post(nsid, text) { return JSON.stringify(handlePost(nsid, text)); }
 // A conversation built outside any client: mls-ds holds `state` and no entry yet.
@@ -235,6 +256,8 @@ export function sequenceEntry(cid, signedRequest) { return sequence(cid, JSON.pa
 export function appendEntry(cid, entry) {
   const e = JSON.parse(entry);
   e.seq = ++ds.seq[cid];
+  e.sequencerReceipt = JSON.parse(receiptFor(JSON.stringify({
+    body: e.signedRequest.body, seq: e.seq, entryId: e.entryId, control: true})));
   ds.entries[cid].push(e);
   return e.seq;
 }
@@ -266,6 +289,9 @@ extern "C" {
     fn installDs(receipt: &js_sys::Function, did_doc: &str);
     fn restoreFetch();
     fn post(nsid: &str, text: &str) -> String;
+    fn loseNextCreateResponse();
+    fn createCallsJson() -> String;
+    fn conversationCount() -> u32;
     fn openConversation(cid: &str, state: &str);
     fn sequenceEntry(cid: &str, signed_request: &str) -> u32;
     fn appendEntry(cid: &str, entry: &str) -> u32;
@@ -318,33 +344,61 @@ fn sequencer_key() -> p256::ecdsa::SigningKey {
     p256::ecdsa::SigningKey::from_slice(&[19; 32]).unwrap()
 }
 
-/// `I13` receipt for a send the fixture sequenced: `{"body": <wire send body>, "seq": n}`.
+/// `I13` receipt for an application or control entry the fixture sequenced.
 fn receipt_for(request: String) -> String {
     let request: Value = serde_json::from_str(&request).unwrap();
     let body = &request["body"];
+    let control = request["control"].as_bool().unwrap_or(false);
+    let coordinate = if control {
+        body.get("next")
+            .or_else(|| body.get("successor"))
+            .or_else(|| body.get("prior"))
+            .unwrap()
+    } else {
+        &body["prior"]
+    };
     let text = |v: &Value| v.as_str().unwrap().to_owned();
+    let (entry_id, archive_commitment) = if control {
+        let kind = body["$type"]
+            .as_str()
+            .and_then(SignedMutationKind::from_type_id)
+            .unwrap();
+        let strict = decode_strict_json(&serde_json::to_vec(body).unwrap()).unwrap();
+        let projected = project_signed_body(kind, &strict).unwrap();
+        (
+            text(&request["entryId"]),
+            *SigningTranscript::build_for(kind, &projected)
+                .unwrap()
+                .request_digest(),
+        )
+    } else {
+        (
+            text(&body["messageId"]),
+            chat_wire::json_bytes(&body["aad"]["archiveCommitment"])
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+    };
     let payload = SequencerReceiptPayload {
         sequencer_did: SEQUENCER.into(),
-        conversation_id: text(&body["prior"]["conversationId"]),
-        group_id: chat_wire::json_bytes(&body["prior"]["groupId"]).unwrap(),
-        epoch: body["prior"]["epoch"].as_u64().unwrap(),
+        conversation_id: text(&coordinate["conversationId"]),
+        group_id: chat_wire::json_bytes(&coordinate["groupId"]).unwrap(),
+        epoch: coordinate["epoch"].as_u64().unwrap(),
         sender_device_did_url: format!(
             "{}#{}",
             text(&body["actorDid"]),
             text(&body["actorDeviceId"])
         ),
-        entry_id: text(&body["messageId"]),
-        archive_commitment: chat_wire::json_bytes(&body["aad"]["archiveCommitment"])
-            .unwrap()
-            .try_into()
-            .unwrap(),
+        entry_id,
+        archive_commitment,
         seq: request["seq"].as_u64().unwrap(),
         issued_at_ms: js_sys::Date::now() as i64,
     };
     let signed = sign_sequencer_receipt(&sequencer_key(), RECEIPT_KID, &payload).unwrap();
     json!({
         "sequencerDid": SEQUENCER, "conversationId": payload.conversation_id,
-        "generation": body["prior"]["generation"], "groupId": STANDARD.encode(&payload.group_id),
+        "generation": coordinate["generation"], "groupId": STANDARD.encode(&payload.group_id),
         "epoch": payload.epoch, "senderDid": body["actorDid"], "senderDeviceId": body["actorDeviceId"],
         "entryId": payload.entry_id, "archiveCommitment": STANDARD.encode(payload.archive_commitment),
         "seq": payload.seq, "issuedAtMs": payload.issued_at_ms, "kid": signed.key_id,
@@ -1077,6 +1131,86 @@ async fn create(alice: &Member, cid: &str, bob: &str) {
         )
         .await
         .unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn group_creation_lost_response_replays_after_reopen() {
+    let _restore = install_ds();
+    let (alice_did, bob_did) = (did("resumecreatealice"), did("resumecreatebob"));
+    let mut alice = Member::enrolled(&alice_did, ALICE_DEVICE).await;
+    let bob = Member::enrolled(&bob_did, BOB_DEVICE).await;
+    let cid = "00000000-0000-4000-8000-00000000c297";
+    loseNextCreateResponse();
+    alice
+        .client
+        .create_group(
+            cid.into(),
+            SEQUENCER.into(),
+            serde_wasm_bindgen::to_value(&[&bob_did]).unwrap(),
+            Some("Resumable genesis".into()),
+            None,
+        )
+        .await
+        .expect_err("the committed response is lost");
+    assert!(alice.row(cid).is_none());
+
+    alice.client.close();
+    alice.client = open(&alice.did, alice.device).await;
+    alice
+        .sync()
+        .await
+        .expect("sync replays the creation journal");
+    let calls: Vec<String> = serde_json::from_str(&createCallsJson()).unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], calls[1], "creation replay changed bytes");
+    assert_eq!(conversationCount(), 1);
+    let snapshot = alice.snapshot(cid).await;
+    let row = snapshot.0.expect("creator conversation");
+    let server = state(cid)["coordinates"].clone();
+    assert_eq!(
+        row.group_id,
+        chat_wire::json_bytes(&server["groupId"]).unwrap()
+    );
+    assert_eq!(row.epoch, 0);
+    assert_eq!(snapshot.1, Some(canonical(&server, cid)));
+    assert_eq!(
+        identities(&snapshot.3),
+        [format!("{alice_did}#{ALICE_DEVICE}")]
+    );
+    alice
+        .client
+        .create_group(
+            cid.into(),
+            SEQUENCER.into(),
+            serde_wasm_bindgen::to_value(&[&bob_did]).unwrap(),
+            Some("Resumable genesis".into()),
+            None,
+        )
+        .await
+        .expect("a completed logical retry returns the existing group");
+    let completed_calls: Vec<String> = serde_json::from_str(&createCallsJson()).unwrap();
+    assert_eq!(
+        completed_calls.len(),
+        2,
+        "completed retry sent a new create"
+    );
+
+    bob.sync().await.expect("invitee accepts");
+    alice.sync().await.expect("creator fulfills recovery");
+    bob.sync().await.expect("invitee joins");
+    let message_id = new_id();
+    alice
+        .client
+        .send_message(cid.into(), message_id.clone(), "resumed genesis".into())
+        .await
+        .expect("creator sends");
+    bob.sync().await.expect("invitee decrypts");
+    let messages: Vec<MessageRow> =
+        serde_wasm_bindgen::from_value(bob.client.list_messages(cid.into(), None, 20).unwrap())
+            .unwrap();
+    assert!(messages.iter().any(|message| {
+        message.message_id == message_id && message.plaintext_json.contains("resumed genesis")
+    }));
 }
 
 /// A delivery service cannot make a member add a device. Alice creates a group whose only leaf

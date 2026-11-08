@@ -1236,10 +1236,10 @@ impl WasmMLSContext {
         })
     }
 
-    /// [`MlsCryptoContext::reserve_application_send`] on this database: the next `sendCounter`,
-    /// the sender-ratchet advance and the send journal commit in one storage transaction, or
-    /// none does. A journal already reserved for `message_id` is returned unchanged. The cached
-    /// group is replaced only by the committed state.
+    /// [`MlsCryptoContext::reserve_application_send`] on this database: the candidate after the
+    /// last confirmed `sendCounter`, the sender-ratchet advance and the send journal commit in one
+    /// storage transaction, or none does. A journal already reserved for `message_id` is returned
+    /// unchanged. The accepted-counter watermark advances only after verified sequencing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reserve_application_send(
         &self,
@@ -1312,7 +1312,6 @@ impl WasmMLSContext {
             let journal =
                 serde_json::to_string(&reserved).map_err(|_| MLSError::SerializationError)?;
             let now_ms = chrono::Utc::now().timestamp_millis();
-            conn.put_account_meta(&counter_key, &send_counter.to_string(), now_ms)?;
             conn.exec_with_text_int_blob_params(
                 "INSERT INTO pending_ops (op_kind, op_key, payload_json, created_at_ms) \
                  VALUES (?1, ?2, ?3, ?4)",
@@ -1332,12 +1331,92 @@ impl WasmMLSContext {
     }
 
     /// [`MlsCryptoContext::discard_application_send`].
-    pub(crate) fn discard_application_send(&self, message_id: &str) -> Result<(), MLSError> {
+    pub(crate) fn discard_application_send(
+        &self,
+        message_id: &str,
+        stale_send: bool,
+    ) -> Result<(), MLSError> {
         let conn = self.provider.storage().conn();
-        conn.exec_with_text_params(
-            "DELETE FROM pending_ops WHERE op_kind = ?1 AND op_key = ?2",
-            &[(1, ORCHESTRATOR_APPLICATION_SEND_OP), (2, message_id)],
-        )?;
+        conn.transaction(|| {
+            if stale_send {
+                if let Some(raw) = conn
+                    .query_text(
+                        "SELECT payload_json FROM pending_ops WHERE op_kind = ?1 AND op_key = ?2",
+                        &[(1, ORCHESTRATOR_APPLICATION_SEND_OP), (2, message_id)],
+                        1,
+                    )?
+                    .into_iter()
+                    .next()
+                    .and_then(|mut row| row.pop().flatten())
+                {
+                    let reserved: ReservedApplicationSend =
+                        serde_json::from_str(&raw).map_err(|_| MLSError::SerializationError)?;
+                    let send_counter = reserved.body["sendCounter"]
+                        .as_u64()
+                        .ok_or(MLSError::SerializationError)?;
+                    let counter_key = chat_wire::send_counter_key(&reserved.conversation_id);
+                    let confirmed = chat_wire::confirmed_send_counter(
+                        conn.get_account_meta(&counter_key)?.as_deref(),
+                        send_counter,
+                    )?;
+                    conn.put_account_meta(
+                        &counter_key,
+                        &confirmed.to_string(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                }
+            }
+            conn.exec_with_text_params(
+                "DELETE FROM pending_ops WHERE op_kind = ?1 AND op_key = ?2",
+                &[(1, ORCHESTRATOR_APPLICATION_SEND_OP), (2, message_id)],
+            )?;
+            Ok::<(), MLSError>(())
+        })?;
+        conn.ensure_durable()?;
+        Ok(())
+    }
+
+    /// Record a verified accepted send before retiring its journal.
+    pub(crate) fn spend_application_send(
+        &self,
+        message_id: &str,
+        proof: &catbird_mls::orchestrator::mls_provider::OwnEchoProof,
+    ) -> Result<(), MLSError> {
+        self.protect_own_echo(proof)?;
+        let conn = self.provider.storage().conn();
+        conn.transaction(|| {
+            if let Some(raw) = conn
+                .query_text(
+                    "SELECT payload_json FROM pending_ops WHERE op_kind = ?1 AND op_key = ?2",
+                    &[(1, ORCHESTRATOR_APPLICATION_SEND_OP), (2, message_id)],
+                    1,
+                )?
+                .into_iter()
+                .next()
+                .and_then(|mut row| row.pop().flatten())
+            {
+                let reserved: ReservedApplicationSend =
+                    serde_json::from_str(&raw).map_err(|_| MLSError::SerializationError)?;
+                let send_counter = reserved.body["sendCounter"]
+                    .as_u64()
+                    .ok_or(MLSError::SerializationError)?;
+                let counter_key = chat_wire::send_counter_key(&reserved.conversation_id);
+                let confirmed = chat_wire::confirmed_send_counter(
+                    conn.get_account_meta(&counter_key)?.as_deref(),
+                    send_counter,
+                )?;
+                conn.put_account_meta(
+                    &counter_key,
+                    &confirmed.to_string(),
+                    chrono::Utc::now().timestamp_millis(),
+                )?;
+            }
+            conn.exec_with_text_params(
+                "DELETE FROM pending_ops WHERE op_kind = ?1 AND op_key = ?2",
+                &[(1, ORCHESTRATOR_APPLICATION_SEND_OP), (2, message_id)],
+            )?;
+            Ok::<(), MLSError>(())
+        })?;
         conn.ensure_durable()?;
         Ok(())
     }
@@ -1920,8 +1999,15 @@ impl MlsCryptoContext for WasmMLSContext {
             complete,
         )
     }
-    fn discard_application_send(&self, message_id: &str) -> Result<(), MLSError> {
-        WasmMLSContext::discard_application_send(self, message_id)
+    fn discard_application_send(&self, message_id: &str, stale_send: bool) -> Result<(), MLSError> {
+        WasmMLSContext::discard_application_send(self, message_id, stale_send)
+    }
+    fn spend_application_send(
+        &self,
+        message_id: &str,
+        proof: &catbird_mls::orchestrator::mls_provider::OwnEchoProof,
+    ) -> Result<(), MLSError> {
+        WasmMLSContext::spend_application_send(self, message_id, proof)
     }
     fn reserved_application_send(
         &self,

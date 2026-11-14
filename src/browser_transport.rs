@@ -410,6 +410,7 @@ fn parse_operation(value: &str) -> Result<CanonicalOperation, String> {
         "revokeDevice" => CanonicalOperation::RevokeDevice,
         "submitTransition" => CanonicalOperation::SubmitTransition,
         "subscribeEvents" => CanonicalOperation::SubscribeEvents,
+        "approveDevice" => CanonicalOperation::ApproveDevice,
         _ => return Err(format!("unsupported clean-chat operation: {value}")),
     };
     Ok(operation)
@@ -453,5 +454,6 @@ fn operation_name(operation: CanonicalOperation) -> &'static str {
         CanonicalOperation::RevokeDevice => "revokeDevice",
         CanonicalOperation::SubmitTransition => "submitTransition",
         CanonicalOperation::SubscribeEvents => "subscribeEvents",
+        CanonicalOperation::ApproveDevice => "approveDevice",
     }
 }

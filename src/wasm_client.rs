@@ -7,13 +7,16 @@ use openmls::prelude::tls_codec::Serialize as TlsSerialize;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
+use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
 
 use catbird_mls::client::{
     account_did_hash_hex, evaluate_spaces_eligibility, execute_pq_otc_handshake,
     generate_otc_offer, generate_recovery_code_vdevice, normalize_account_did,
-    personal_mailbox_space_uri, verify_recovery_code_vdevice, EnrollmentReceipt,
-    LabyrinthBackupStatus, SpacesEligibilityInput,
+    personal_mailbox_space_uri, verify_recovery_code_vdevice, CircleOwnerStateDto,
+    EnrollmentReceipt, LabyrinthBackupStatus, SpacesEligibilityInput,
+    UploadedConversationAttachment,
 };
 use catbird_mls::groups::lifecycle::MemberRole;
 use catbird_mls::orchestrator::canonical_transport::derive_key_id;
@@ -51,6 +54,8 @@ pub(crate) fn uuid_v4(value: &str) -> Option<uuid::Uuid> {
     (uuid.get_version_num() == 4 && uuid.get_variant() == uuid::Variant::RFC4122).then_some(uuid)
 }
 
+pub(crate) type PendingOtcInitiator = (String, labyrinth::otc::Initiator, u32, [u8; 32]);
+
 /// Unified browser WASM MLS client backed by per-account `catbird-mls/<did_hash>.db` on OPFS (`sqlite3mc` ChaCha20).
 #[wasm_bindgen]
 pub struct WasmMlsClient {
@@ -63,6 +68,8 @@ pub struct WasmMlsClient {
     pub(crate) auth_token: RefCell<Option<String>>,
     pub(crate) http: reqwest::Client,
     pub(crate) db: Option<WasmAccountDb<Rc<SqliteConn>>>,
+    pub(crate) pending_otc_initiator: RefCell<Option<PendingOtcInitiator>>,
+    pub(crate) pending_otc_offer_digits: RefCell<Option<Zeroizing<String>>>,
 }
 
 #[wasm_bindgen]
@@ -79,37 +86,16 @@ impl WasmMlsClient {
     ) -> Result<WasmMlsClient, JsValue> {
         let normalized_did = normalize_account_did(&account_did).map_err(mls_to_js_err)?;
         let did_hash = account_did_hash_hex(&normalized_did).map_err(mls_to_js_err)?;
-        if device_id.trim().is_empty() {
-            return Err(JsValue::from_str("device_id must not be empty"));
-        }
         let db_path = format!("catbird-mls/{did_hash}.db");
-        let conn = Rc::new(
-            SqliteConn::open(&db_path, &db_key_hex)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?,
-        );
-        let db = WasmAccountDb::new(conn);
-        let ts = now_ms();
-        db.write_tx(|tx| {
-            tx.put_account_meta("owner_did", &normalized_did, ts)?;
-            tx.put_account_meta("device_id", &device_id, ts)?;
-            tx.put_account_meta("home_ds_did", &home_ds_did, ts)?;
-            tx.put_account_meta("home_ds_endpoint", &home_ds_endpoint, ts)?;
-            tx.put_account_meta("pds_endpoint", &pds_endpoint, ts)?;
-            Ok(())
-        })
-        .map_err(mls_to_js_err)?;
-
-        Ok(Self {
-            account_did: normalized_did,
-            account_did_hash: did_hash,
+        Self::open_with_db_path(
+            account_did,
             device_id,
             home_ds_did,
             home_ds_endpoint,
             pds_endpoint,
-            auth_token: RefCell::new(None),
-            http: reqwest::Client::new(),
-            db: Some(db),
-        })
+            db_key_hex,
+            &db_path,
+        )
     }
 
     /// Initialize persistent OPFS storage (`multipleciphers-opfs-sahpool`) in this Dedicated Worker
@@ -142,6 +128,19 @@ impl WasmMlsClient {
             .ok_or_else(|| JsValue::from_str("WasmMlsClient handle is closed"))
     }
 
+    fn wipe_and_close_local_storage(&mut self) -> Result<(), MLSError> {
+        *self.auth_token.borrow_mut() = None;
+        *self.pending_otc_initiator.borrow_mut() = None;
+        *self.pending_otc_offer_digits.borrow_mut() = None;
+        if let Some(db) = self.db.take() {
+            let db_path = db.backend().db_path().to_owned();
+            let _ = db.write_tx(|tx| tx.wipe_all_tables());
+            drop(db);
+            let _ = SqliteConn::delete_opfs_database(&db_path);
+        }
+        Ok(())
+    }
+
     /// Inject or refresh the `nest` BFF / OAuth bearer session token for live XRPC dispatches.
     #[wasm_bindgen(js_name = setAuthToken)]
     pub fn set_auth_token(&self, token: Option<String>) {
@@ -156,6 +155,11 @@ impl WasmMlsClient {
     #[wasm_bindgen(js_name = accountDidHash)]
     pub fn account_did_hash(&self) -> String {
         self.account_did_hash.clone()
+    }
+
+    #[wasm_bindgen(js_name = deviceId)]
+    pub fn device_id(&self) -> String {
+        self.device_id.clone()
     }
 
     #[wasm_bindgen(js_name = homeDsDid)]
@@ -196,10 +200,6 @@ impl WasmMlsClient {
     /// KeyPackages (`C33` >= 35d direct-request + <= 30d recovery), publishing `ADR-009`
     /// `blue.catbird.chat.device` + `blue.catbird.chat.declaration` + `mls-ds` `enrollDevice`
     /// outside `WasmAccountDb::write_tx` (`I6`), and initializing Labyrinth (`D4`).
-    ///
-    /// Idempotent, like catbird-mls `enroll_device`: an enrolled device keeps its signer and
-    /// archive status. Its MLS leaves and the `mls-ds` device row are bound to that key, and
-    /// `mls-ds` has no key rotation: a new signing key is a new device ID.
     #[wasm_bindgen(js_name = enrollDevice)]
     pub async fn enroll_device(
         &self,
@@ -373,6 +373,68 @@ impl WasmMlsClient {
         to_js_val(&receipt)
     }
 
+    #[wasm_bindgen(js_name = isDevicePendingApproval)]
+    pub fn is_device_pending_approval(&self) -> Result<bool, JsValue> {
+        self.is_device_pending_approval_impl()
+            .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = approveDevice)]
+    pub async fn approve_device(&self, target_device_id: String) -> Result<(), JsValue> {
+        self.approve_device_impl(&target_device_id)
+            .await
+            .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = approveDeviceWithKey)]
+    pub async fn approve_device_with_key(
+        &self,
+        target_device_id: String,
+        target_signature_public_key: &[u8],
+        target_auth_generation: i64,
+    ) -> Result<(), JsValue> {
+        self.approve_device_with_key_impl(
+            &target_device_id,
+            target_signature_public_key,
+            target_auth_generation,
+        )
+        .await
+        .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = listDevices)]
+    pub async fn list_devices(&self) -> Result<JsValue, JsValue> {
+        let devices = self.list_devices_impl().await.map_err(mls_to_js_err)?;
+        to_js_val(&devices)
+    }
+
+    #[wasm_bindgen(js_name = revokeDevice)]
+    pub async fn revoke_device(&self, target_device_id: String) -> Result<JsValue, JsValue> {
+        let report = self
+            .revoke_device_impl(&target_device_id)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&report)
+    }
+
+    #[wasm_bindgen(js_name = retireCurrentDevice)]
+    pub async fn retire_current_device(&mut self) -> Result<(), JsValue> {
+        self.retire_current_device_pre_wipe()
+            .await
+            .map_err(mls_to_js_err)?;
+        self.wipe_and_close_local_storage().map_err(mls_to_js_err)
+    }
+
+    /// Fail-closed `D-3` account deletion: purges `OwnerMailbox`, `mailboxKeys` PDS records,
+    /// `mls-ds` `deleteAccountData`, and owned conversation Space records BEFORE wiping local OPFS.
+    #[wasm_bindgen(js_name = deleteAccountData)]
+    pub async fn delete_account_data(&mut self) -> Result<(), JsValue> {
+        self.delete_account_data_remote_impl()
+            .await
+            .map_err(mls_to_js_err)?;
+        self.wipe_and_close_local_storage().map_err(mls_to_js_err)
+    }
+
     #[wasm_bindgen(js_name = replenishKeyPackages)]
     pub async fn replenish_key_packages(&self, count: u32) -> Result<u32, JsValue> {
         self.replenish_key_packages_impl(count)
@@ -495,6 +557,97 @@ impl WasmMlsClient {
         to_js_val(&row)
     }
 
+    #[wasm_bindgen(js_name = uploadConversationAttachment)]
+    pub async fn upload_conversation_attachment(
+        &self,
+        conversation_id: String,
+        plaintext: &[u8],
+        mime_type: String,
+    ) -> Result<JsValue, JsValue> {
+        let uploaded = self
+            .upload_conversation_attachment_impl(&conversation_id, plaintext, mime_type)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&uploaded)
+    }
+
+    #[wasm_bindgen(js_name = downloadConversationAttachment)]
+    pub async fn download_conversation_attachment(
+        &self,
+        locator: String,
+        symmetric_key: &[u8],
+        iv: &[u8],
+        expected_sha256: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, JsValue> {
+        self.download_conversation_attachment_impl(
+            &locator,
+            symmetric_key,
+            iv,
+            expected_sha256.as_deref(),
+        )
+        .await
+        .map_err(mls_to_js_err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = sendMediaAttachmentMessage)]
+    pub async fn send_media_attachment_message(
+        &self,
+        conversation_id: String,
+        message_id: String,
+        text: String,
+        uploaded_js: JsValue,
+        width: Option<u32>,
+        height: Option<u32>,
+        alt_text: Option<String>,
+        duration_ms: Option<u64>,
+        waveform_js: JsValue,
+        transcript: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let uploaded: UploadedConversationAttachment = serde_wasm_bindgen::from_value(uploaded_js)
+            .map_err(|e| JsValue::from_str(&format!("invalid uploaded attachment: {e}")))?;
+        let waveform: Option<Vec<f32>> = if waveform_js.is_null() || waveform_js.is_undefined() {
+            None
+        } else {
+            Some(
+                serde_wasm_bindgen::from_value(waveform_js)
+                    .map_err(|e| JsValue::from_str(&format!("invalid waveform array: {e}")))?,
+            )
+        };
+        let row = self
+            .send_media_attachment_message_impl(
+                &conversation_id,
+                &message_id,
+                &text,
+                &uploaded,
+                width,
+                height,
+                alt_text,
+                duration_ms,
+                waveform,
+                transcript,
+            )
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&row)
+    }
+
+    #[wasm_bindgen(js_name = leaveConversation)]
+    pub async fn leave_conversation(&self, conversation_id: String) -> Result<JsValue, JsValue> {
+        let out = self
+            .leave_conversation_impl(&conversation_id)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&out)
+    }
+
+    #[wasm_bindgen(js_name = fulfillPendingGroupLeaves)]
+    pub async fn fulfill_pending_group_leaves(&self) -> Result<u32, JsValue> {
+        self.fulfill_pending_group_leaves_impl()
+            .await
+            .map_err(mls_to_js_err)
+    }
+
     /// Enforce `D3` (`M-F01`) admin-only member removal and dispatch `#commitTransitionBody` on live sessions.
     #[wasm_bindgen(js_name = removeGroupMember)]
     pub async fn remove_group_member(
@@ -592,6 +745,150 @@ impl WasmMlsClient {
         to_js_val(&status)
     }
 
+    #[wasm_bindgen(js_name = enableLabyrinthLive)]
+    pub async fn enable_labyrinth_live(&self) -> Result<JsValue, JsValue> {
+        let status = self
+            .enable_labyrinth_live_impl()
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&status)
+    }
+
+    #[wasm_bindgen(js_name = createRecoveryCodeLive)]
+    pub async fn create_recovery_code_live(&self) -> Result<String, JsValue> {
+        self.create_recovery_code_live_impl()
+            .await
+            .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = restoreWithRecoveryCodeLive)]
+    pub async fn restore_with_recovery_code_live(&self, code: String) -> Result<JsValue, JsValue> {
+        let status = self
+            .restore_with_recovery_code_live_impl(&code)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&status)
+    }
+
+    #[wasm_bindgen(js_name = registerPasskeyPrfLive)]
+    pub async fn register_passkey_prf_live(
+        &self,
+        credential_id: &[u8],
+        prf_output_32: &[u8],
+    ) -> Result<JsValue, JsValue> {
+        let status = self
+            .register_passkey_prf_live_impl(credential_id, prf_output_32)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&status)
+    }
+
+    #[wasm_bindgen(js_name = restoreWithPasskeyPrf)]
+    pub async fn restore_with_passkey_prf(
+        &self,
+        credential_id: &[u8],
+        prf_output_32: &[u8],
+    ) -> Result<JsValue, JsValue> {
+        let status = self
+            .restore_with_passkey_prf_impl(credential_id, prf_output_32)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&status)
+    }
+
+    #[wasm_bindgen(js_name = verifyAndReindexHistory)]
+    pub async fn verify_and_reindex_history(
+        &self,
+        conversation_id: String,
+    ) -> Result<u32, JsValue> {
+        self.verify_and_reindex_history_impl(&conversation_id)
+            .await
+            .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = getReadState)]
+    pub async fn get_read_state(&self, conversation_id: String) -> Result<JsValue, JsValue> {
+        let out = self
+            .get_read_state_impl(&conversation_id)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&out)
+    }
+
+    #[wasm_bindgen(js_name = advanceReadState)]
+    pub async fn advance_read_state(
+        &self,
+        conversation_id: String,
+        candidate_seq: u64,
+    ) -> Result<JsValue, JsValue> {
+        let out = self
+            .advance_read_state_impl(&conversation_id, candidate_seq)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&out)
+    }
+
+    #[wasm_bindgen(js_name = listReadStates)]
+    pub async fn list_read_states(&self) -> Result<JsValue, JsValue> {
+        let out = self.list_read_states_impl().await.map_err(mls_to_js_err)?;
+        to_js_val(&out)
+    }
+
+    #[wasm_bindgen(js_name = getCircleOwnerState)]
+    pub async fn get_circle_owner_state(&self, circle_id: String) -> Result<JsValue, JsValue> {
+        let out = self
+            .get_circle_owner_state_impl(&circle_id)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&out)
+    }
+
+    #[wasm_bindgen(js_name = putCircleOwnerState)]
+    pub async fn put_circle_owner_state(
+        &self,
+        state_js: JsValue,
+        swap_record_cid: Option<String>,
+    ) -> Result<String, JsValue> {
+        let state: CircleOwnerStateDto = serde_wasm_bindgen::from_value(state_js)
+            .map_err(|e| JsValue::from_str(&format!("invalid CircleOwnerStateDto: {e}")))?;
+        self.put_circle_owner_state_impl(state, swap_record_cid)
+            .await
+            .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = mergeCircleOwnerState)]
+    pub async fn merge_circle_owner_state(&self, update_js: JsValue) -> Result<JsValue, JsValue> {
+        let update: CircleOwnerStateDto = serde_wasm_bindgen::from_value(update_js)
+            .map_err(|e| JsValue::from_str(&format!("invalid CircleOwnerStateDto: {e}")))?;
+        let out = self
+            .merge_circle_owner_state_impl(update)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&out)
+    }
+
+    #[wasm_bindgen(js_name = clearCircleAclTombstone)]
+    pub async fn clear_circle_acl_tombstone(
+        &self,
+        circle_id: String,
+        member_did: String,
+    ) -> Result<JsValue, JsValue> {
+        let out = self
+            .clear_circle_acl_tombstone_impl(&circle_id, &member_did)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&out)
+    }
+
+    #[wasm_bindgen(js_name = listCircleOwnerStates)]
+    pub async fn list_circle_owner_states(&self) -> Result<JsValue, JsValue> {
+        let out = self
+            .list_circle_owner_states_impl()
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&out)
+    }
+
     #[wasm_bindgen(js_name = setupRecoveryCode)]
     pub fn setup_recovery_code(&self) -> Result<String, JsValue> {
         let (grouped, vdev_id) =
@@ -676,6 +973,14 @@ impl WasmMlsClient {
                 "passkey PRF requires non-empty credential_id and 32-byte PRF output",
             ));
         }
+        let mut digest_hasher = Sha256::new();
+        digest_hasher.update(b"catbird.wasm.passkey_prf.v1\0");
+        digest_hasher.update(self.account_did.as_bytes());
+        digest_hasher.update([0u8]);
+        digest_hasher.update(credential_id);
+        digest_hasher.update([0u8]);
+        digest_hasher.update(prf_output_32);
+        let prf_digest: [u8; 32] = digest_hasher.finalize().into();
         let ts = now_ms();
         let status = self
             .require_db()?
@@ -687,6 +992,7 @@ impl WasmMlsClient {
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
                 st.has_passkey_prf = true;
                 tx.put_labyrinth_state("passkey_credential_id", credential_id, ts)?;
+                tx.put_labyrinth_state("passkey_prf_digest", &prf_digest, ts)?;
                 tx.put_labyrinth_state(
                     "status_json",
                     &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
@@ -702,12 +1008,65 @@ impl WasmMlsClient {
     pub fn initiate_otc_pairing(&self) -> Result<JsValue, JsValue> {
         let offer = generate_otc_offer().map_err(mls_to_js_err)?;
         let ts = now_ms();
+        let mut salt = [0u8; 16];
+        let _ = getrandom::getrandom(&mut salt);
+        let mut hasher = Sha256::new();
+        hasher.update(b"catbird.otc.offer.v1\0");
+        hasher.update(salt);
+        hasher.update(offer.six_digit_code.as_bytes());
+        let code_digest_hex = hex::encode(hasher.finalize());
+        let offer_state = serde_json::json!({
+            "salt_hex": hex::encode(salt),
+            "code_digest_hex": code_digest_hex,
+            "expires_at_ms": ts.saturating_add(10 * 60 * 1000),
+            "attempts": 0u64,
+        });
         self.require_db()?
             .write_tx(|tx| {
-                tx.put_labyrinth_state("pending_otc_digits", offer.six_digit_code.as_bytes(), ts)
+                tx.put_labyrinth_state("pending_otc_digits", offer.six_digit_code.as_bytes(), ts)?;
+                tx.put_labyrinth_state(
+                    "pending_otc_offer",
+                    &serde_json::to_vec(&offer_state)
+                        .map_err(|e| MLSError::Internal(e.to_string()))?,
+                    ts,
+                )
             })
             .map_err(mls_to_js_err)?;
+        *self.pending_otc_offer_digits.borrow_mut() =
+            Some(Zeroizing::new(offer.six_digit_code.clone()));
         to_js_val(&offer)
+    }
+
+    #[wasm_bindgen(js_name = startOtcPairing)]
+    pub async fn start_otc_pairing(&self, six_digit_code: String) -> Result<JsValue, JsValue> {
+        let initiated = self
+            .start_otc_pairing_impl(&six_digit_code)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&initiated)
+    }
+
+    #[wasm_bindgen(js_name = respondOtcPairing)]
+    pub async fn respond_otc_pairing(
+        &self,
+        session_id_hex: String,
+        six_digit_code: Option<String>,
+    ) -> Result<(), JsValue> {
+        self.respond_otc_pairing_impl(&session_id_hex, six_digit_code.as_deref())
+            .await
+            .map_err(mls_to_js_err)
+    }
+
+    #[wasm_bindgen(js_name = completeLiveOtcPairing)]
+    pub async fn complete_live_otc_pairing(
+        &self,
+        six_digit_code: String,
+    ) -> Result<JsValue, JsValue> {
+        let completion = self
+            .complete_live_otc_pairing_impl(&six_digit_code)
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&completion)
     }
 
     #[wasm_bindgen(js_name = completeOtcPairing)]
@@ -798,6 +1157,78 @@ impl WasmMlsClient {
     #[wasm_bindgen]
     pub fn close(&mut self) {
         self.db = None;
+    }
+}
+
+impl WasmMlsClient {
+    #[doc(hidden)]
+    pub fn open_with_db_path(
+        account_did: String,
+        device_id: String,
+        home_ds_did: String,
+        home_ds_endpoint: String,
+        pds_endpoint: String,
+        db_key_hex: String,
+        db_path: &str,
+    ) -> Result<WasmMlsClient, JsValue> {
+        let normalized_did = normalize_account_did(&account_did).map_err(mls_to_js_err)?;
+        let did_hash = account_did_hash_hex(&normalized_did).map_err(mls_to_js_err)?;
+        if device_id.trim().is_empty() {
+            return Err(JsValue::from_str("device_id must not be empty"));
+        }
+        let conn = Rc::new(
+            SqliteConn::open(db_path, &db_key_hex)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        );
+        let db = WasmAccountDb::new(conn);
+        let ts = now_ms();
+        db.write_tx(|tx| {
+            tx.put_account_meta("owner_did", &normalized_did, ts)?;
+            tx.put_account_meta("device_id", &device_id, ts)?;
+            tx.put_account_meta("home_ds_did", &home_ds_did, ts)?;
+            tx.put_account_meta("home_ds_endpoint", &home_ds_endpoint, ts)?;
+            tx.put_account_meta("pds_endpoint", &pds_endpoint, ts)?;
+            Ok(())
+        })
+        .map_err(mls_to_js_err)?;
+
+        Ok(Self {
+            account_did: normalized_did,
+            account_did_hash: did_hash,
+            device_id,
+            home_ds_did,
+            home_ds_endpoint,
+            pds_endpoint,
+            auth_token: RefCell::new(None),
+            http: reqwest::Client::new(),
+            db: Some(db),
+            pending_otc_initiator: RefCell::new(None),
+            pending_otc_offer_digits: RefCell::new(None),
+        })
+    }
+
+    #[doc(hidden)]
+    pub async fn open_with_db_path_async(
+        account_did: String,
+        device_id: String,
+        home_ds_did: String,
+        home_ds_endpoint: String,
+        pds_endpoint: String,
+        db_key_hex: String,
+        db_path: &str,
+    ) -> Result<WasmMlsClient, JsValue> {
+        SqliteConn::initialize_opfs().await.map_err(|e| {
+            JsValue::from_str(&format!("Persistent encrypted storage unavailable: {e}"))
+        })?;
+        Self::open_with_db_path(
+            account_did,
+            device_id,
+            home_ds_did,
+            home_ds_endpoint,
+            pds_endpoint,
+            db_key_hex,
+            db_path,
+        )
     }
 }
 

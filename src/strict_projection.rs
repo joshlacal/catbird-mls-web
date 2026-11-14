@@ -29,6 +29,7 @@ use catbird_mls::orchestrator::canonical_transport::{
 const REPLENISH_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REPLENISH\0";
 const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
 const DEVICE_REVOKE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REVOKE\0";
+const DEVICE_APPROVE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-APPROVE\0";
 const CREATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-CREATE\0";
 const COMMIT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-COMMIT\0";
 const POLICY_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-POLICY\0";
@@ -1092,6 +1093,11 @@ fn signed_request_spec(
             body_type: "blue.catbird.chat.defs#deviceRevocationBody",
             variant: None,
         },
+        CanonicalOperation::ApproveDevice => SignedRequestSpec {
+            domain: DEVICE_APPROVE_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#deviceApprovalBody",
+            variant: None,
+        },
         CanonicalOperation::RequestLeave => match variant {
             Some("blue.catbird.chat.defs#signedLeaveRequest") => SignedRequestSpec {
                 domain: LEAVE_REQUEST_SIGNATURE_DOMAIN,
@@ -1328,15 +1334,16 @@ pub(crate) fn parse_generated_request(
     };
     use catbird_mls::orchestrator::canonical_transport::{
         AcceptConversationRequestBody, AcknowledgeEntriesRequestBody,
-        AcknowledgeWelcomeRequestBody, ActivateResetRequestBody, CancelLeafRecoveryRequestBody,
-        CancelLeaveRequestBody, CloseConversationRequestBody, CreateConversationRequestBody,
-        EnrollDeviceRequestBody, GetConversationStateRequestBody, GetDeviceKeyRequestBody,
-        GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody, GetOwnDevicesRequestBody,
-        GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody, PublishTypingRequestBody,
-        RegisterPushGatewayRequestBody, RejectWelcomeRequestBody, RelaySpaceCredentialRequestBody,
-        RelaySpaceReadRequestBody, ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody,
-        RequestLeaveRequestBody, RequestResetRequestBody, RevokeDeviceRequestBody,
-        SendMessageRequestBody, SubmitTransitionRequestBody, SubscribeEventsRequestBody,
+        AcknowledgeWelcomeRequestBody, ActivateResetRequestBody, ApproveDeviceRequestBody,
+        CancelLeafRecoveryRequestBody, CancelLeaveRequestBody, CloseConversationRequestBody,
+        CreateConversationRequestBody, EnrollDeviceRequestBody, GetConversationStateRequestBody,
+        GetDeviceKeyRequestBody, GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody,
+        GetOwnDevicesRequestBody, GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody,
+        PublishTypingRequestBody, RegisterPushGatewayRequestBody, RejectWelcomeRequestBody,
+        RelaySpaceCredentialRequestBody, RelaySpaceReadRequestBody,
+        ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
+        RequestResetRequestBody, RevokeDeviceRequestBody, SendMessageRequestBody,
+        SubmitTransitionRequestBody, SubscribeEventsRequestBody,
     };
     match operation {
         CanonicalOperation::PrepareDirectRequest
@@ -1410,6 +1417,7 @@ pub(crate) fn parse_generated_request(
             parse!(SubmitTransitionRequestBody, SubmitTransition)
         }
         CanonicalOperation::SubscribeEvents => parse!(SubscribeEventsRequestBody, SubscribeEvents),
+        CanonicalOperation::ApproveDevice => parse!(ApproveDeviceRequestBody, ApproveDevice),
     }
 }
 

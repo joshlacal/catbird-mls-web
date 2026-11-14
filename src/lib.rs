@@ -42,6 +42,7 @@ mod request_runtime;
 pub mod sqlite_conn;
 mod strict_projection;
 mod wasm_archive;
+mod wasm_archive_space;
 pub mod wasm_client;
 mod wasm_client_c33;
 mod wasm_client_mutations;
@@ -2722,7 +2723,7 @@ mod background_tasks_tests {
     use wasm_bindgen_test::*;
 
     #[cfg(not(feature = "inventory-worker-tests"))]
-    wasm_bindgen_test_configure!(run_in_browser);
+    wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
     fn in_flight() -> bool {
         BACKGROUND_TICK_IN_FLIGHT.with(|f| f.get())
@@ -2859,7 +2860,7 @@ mod conversation_identity_tests {
     use wasm_bindgen_test::*;
 
     #[cfg(not(feature = "inventory-worker-tests"))]
-    wasm_bindgen_test_configure!(run_in_browser);
+    wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
     fn create_response(
         result_type: &str,

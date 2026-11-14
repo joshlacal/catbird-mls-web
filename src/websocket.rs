@@ -239,7 +239,7 @@ mod identity_tests {
     use wasm_bindgen_test::*;
 
     #[cfg(not(feature = "inventory-worker-tests"))]
-    wasm_bindgen_test_configure!(run_in_browser);
+    wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
     fn message_frame(frame_conversation_id: &str) -> Vec<u8> {
         let header = CborValue::Map(vec![

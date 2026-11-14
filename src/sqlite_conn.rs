@@ -1422,6 +1422,78 @@ impl SqliteConn {
         .map_err(map_wasm_mls_err)
     }
 
+    /// Database path inside the OPFS SAH pool.
+    pub fn db_path(&self) -> &str {
+        &self.db_path
+    }
+
+    /// Delete one `labyrinth_state` row by key.
+    pub fn delete_labyrinth_state_key(&self, state_key: &str) -> Result<(), catbird_mls::MLSError> {
+        self.exec_with_text_params(
+            "DELETE FROM labyrinth_state WHERE state_key = ?1",
+            &[(1, state_key)],
+        )
+        .map_err(map_wasm_mls_err)
+    }
+
+    /// Wipe all rows across all 15 unified schema tables inside one immediate transaction.
+    pub fn wipe_all_tables(&self) -> Result<(), catbird_mls::MLSError> {
+        self.transaction(|| {
+            for table in [
+                "openmls_kv",
+                "account_meta",
+                "conversations",
+                "messages",
+                "requests",
+                "participant_profiles",
+                "group_metadata_cache",
+                "epoch_secrets",
+                "sequencer_receipts",
+                "recovery_state",
+                "pending_ops",
+                "mutation_journal",
+                "routing_cache",
+                "labyrinth_state",
+                "labyrinth_queue",
+            ] {
+                self.exec_raw(&format!("DELETE FROM {table};"))?;
+            }
+            Ok::<(), WasmSqliteError>(())
+        })
+        .map_err(map_wasm_mls_err)?;
+        self.ensure_durable().map_err(map_wasm_mls_err)
+    }
+
+    /// Unlink a closed database path from the encrypted OPFS SAH pool VFS.
+    pub fn delete_opfs_database(db_path: &str) -> Result<(), WasmSqliteError> {
+        if OPEN_DATABASES.with(|paths| paths.borrow().contains(db_path)) {
+            return Err(WasmSqliteError::Sqlite {
+                code: SQLITE_BUSY,
+                message: "Cannot delete an open OPFS database".into(),
+            });
+        }
+        let c_path =
+            CString::new(db_path).map_err(|e| WasmSqliteError::Serialization(e.to_string()))?;
+        let vfs = unsafe { sqlite3_vfs_find(ENCRYPTED_OPFS_VFS_NAME.as_ptr()) };
+        if vfs.is_null() {
+            return Ok(());
+        }
+        let rc = unsafe {
+            match (*vfs).xDelete {
+                Some(del) => del(vfs, c_path.as_ptr(), 1),
+                None => SQLITE_OK,
+            }
+        };
+        if rc == SQLITE_OK || rc == SQLITE_IOERR_DELETE_NOENT {
+            Ok(())
+        } else {
+            Err(WasmSqliteError::Sqlite {
+                code: rc,
+                message: format!("Failed to delete OPFS database {db_path}"),
+            })
+        }
+    }
+
     /// Extract the last error message from the database handle.
     pub fn last_error(&self, code: i32) -> WasmSqliteError {
         let msg = unsafe {
@@ -1434,6 +1506,18 @@ impl SqliteConn {
             }
         };
         WasmSqliteError::Sqlite { code, message: msg }
+    }
+
+    pub fn delete_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<(), catbird_mls::MLSError> {
+        self.exec_with_text_params(
+            "DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
+            &[(1, conversation_id), (2, message_id)],
+        )
+        .map_err(map_wasm_mls_err)
     }
 }
 

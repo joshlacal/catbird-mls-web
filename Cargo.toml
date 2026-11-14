@@ -92,10 +92,15 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 # Keeping this target-specific prevents native checks from pulling its
 # audiopus_sys/CMake voice stack into this browser-only crate.
 catbird_mls = { path = "../catbird-mls", default-features = false, features = ["browser"] }
-catbird-atproto = { path = "../catbird-atproto" }
+catbird-atproto = { path = "../../dec1-w0/wave1-catbird-atproto", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
+atproto-spaces = { path = "../../dec1-w0/wave1-catbird-atproto/atproto-spaces", default-features = false }
 # Labyrinth records, MEKs and directory for the browser archive (already in the graph via
 # catbird_mls).
 labyrinth = { path = "../labyrinth", features = ["space"] }
+http = "1"
+multibase = "0.9"
+subtle = "2"
+zeroize = "1"
 
 # SQLite for WASM — raw FFI bindings with sqlite3mc encryption. Keep this out
 # of native checks/tests: its OPFS VFS and C amalgamation only run in WASM.

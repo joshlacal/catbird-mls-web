@@ -59,18 +59,20 @@ fn fixture_wire_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn signing_domain_operation(body_name: &str) -> &'static str {
+fn signing_domain_operation(body_name: &str) -> Option<&'static str> {
     match body_name {
-        "deviceEnrollmentBody" => "enrollDevice",
-        "keyPackageReplenishmentBody" => "replenishKeyPackages",
-        "deviceRevocationBody" => "revokeDevice",
-        "blobUploadPreparationBody" => "prepareBlobUpload",
-        "applicationSendBody" => "sendMessage",
-        "typingBody" => "publishTyping",
-        "leafRecoveryRequestBody" => "requestLeafRecovery",
-        "leafRecoveryCancellationBody" => "cancelLeafRecovery",
-        "welcomeAcknowledgementBody" => "acknowledgeWelcome",
-        "welcomeRejectionBody" => "rejectWelcome",
+        "deviceEnrollmentBody" => Some("enrollDevice"),
+        "keyPackageReplenishmentBody" => Some("replenishKeyPackages"),
+        "deviceRevocationBody" => Some("revokeDevice"),
+        "deviceApprovalBody" => Some("approveDevice"),
+        // Retired DS blob route (`FC-07`): attachments live in ATProto Spaces (`"{spaceURI}|{repoDID}|{cid}"`).
+        "blobUploadPreparationBody" => None,
+        "applicationSendBody" => Some("sendMessage"),
+        "typingBody" => Some("publishTyping"),
+        "leafRecoveryRequestBody" => Some("requestLeafRecovery"),
+        "leafRecoveryCancellationBody" => Some("cancelLeafRecovery"),
+        "welcomeAcknowledgementBody" => Some("acknowledgeWelcome"),
+        "welcomeRejectionBody" => Some("rejectWelcome"),
         other => panic!("unmapped signed-domain fixture {other}"),
     }
 }
@@ -295,11 +297,34 @@ async fn strict_projection_rejects_out_of_bounds_before_signing() {
 async fn signed_wrapper_bytes_match_approved_fixture_all_ten_domains() {
     let fixture = fixture_json(SIGNING_DOMAIN_VECTORS);
     let cases = fixture["cases"].as_array().expect("signing-domain cases");
-    assert_eq!(cases.len(), 10);
+    assert_eq!(cases.len(), 11);
 
+    let mut active_verified = 0usize;
     for case in cases {
         let body_name = case["bodyName"].as_str().expect("body name");
-        let operation = signing_domain_operation(body_name);
+        let Some(operation) = signing_domain_operation(body_name) else {
+            // Retired DS blob preparation route (`FC-07`) must fail closed before signing.
+            catbird_mls_web::catbird_mls_set_signer_bridge(
+                Function::new_no_args("throw new Error('retired blob route invoked signer')"),
+                valid_fake_key(),
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                "70707070-7070-4070-b070-707070707070".to_owned(),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                Uint8Array::new_with_length(32),
+                Some(1),
+            )
+            .unwrap();
+            let request = serde_json::json!({ "signedRequest": { "body": case["body"] } });
+            let err = catbird_mls_web::catbird_mls_prepare_signed_request(
+                "prepareBlobUpload".to_owned(),
+                request.to_string(),
+            )
+            .await
+            .expect_err("retired prepareBlobUpload must be rejected before signing");
+            assert!(err.as_string().unwrap_or_default().contains("unsupported"));
+            catbird_mls_web::catbird_mls_clear_signer_bridge();
+            continue;
+        };
         let (actor_did, device_id, dpop_jkt, auth_generation) =
             signing_domain_binding(&case["body"], operation);
         install_fixture_signer(
@@ -342,52 +367,38 @@ async fn signed_wrapper_bytes_match_approved_fixture_all_ten_domains() {
             88,
             "signature is canonical standard base64 for {body_name}"
         );
+        active_verified += 1;
     }
+    assert_eq!(
+        active_verified, 10,
+        "all 10 active signing domains including deviceApprovalBody must match byte-for-byte"
+    );
 }
 
 #[wasm_bindgen_test]
-async fn signed_wrapper_bytes_match_approved_blob_fixture() {
+async fn retired_ds_blob_delete_route_is_rejected_before_signing() {
     let contract = fixture_json(CONTRACT_VECTORS);
     let blob = contract["signedMutator"]["body"].clone();
-    let operation = "deleteBlob";
-    let (actor_did, device_id, dpop_jkt, auth_generation) =
-        signing_domain_binding(&blob, operation);
-    install_fixture_signer(
-        contract["signedMutator"]["publicKeyHex"]
-            .as_str()
-            .expect("blob public key"),
-        contract["signedMutator"]["signatureHex"]
-            .as_str()
-            .expect("blob signature"),
-        &actor_did,
-        &device_id,
-        &dpop_jkt,
-        auth_generation,
-    );
+    catbird_mls_web::catbird_mls_set_signer_bridge(
+        Function::new_no_args("throw new Error('retired deleteBlob route invoked signer')"),
+        valid_fake_key(),
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "70707070-7070-4070-b070-707070707070".to_owned(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        Uint8Array::new_with_length(32),
+        Some(1),
+    )
+    .unwrap();
 
     let request = serde_json::json!({ "signedRequest": { "body": blob } });
-    let prepared = catbird_mls_web::catbird_mls_prepare_signed_request(
-        operation.to_owned(),
+    let err = catbird_mls_web::catbird_mls_prepare_signed_request(
+        "deleteBlob".to_owned(),
         request.to_string(),
     )
     .await
-    .expect("blob deletion fixture prepares");
-    let wire = prepared_body(prepared);
-    let expected_signature = base64::engine::general_purpose::STANDARD.encode(hex_decode(
-        contract["signedMutator"]["signatureHex"]
-            .as_str()
-            .expect("blob signature hex"),
-    ));
-    assert_eq!(
-        wire["signedRequest"]["signature"]
-            .as_str()
-            .expect("signature"),
-        expected_signature
-    );
-    assert_eq!(
-        wire["signedRequest"]["body"]["$type"],
-        "blue.catbird.chat.defs#blobDeletionBody"
-    );
+    .expect_err("retired deleteBlob operation must fail closed before signing");
+    assert!(err.as_string().unwrap_or_default().contains("unsupported"));
+    catbird_mls_web::catbird_mls_clear_signer_bridge();
 }
 
 // ---------------------------------------------------------------------------

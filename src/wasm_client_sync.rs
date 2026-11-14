@@ -282,6 +282,49 @@ pub(crate) fn stored_roster(
         .transpose()
 }
 
+pub(crate) fn clear_roster_baseline(tx: &impl WasmSqlBackend, cid: &str) -> Result<(), MLSError> {
+    if let Some(previous) = stored_roster(tx, cid)? {
+        for did in previous
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(did, _)| did)
+        {
+            tx.delete_account_meta(&chat_wire::verified_participant_admission_key(cid, did))?;
+        }
+    }
+    tx.delete_account_meta(&chat_wire::conversation_roster_key(cid))
+}
+
+/// Records a member-authenticated roster baseline for `cid`, replacing any. Active rows carry
+/// admission authority to this device; pending rows carry only their immutable invitation
+/// provenance. Old baseline markers are removed before the replacement is installed.
+pub(crate) fn store_roster(
+    tx: &impl WasmSqlBackend,
+    cid: &str,
+    roster: &Value,
+    ts: i64,
+) -> Result<(), MLSError> {
+    clear_roster_baseline(tx, cid)?;
+    tx.put_account_meta(
+        &chat_wire::conversation_roster_key(cid),
+        &roster.to_string(),
+        ts,
+    )?;
+    for (did, row) in roster.as_object().into_iter().flatten() {
+        if row["status"] == "active" {
+            tx.put_account_meta(
+                &chat_wire::verified_participant_admission_key(cid, did),
+                "true",
+                ts,
+            )?;
+        } else if row["status"] == "pending" {
+            tx.delete_account_meta(&chat_wire::invitation_closed_key(cid, did))?;
+        }
+    }
+    Ok(())
+}
+
 /// The participant effects of a verified `kind` body on `cid`'s verified roster
 /// ([`chat_wire::apply_roster_effects`]), in the transaction that applies that body's transition,
 /// once per transition. Without a verified roster there is nothing to keep current.
@@ -292,15 +335,36 @@ pub(crate) fn apply_verified_roster_effects(
     body: &Value,
     ts: i64,
 ) -> Result<(), MLSError> {
-    let Some(mut roster) = stored_roster(tx, cid)? else {
+    let key = chat_wire::conversation_roster_key(cid);
+    let acceptance_did = (kind == SignedMutationKind::ParticipantAcceptance)
+        .then(|| body["actorDid"].as_str())
+        .flatten();
+    let Some(stored) = tx.get_account_meta(&key)? else {
         return Ok(());
     };
+    let mut roster: Value = serde_json::from_str(&stored)?;
+    let removed = chat_wire::removed_participants(kind, body);
     chat_wire::apply_roster_effects(&mut roster, kind, body);
-    tx.put_account_meta(
-        &chat_wire::conversation_roster_key(cid),
-        &roster.to_string(),
-        ts,
-    )
+    for (did, row) in roster.as_object().into_iter().flatten() {
+        if row["status"] == "pending" {
+            tx.delete_account_meta(&chat_wire::invitation_closed_key(cid, did))?;
+        }
+    }
+    if let Some(did) = acceptance_did {
+        tx.put_account_meta(
+            &chat_wire::verified_participant_admission_key(cid, did),
+            "true",
+            ts,
+        )?;
+    }
+    for did in removed {
+        tx.delete_account_meta(&chat_wire::verified_participant_admission_key(cid, &did))?;
+    }
+    let updated = roster.to_string();
+    if updated != stored {
+        tx.put_account_meta(&key, &updated, ts)?;
+    }
+    Ok(())
 }
 
 impl WasmMlsClient {
@@ -724,10 +788,14 @@ impl WasmMlsClient {
         did: &str,
         persist: bool,
     ) -> Result<Vec<(String, Vec<u8>)>, MLSError> {
-        let pds_endpoint = self
-            .resolve_did_document(session_token, did)
-            .await?
-            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(&doc))
+        let resolved_doc = self.resolve_did_document(session_token, did).await?;
+        let atproto_key = resolved_doc
+            .as_deref()
+            .and_then(|doc| atproto_spaces::did_resolver::DidDocument::parse_json(did, doc).ok())
+            .and_then(|doc| doc.atproto_key);
+        let pds_endpoint = resolved_doc
+            .as_deref()
+            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(doc, did))
             .unwrap_or_else(|| self.pds_base());
         let list_url = format!(
             "{}/xrpc/com.atproto.repo.listRecords?repo={}&collection=blue.catbird.chat.device&limit=100",
@@ -755,6 +823,86 @@ impl WasmMlsClient {
             return Err(MLSError::insufficient_permissions(format!(
                 "I4: zero valid blue.catbird.chat.device records on PDS for `{did}`"
             )));
+        }
+        if let Some(ref atproto_key) = atproto_key {
+            let parsed_list: Value = serde_json::from_slice(&body).map_err(|e| {
+                MLSError::Cryptography(format!("I4 listRecords JSON parse failed for `{did}`: {e}"))
+            })?;
+            let records = parsed_list
+                .get("records")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for (device_id, _) in &pairs {
+                let expected_uri = format!("at://{did}/blue.catbird.chat.device/{device_id}");
+                let record_entry = records
+                    .iter()
+                    .find(|entry| entry["uri"].as_str() == Some(expected_uri.as_str()))
+                    .ok_or_else(|| {
+                        MLSError::Cryptography(format!(
+                            "I4 missing canonical record entry for `{expected_uri}`"
+                        ))
+                    })?;
+                let expected_cid = record_entry["cid"]
+                    .as_str()
+                    .filter(|c| !c.is_empty())
+                    .ok_or_else(|| {
+                        MLSError::Cryptography(format!(
+                            "I4 missing record CID for `{expected_uri}`"
+                        ))
+                    })?;
+                let record_val = record_entry.get("value").ok_or_else(|| {
+                    MLSError::Cryptography(format!("I4 missing record value for `{expected_uri}`"))
+                })?;
+                let inline_proof = record_entry.get("proof").and_then(|p| {
+                    p.as_str()
+                        .or_else(|| p.get("$bytes").and_then(Value::as_str))
+                });
+                let car_bytes = if let Some(b64) = inline_proof {
+                    STANDARD.decode(b64).map_err(|e| {
+                        MLSError::Cryptography(format!(
+                            "I4 inline CAR proof base64 decode failed for `{expected_uri}`: {e}"
+                        ))
+                    })?
+                } else {
+                    let proof_url = format!(
+                        "{}/xrpc/com.atproto.sync.getRecord?did={}&collection=blue.catbird.chat.device&rkey={}",
+                        pds_endpoint.trim_end_matches('/'),
+                        chat_wire::urlencode_form_component(did),
+                        chat_wire::urlencode_form_component(device_id),
+                    );
+                    let proof_resp = self.http.get(&proof_url).send().await.map_err(|e| {
+                        MLSError::Cryptography(format!(
+                            "I4 sync.getRecord({expected_uri}) failed: {e}"
+                        ))
+                    })?;
+                    if !proof_resp.status().is_success() {
+                        return Err(MLSError::Cryptography(format!(
+                            "I4 sync.getRecord({expected_uri}) failed with HTTP {}",
+                            proof_resp.status().as_u16()
+                        )));
+                    }
+                    proof_resp
+                        .bytes()
+                        .await
+                        .map_err(|e| MLSError::Internal(e.to_string()))?
+                        .to_vec()
+                };
+                catbird_mls::labyrinth::repo_proof::verify_car_record_json_match(
+                    &car_bytes,
+                    did,
+                    "blue.catbird.chat.device",
+                    device_id,
+                    Some(expected_cid),
+                    record_val,
+                    atproto_key,
+                )
+                .map_err(|e| {
+                    MLSError::Cryptography(format!(
+                        "I4 CARv1 repo proof failed for `{expected_uri}`: {e}"
+                    ))
+                })?;
+            }
         }
         if persist {
             let cached_json = serde_json::to_string(
@@ -800,7 +948,7 @@ impl WasmMlsClient {
             .await
             .ok()
             .flatten()
-            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(&doc))
+            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(&doc, did))
             .unwrap_or_else(|| self.pds_base());
         let get_url = format!(
             "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.declaration&rkey=self",
@@ -1550,16 +1698,22 @@ impl WasmMlsClient {
                 _ => false,
             };
             if !retired {
-                return Ok(applied.saturating_add(
-                    self.fulfill_leaf_recovery(
+                let recovered = self
+                    .fulfill_leaf_recovery(session_token, canonical_dev_id, signer, auth_gen, cid)
+                    .await?;
+                let leaves_fulfilled = self
+                    .fulfill_pending_group_leave_for_conversation(
                         session_token,
                         canonical_dev_id,
                         signer,
                         auth_gen,
                         cid,
                     )
-                    .await?,
-                ));
+                    .await
+                    .unwrap_or(0);
+                return Ok(applied
+                    .saturating_add(recovered)
+                    .saturating_add(leaves_fulfilled));
             }
         }
         if welcome_pending {
@@ -2913,10 +3067,9 @@ impl WasmMlsClient {
                 unread_count: retired.map_or(0, |row| row.unread_count),
                 updated_at_ms: ts,
             })?;
-            let roster_key = chat_wire::conversation_roster_key(cid);
             match &roster {
-                Some(roster) => tx.put_account_meta(&roster_key, &roster.to_string(), ts)?,
-                None => tx.delete_account_meta(&roster_key)?,
+                Some(roster) => store_roster(tx, cid, roster, ts)?,
+                None => clear_roster_baseline(tx, cid)?,
             }
             // The fulfillment answered this device's own request.
             tx.delete_account_meta(&chat_wire::own_leaf_recovery_key(cid))?;
@@ -3074,10 +3227,16 @@ impl WasmMlsClient {
                         );
                         continue;
                     }
+                    let verified_admission = self
+                        .require_db_mls()?
+                        .backend()
+                        .get_account_meta(&chat_wire::verified_participant_admission_key(cid, did))?
+                        .is_some();
                     if !chat_wire::recovery_request_entitled(
                         &authorization,
                         &leaves,
                         roster.as_ref(),
+                        verified_admission,
                         &self.account_did,
                         canonical_dev_id,
                     ) {
@@ -3757,11 +3916,7 @@ impl WasmMlsClient {
                 &successor.to_string(),
                 ts,
             )?;
-            tx.put_account_meta(
-                &chat_wire::conversation_roster_key(cid),
-                &roster.to_string(),
-                ts,
-            )?;
+            store_roster(tx, cid, roster, ts)?;
             tx.delete_account_meta(&chat_wire::leaf_recovery_authorization_key(cid))
         })
     }
@@ -4781,6 +4936,13 @@ impl WasmMlsClient {
                         }
                     }
                     tx.put_account_meta(&format!("conversation_coords:{cid}"), &next, ts)?;
+                    if let Some(did) = body["actorDid"].as_str() {
+                        tx.put_account_meta(
+                            &chat_wire::verified_participant_admission_key(cid, did),
+                            "true",
+                            ts,
+                        )?;
+                    }
                     if let Some(mut c) = tx.get_conversation(cid)? {
                         c.last_seq = c.last_seq.max(entry_seq);
                         c.updated_at_ms = ts;

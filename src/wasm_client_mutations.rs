@@ -18,7 +18,10 @@ use catbird_mls::chat_v2::ids::BareDid;
 use catbird_mls::chat_v2::transcript::direct_request as dr_transcript;
 use catbird_mls::chat_v2::transcript::SignedMutationKind;
 use catbird_mls::client::chat_wire;
-use catbird_mls::client::{normalize_account_did, QueuedLabyrinthArchivePayload};
+use catbird_mls::client::{
+    normalize_account_did, LeaveConversationOutcome, QueuedLabyrinthArchivePayload,
+    UploadedConversationAttachment,
+};
 use catbird_mls::groups::lifecycle::{enforce_admin_removal_policy, MemberRole};
 use catbird_mls::groups::metadata_v1::validate_metadata_snapshot_size;
 use catbird_mls::messaging::receive::{
@@ -36,6 +39,9 @@ use catbird_mls::orchestrator::direct_request_keys::{
     DirectRequestKeyPublication, DirectRequestKeyPublicationInput,
 };
 use catbird_mls::orchestrator::direct_request_shared_crypto::build_request_key_publication;
+use catbird_mls::orchestrator::types::{
+    MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload,
+};
 use catbird_mls::storage::driver_wasm::WasmSqlBackend;
 use catbird_mls::storage::{
     ConversationRow, GroupMetadataRow, KvWriteOverlay, LabyrinthQueueRow, MessageRow,
@@ -43,7 +49,7 @@ use catbird_mls::storage::{
 };
 use catbird_mls::MLSError;
 
-use crate::wasm_client_sync::apply_verified_roster_effects;
+use crate::wasm_client_sync::{apply_verified_roster_effects, store_roster};
 
 use crate::wasm_client::{now_ms, now_secs, WasmMlsClient, CIPHERSUITE};
 
@@ -116,7 +122,7 @@ fn put_group_creation(
     if group_creation_for_conversation(tx, &pending.conversation_id)?.is_some() {
         return Ok(false);
     }
-    let key = group_creation_key(&pending.operation_id);
+    let key = group_creation_key(&pending.journal_id);
     if tx.get_account_meta(&key)?.is_some() {
         return Err(MLSError::InvalidState(
             "group creation operation id already exists".into(),
@@ -128,7 +134,7 @@ fn put_group_creation(
         pending.created_at_ms,
     )?;
     let mut operation_ids = group_creation_operation_ids(tx)?;
-    operation_ids.push(pending.operation_id.clone());
+    operation_ids.push(pending.journal_id.clone());
     operation_ids.sort();
     tx.put_account_meta(
         GROUP_CREATIONS_KEY,
@@ -359,6 +365,8 @@ impl WasmMlsClient {
         let db = self.require_db_mls()?;
         let pub_key = signer.public();
         let key_id = derive_key_id(pub_key);
+        let enrollment_status = db.backend().get_account_meta("enrollment_status")?;
+        let was_pending_approval = enrollment_status.as_deref() == Some("pending_approval");
         if let Some(auth_generation) = db.backend().get_account_meta("auth_generation")? {
             let bound_device = db.backend().get_account_meta("enrolled_device_id")?;
             let bound_key = db.backend().get_account_meta("enrolled_signer_key_id")?;
@@ -375,36 +383,41 @@ impl WasmMlsClient {
             }
             if bound_device.as_deref() == Some(canonical_dev_id)
                 && bound_key.as_deref() == Some(key_id.as_str())
+                && !was_pending_approval
             {
                 return Ok(());
             }
-            let devices = self
-                .ds_signed_get(
-                    session_token,
-                    canonical_dev_id,
-                    "blue.catbird.chat.getOwnDevices",
-                    &[("actorDeviceId", canonical_dev_id), ("limit", "100")],
-                    signer,
-                )
-                .await?;
-            let own = chat_wire::own_active_device(&devices, canonical_dev_id, pub_key)
-                .ok_or_else(|| MLSError::InvalidState("EnrollmentDeviceIdentityMismatch".into()))?;
-            if own
-                .pointer("/device/authGeneration")
-                .or_else(|| own.get("authGeneration"))
-                .and_then(Value::as_i64)
-                != auth_generation.parse::<i64>().ok()
-            {
-                return Err(MLSError::InvalidState(
-                    "EnrollmentDeviceIdentityMismatch".into(),
-                ));
+            if bound_key.is_none() {
+                let devices = self
+                    .ds_signed_get(
+                        session_token,
+                        canonical_dev_id,
+                        "blue.catbird.chat.getOwnDevices",
+                        &[("actorDeviceId", canonical_dev_id), ("limit", "100")],
+                        signer,
+                    )
+                    .await?;
+                let own = own_enrolled_device_entry(&devices, canonical_dev_id, pub_key)
+                    .ok_or_else(|| {
+                        MLSError::InvalidState("EnrollmentDeviceIdentityMismatch".into())
+                    })?;
+                if own
+                    .pointer("/device/authGeneration")
+                    .or_else(|| own.get("authGeneration"))
+                    .and_then(Value::as_i64)
+                    != auth_generation.parse::<i64>().ok()
+                {
+                    return Err(MLSError::InvalidState(
+                        "EnrollmentDeviceIdentityMismatch".into(),
+                    ));
+                }
+                let ts = now_ms();
+                db.write_tx(|tx| {
+                    tx.put_account_meta("enrolled_device_id", canonical_dev_id, ts)?;
+                    tx.put_account_meta("enrolled_signer_key_id", &key_id, ts)
+                })?;
+                return Ok(());
             }
-            let ts = now_ms();
-            db.write_tx(|tx| {
-                tx.put_account_meta("enrolled_device_id", canonical_dev_id, ts)?;
-                tx.put_account_meta("enrolled_signer_key_id", &key_id, ts)
-            })?;
-            return Ok(());
         }
 
         let now_s = now_secs();
@@ -510,7 +523,7 @@ impl WasmMlsClient {
                         signer,
                     )
                     .await?;
-                let own = chat_wire::own_active_device(&devices, canonical_dev_id, pub_key)
+                let own = own_enrolled_device_entry(&devices, canonical_dev_id, pub_key)
                     .cloned()
                     .ok_or_else(|| {
                         MLSError::InvalidState(format!(
@@ -522,18 +535,19 @@ impl WasmMlsClient {
             }
             Err(e) => return Err(e),
         };
-        let auth_gen = enroll_resp
-            .get("device")
-            .and_then(|d| d.get("authGeneration"))
-            .and_then(|g| g.as_i64())
-            .or_else(|| enroll_resp.get("authGeneration").and_then(|g| g.as_i64()))
+        let dev_view = enroll_resp.get("device").unwrap_or(&enroll_resp);
+        let status_str = dev_view["status"].as_str().unwrap_or("");
+        let auth_gen = dev_view
+            .get("authGeneration")
+            .and_then(Value::as_i64)
+            .or_else(|| enroll_resp.get("authGeneration").and_then(Value::as_i64))
             .filter(|g| *g >= 1)
             .ok_or_else(|| {
                 MLSError::Internal("enrollDevice response missing valid authGeneration >= 1".into())
             })?;
         // The key-mismatch check precedes every PDS write: a fresh answer or an adopted
         // enrollment naming another device or key leaves both PDS records untouched.
-        if chat_wire::own_active_device(
+        if own_enrolled_device_entry(
             &json!({ "items": [&enroll_resp] }),
             canonical_dev_id,
             pub_key,
@@ -544,6 +558,7 @@ impl WasmMlsClient {
                 "EnrollmentDeviceIdentityMismatch".into(),
             ));
         }
+        let is_pending_approval = status_str == "pending_approval";
 
         let dev_rec = chat_wire::build_pds_device_put_record_body(
             &self.account_did,
@@ -575,7 +590,13 @@ impl WasmMlsClient {
         }
 
         let ts = now_ms();
-        if !request_keys_published {
+        // Real `mls-ds` rejects `publishDirectRequestKeys` (400 PreparationConflict) and
+        // `replenishKeyPackages` (403 NotAuthorized) while a 2nd+ device is `pending_approval`.
+        // Re-running `enrollDevice` after approval hits `DeviceAlreadyExists` ->
+        // `own_enrolled_device_entry`, sees `directRequestKeyPool.is_none()` and
+        // `is_pending_approval == false`, publishes request keys, clears `enrollment_status`,
+        // and replenishes KeyPackages.
+        if !request_keys_published && !is_pending_approval {
             let dr_exact_request = db.write_tx(|tx| {
                 let provider =
                     OpenMlsKvProvider::new(catbird_mls::storage::OpenMlsKvStorage::new(tx))?;
@@ -610,13 +631,148 @@ impl WasmMlsClient {
         db.write_tx(|tx| {
             tx.put_account_meta("auth_generation", &auth_gen.to_string(), ts)?;
             tx.put_account_meta("enrolled_device_id", canonical_dev_id, ts)?;
+            if is_pending_approval {
+                tx.put_account_meta("enrollment_status", "pending_approval", ts)?;
+            } else if was_pending_approval {
+                tx.delete_account_meta("enrollment_status")?;
+            }
             tx.put_account_meta("enrolled_signer_key_id", &key_id, ts)
         })?;
-        let _ = self.replenish_key_packages_impl(4).await?;
+        if !is_pending_approval {
+            let _ = self.replenish_key_packages_impl(4).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_device_pending_approval_impl(&self) -> Result<bool, MLSError> {
+        Ok(self
+            .require_db_mls()?
+            .backend()
+            .get_account_meta("enrollment_status")?
+            .as_deref()
+            == Some("pending_approval"))
+    }
+
+    pub(crate) async fn approve_device_impl(&self, target_device_id: &str) -> Result<(), MLSError> {
+        let target_uuid = uuid_v4(target_device_id, "targetDeviceId")?;
+        let canonical_target = target_uuid.hyphenated().to_string();
+        let (session_token, actor_dev_id) = self.require_live_session()?;
+        if canonical_target == actor_dev_id {
+            return Err(MLSError::invalid_input(
+                "cannot self-approve the current device",
+            ));
+        }
+        let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
+        let own_devices = self
+            .ds_signed_get(
+                &session_token,
+                &actor_dev_id,
+                "blue.catbird.chat.getOwnDevices",
+                &[("actorDeviceId", &actor_dev_id), ("limit", "100")],
+                &signer,
+            )
+            .await?;
+        let items = own_devices
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| MLSError::Internal("getOwnDevices missing items array".into()))?;
+        let target_item = items
+            .iter()
+            .find(|item| {
+                item.pointer("/device/deviceId")
+                    .or_else(|| item.get("deviceId"))
+                    .and_then(Value::as_str)
+                    == Some(canonical_target.as_str())
+            })
+            .ok_or_else(|| {
+                MLSError::InvalidState(format!(
+                    "target device {canonical_target} not found in getOwnDevices"
+                ))
+            })?;
+        let dev_view = target_item.get("device").unwrap_or(target_item);
+        let ds_pub_key = chat_wire::json_bytes(&dev_view["signaturePublicKey"])?;
+        let target_auth_gen = dev_view["authGeneration"]
+            .as_i64()
+            .filter(|g| *g >= 1)
+            .ok_or_else(|| {
+                MLSError::Cryptography("target device missing valid authGeneration".into())
+            })?;
+        let authorized_pds = self
+            .verify_peer_device_keys_via_pds(&session_token, &self.account_did)
+            .await?;
+        let pds_match = authorized_pds
+            .iter()
+            .find(|(dev_id, _)| dev_id == &canonical_target)
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!(
+                    "target device {canonical_target} missing verified PDS blue.catbird.chat.device record"
+                ))
+            })?;
+        if pds_match.1 != ds_pub_key {
+            return Err(MLSError::Cryptography(format!(
+                "target device {canonical_target} signaturePublicKey mismatch between mls-ds and PDS"
+            )));
+        }
+        self.approve_device_with_key_impl(&canonical_target, &ds_pub_key, target_auth_gen)
+            .await
+    }
+
+    pub(crate) async fn approve_device_with_key_impl(
+        &self,
+        target_device_id: &str,
+        target_signature_public_key: &[u8],
+        target_auth_generation: i64,
+    ) -> Result<(), MLSError> {
+        let target_uuid = uuid_v4(target_device_id, "targetDeviceId")?;
+        let canonical_target = target_uuid.hyphenated().to_string();
+        if target_signature_public_key.len() != 32 {
+            return Err(MLSError::invalid_input(
+                "targetSignaturePublicKey must be a 32-byte Ed25519 key",
+            ));
+        }
+        if target_auth_generation < 1 {
+            return Err(MLSError::invalid_input("targetAuthGeneration must be >= 1"));
+        }
+        let (session_token, actor_dev_id) = self.require_live_session()?;
+        if canonical_target == actor_dev_id {
+            return Err(MLSError::invalid_input(
+                "cannot self-approve the current device",
+            ));
+        }
+        let (signer, actor_auth_gen) = self.load_enrolled_signer_and_auth_gen()?;
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#deviceApprovalBody",
+            "signatureDomain": "CATBIRD-CHAT-DEVICE-APPROVE\0",
+            "actorDid": self.account_did,
+            "actorDeviceId": actor_dev_id,
+            "authGeneration": actor_auth_gen,
+            "keyId": derive_key_id(signer.public()),
+            "targetDeviceId": canonical_target,
+            "targetKeyId": derive_key_id(target_signature_public_key),
+            "targetAuthGeneration": target_auth_generation,
+            "targetSignaturePublicKey": { "$bytes": STANDARD.encode(target_signature_public_key) },
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "signedAt": chat_wire::now_rfc3339_millis(),
+        });
+        let _ = self
+            .submit_signed_chat_op(
+                &session_token,
+                &actor_dev_id,
+                Some(actor_auth_gen),
+                CanonicalOperation::ApproveDevice,
+                &body,
+                &signer,
+            )
+            .await?;
         Ok(())
     }
 
     pub(crate) async fn replenish_key_packages_impl(&self, count: u32) -> Result<u32, MLSError> {
+        if self.is_device_pending_approval_impl()? {
+            return Err(MLSError::PendingDeviceAccess {
+                reason: "DevicePendingApproval".into(),
+            });
+        }
         let clamped = count.clamp(1, 32);
         let now_s = now_secs();
         let device_str = self
@@ -982,22 +1138,31 @@ impl WasmMlsClient {
         )?;
         let request = prepared.body.unwrap_or_default();
         let request_value: Value = serde_json::from_slice(&request)?;
-        let request_body = &request_value["signedRequest"]["body"];
+        let signed_at = request_value["signedRequest"]["body"]["signedAt"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let pending = chat_wire::PendingGroupCreation {
             version: chat_wire::GROUP_CREATION_JOURNAL_VERSION,
             conversation_id: canonical_convo_id.to_string(),
-            operation_id: transition_id,
+            journal_id: transition_id.clone(),
             sequencer_did: sequencer_did.to_string(),
             group_id: group_id_bytes,
             signer_public_key: signer.public().to_vec(),
-            request,
-            next: request_body["next"].clone(),
-            metadata_snapshot: request_body["metadataSnapshot"].clone(),
+            attempts: vec![chat_wire::PendingGroupCreationAttempt {
+                operation_id: transition_id,
+                signed_at,
+                request,
+                expired_confirmed: false,
+            }],
             kv_batch,
             title,
             description,
             new_signer_json: None,
             created_at_ms: ts,
+            retry_at_ms: 0,
+            retry_count: 0,
+            retry_code: None,
         };
         db.write_tx(|tx| put_group_creation(tx, &pending).map(|_| ()))?;
         self.resume_pending_group_creation(session_token, canonical_convo_id)
@@ -1012,24 +1177,27 @@ impl WasmMlsClient {
         conversation_id: &str,
     ) -> Result<Option<ConversationRow>, MLSError> {
         let db = self.require_db_mls()?;
-        let Some((operation_id, raw)) =
+        let Some((journal_id, raw)) =
             group_creation_for_conversation(db.backend(), conversation_id)?
         else {
             return Ok(None);
         };
-        let key = group_creation_key(&operation_id);
+        let key = group_creation_key(&journal_id);
         let pending: chat_wire::PendingGroupCreation = serde_json::from_str(&raw)
             .map_err(|e| MLSError::Internal(format!("parse group creation journal: {e}")))?;
         if pending.version != chat_wire::GROUP_CREATION_JOURNAL_VERSION
             || pending.conversation_id != conversation_id
-            || pending.operation_id != operation_id
+            || pending.journal_id != journal_id
         {
             return Err(MLSError::InvalidState(
                 "unsupported or mismatched group creation journal".into(),
             ));
         }
+        let attempt = pending.attempts.last().ok_or_else(|| {
+            MLSError::InvalidState("group creation journal has no attempts".into())
+        })?;
 
-        let submitted: Value = serde_json::from_slice(&pending.request)
+        let submitted: Value = serde_json::from_slice(&attempt.request)
             .map_err(|e| MLSError::Internal(format!("parse group creation request: {e}")))?;
         let (verified_body, _) = chat_wire::verify_signed_mutation_body_and_digest(
             &submitted["signedRequest"],
@@ -1037,14 +1205,12 @@ impl WasmMlsClient {
             &pending.signer_public_key,
         )?;
         let signed_next = chat_wire::canonicalize_wire_coordinate(&verified_body["next"], None)?;
-        let journaled_next = chat_wire::canonicalize_wire_coordinate(&pending.next, None)?;
         if verified_body["conversationId"] != pending.conversation_id
-            || verified_body["transitionId"] != pending.operation_id
-            || verified_body["idempotencyKey"] != pending.operation_id
+            || verified_body["transitionId"] != attempt.operation_id
+            || verified_body["idempotencyKey"] != attempt.operation_id
+            || verified_body["signedAt"] != attempt.signed_at
             || verified_body["actorDid"] != self.account_did
-            || verified_body["metadataSnapshot"] != pending.metadata_snapshot
             || chat_wire::json_bytes(&signed_next["groupId"])? != pending.group_id
-            || signed_next != journaled_next
         {
             return Err(MLSError::Cryptography(
                 "group creation journal does not match its signed request".into(),
@@ -1056,7 +1222,7 @@ impl WasmMlsClient {
                 session_token,
                 CanonicalOperation::CreateConversation,
                 "blue.catbird.chat.createConversation",
-                pending.request.clone(),
+                attempt.request.clone(),
                 &pending.signer_public_key,
                 Some(&pending.sequencer_did),
             )
@@ -1067,7 +1233,7 @@ impl WasmMlsClient {
                 if is_terminal_refusal(&error) {
                     db.write_tx(|tx| {
                         if tx.get_account_meta(&key)?.as_deref() == Some(raw.as_str()) {
-                            remove_group_creation_operation(tx, &operation_id)?;
+                            remove_group_creation_operation(tx, &journal_id)?;
                         }
                         Ok(())
                     })?;
@@ -1086,10 +1252,10 @@ impl WasmMlsClient {
 
         let roster =
             chat_wire::roster_from_participants(&verified_body["manifest"]["participants"])?;
-        let generation = pending.next["generation"].as_i64().unwrap_or_default();
-        let epoch = pending.next["epoch"].as_i64().unwrap_or_default();
-        let coords = serde_json::to_string(&pending.next)?;
-        let snapshot = serde_json::to_string(&pending.metadata_snapshot)?;
+        let generation = signed_next["generation"].as_i64().unwrap_or_default();
+        let epoch = signed_next["epoch"].as_i64().unwrap_or_default();
+        let coords = serde_json::to_string(&signed_next)?;
+        let snapshot = serde_json::to_string(&verified_body["metadataSnapshot"])?;
         let title_str = pending.title.clone().unwrap_or_default();
         let description_str = pending.description.clone().unwrap_or_default();
         let ts = pending.created_at_ms;
@@ -1110,7 +1276,7 @@ impl WasmMlsClient {
             )
             .map_err(|e| MLSError::Internal(format!("load journaled genesis group: {e:?}")))?
             .ok_or_else(|| MLSError::group_not_found(conversation_id))?;
-            chat_wire::require_coordinate_names_group(&pending.next, &group, &provider)?;
+            chat_wire::require_coordinate_names_group(&signed_next, &group, &provider)?;
             if pending.title.is_some() || pending.description.is_some() {
                 let metadata = GroupMetadataV1 {
                     version: 1,
@@ -1154,12 +1320,8 @@ impl WasmMlsClient {
                 &snapshot,
                 ts,
             )?;
-            tx.put_account_meta(
-                &chat_wire::conversation_roster_key(conversation_id),
-                &roster.to_string(),
-                ts,
-            )?;
-            remove_group_creation_operation(tx, &operation_id)?;
+            store_roster(tx, conversation_id, &roster, ts)?;
+            remove_group_creation_operation(tx, &journal_id)?;
             Ok(row)
         })?;
         Ok(Some(conversation))
@@ -1314,10 +1476,82 @@ impl WasmMlsClient {
         message_id: &str,
         text: &str,
     ) -> Result<MessageRow, MLSError> {
+        let (display_json, frame_json) = canonical_labyrinth_frame_for_text(text);
+        self.send_canonical_frame_impl(conversation_id, message_id, display_json, frame_json)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_media_attachment_message_impl(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        text: &str,
+        uploaded: &UploadedConversationAttachment,
+        width: Option<u32>,
+        height: Option<u32>,
+        alt_text: Option<String>,
+        duration_ms: Option<u64>,
+        waveform: Option<Vec<f32>>,
+        transcript: Option<String>,
+    ) -> Result<MessageRow, MLSError> {
+        let _ = uuid_v4(conversation_id, "conversationId")?;
+        let _ = uuid_v4(message_id, "messageId")?;
+        let sha256_hex = hex::encode(&uploaded.ciphertext_sha256);
+        let is_audio = duration_ms.is_some()
+            || waveform.is_some()
+            || transcript.is_some()
+            || uploaded
+                .mime_type
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("audio/");
+        let embed = if is_audio {
+            MLSEmbedData::audio(MLSAudioEmbed {
+                blob_id: uploaded.locator.clone(),
+                key: uploaded.symmetric_key.clone(),
+                iv: uploaded.iv.clone(),
+                sha256: sha256_hex,
+                content_type: uploaded.mime_type.clone(),
+                size: uploaded.ciphertext_size,
+                duration_ms: duration_ms.unwrap_or(1_000),
+                waveform: waveform.unwrap_or_default(),
+                transcript,
+            })
+            .map_err(|e| MLSError::Internal(format!("build MLSAudioEmbed: {e}")))?
+        } else {
+            MLSEmbedData::image(MLSImageEmbed {
+                blob_id: uploaded.locator.clone(),
+                key: uploaded.symmetric_key.clone(),
+                iv: uploaded.iv.clone(),
+                sha256: sha256_hex,
+                content_type: uploaded.mime_type.clone(),
+                size: uploaded.ciphertext_size as usize,
+                width: width.unwrap_or(0),
+                height: height.unwrap_or(0),
+                alt_text,
+                blurhash: None,
+            })
+            .map_err(|e| MLSError::Internal(format!("build MLSImageEmbed: {e}")))?
+        };
+        let payload = MLSMessagePayload::text_with_embed(text, embed);
+        let display_json = serde_json::to_string(&payload)
+            .map_err(|e| MLSError::Internal(format!("serialize media payload: {e}")))?;
+        let frame_json = chat_wire::canonical_labyrinth_frame_json(&display_json);
+        self.send_canonical_frame_impl(conversation_id, message_id, display_json, frame_json)
+            .await
+    }
+
+    pub(crate) async fn send_canonical_frame_impl(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        display_json: String,
+        frame_json: String,
+    ) -> Result<MessageRow, MLSError> {
         let convo_uuid = uuid_v4(conversation_id, "conversationId")?;
         let msg_uuid = uuid_v4(message_id, "messageId")?;
         let (session_token, canonical_dev_id) = self.require_live_session()?;
-        let (display_json, frame_json) = canonical_labyrinth_frame_for_text(text);
         let canonical_msg_id = msg_uuid.hyphenated().to_string();
         let reserve = || {
             self.reserve_application_send(
@@ -2506,6 +2740,843 @@ impl WasmMlsClient {
         }
         Ok(out)
     }
+
+    /// Leave `conversation_id` cleanly (`FC-07`):
+    /// - Re-archives local history into `OwnerMailbox` when Labyrinth is enrolled.
+    /// - Closes `direct` or solo-admin 1-member `group` conversations via `close_conversation_live`.
+    /// - Refuses `LastAdminCannotLeave` when this account is the sole active admin in a multi-member group.
+    /// - Submits `#zeroLeafLeaveBody` (`CATBIRD-CHAT-LEAVE-ZERO-LEAF\0`) when `leaf_count == 0`.
+    /// - Submits `#leaveRequestBody` (`CATBIRD-CHAT-LEAVE-REQUEST\0`) when `leaf_count > 0`.
+    pub(crate) async fn leave_conversation_impl(
+        &self,
+        conversation_id: &str,
+    ) -> Result<LeaveConversationOutcome, MLSError> {
+        let convo_uuid = uuid_v4(conversation_id, "conversationId")?;
+        let canonical_cid = convo_uuid.hyphenated().to_string();
+        let (session_token, canonical_dev_id) = self.require_live_session()?;
+        let (signer, auth_gen) = self.load_enrolled_signer_and_auth_gen()?;
+
+        let rearchived_messages = self
+            .rearchive_conversation_before_leave_impl(&canonical_cid)
+            .await
+            .unwrap_or(0);
+
+        let resp = self
+            .ds_signed_get(
+                &session_token,
+                &canonical_dev_id,
+                "blue.catbird.chat.getConversationState",
+                &[
+                    ("actorDeviceId", &canonical_dev_id),
+                    ("conversationId", &canonical_cid),
+                ],
+                &signer,
+            )
+            .await?;
+        let state = resp.get("state").unwrap_or(&resp);
+        let prior =
+            chat_wire::canonicalize_wire_coordinate(&state["coordinates"], Some(&canonical_cid))?;
+        if prior["lifecycle"].as_str() != Some("active") {
+            self.apply_terminal_close(&canonical_cid, Some(&prior), None)?;
+            return Ok(LeaveConversationOutcome {
+                left_immediately: true,
+                leave_request_id: None,
+                rearchived_messages,
+            });
+        }
+        let kind = state
+            .get("conversationKind")
+            .or_else(|| state.get("kind"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                MLSError::Cryptography("getConversationState missing conversationKind".into())
+            })?;
+        if !matches!(kind, "direct" | "group") {
+            return Err(MLSError::Cryptography(format!(
+                "unsupported conversationKind `{kind}`"
+            )));
+        }
+        let participants = state
+            .get("participants")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                MLSError::Cryptography("getConversationState missing participants".into())
+            })?;
+        let Some(own) = participants
+            .iter()
+            .find(|p| p["userDid"].as_str() == Some(self.account_did.as_str()))
+        else {
+            self.apply_terminal_close(&canonical_cid, None, None)?;
+            return Ok(LeaveConversationOutcome {
+                left_immediately: true,
+                leave_request_id: None,
+                rearchived_messages,
+            });
+        };
+        let active_admin =
+            own["status"].as_str() == Some("active") && own["role"].as_str() == Some("admin");
+        let active_participant_count = participants
+            .iter()
+            .filter(|p| matches!(p["status"].as_str(), Some("active" | "pending")))
+            .count();
+        let close = kind == "direct" || (active_participant_count <= 1 && active_admin);
+        if kind == "group" && !close && active_admin {
+            let another_active_admin = participants.iter().any(|p| {
+                p["userDid"].as_str() != Some(self.account_did.as_str())
+                    && p["status"].as_str() == Some("active")
+                    && p["role"].as_str() == Some("admin")
+            });
+            if !another_active_admin {
+                return Err(MLSError::InvalidState("LastAdminCannotLeave".into()));
+            }
+        }
+
+        if close {
+            // Ensure local coordinates exist when closing a conversation whose state was just fetched.
+            let db = self.require_db_mls()?;
+            if db
+                .backend()
+                .get_account_meta(&format!("conversation_coords:{canonical_cid}"))?
+                .is_none()
+            {
+                let prior_str = serde_json::to_string(&prior)?;
+                db.write_tx(|tx| {
+                    tx.put_account_meta(
+                        &format!("conversation_coords:{canonical_cid}"),
+                        &prior_str,
+                        now_ms(),
+                    )
+                })?;
+            }
+            self.close_conversation_live(&session_token, &canonical_dev_id, &canonical_cid, kind)
+                .await?;
+            return Ok(LeaveConversationOutcome {
+                left_immediately: true,
+                leave_request_id: None,
+                rearchived_messages,
+            });
+        }
+
+        let prior_sv = prior["stateVersion"].as_i64().unwrap_or(0);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let key_id = derive_key_id(signer.public());
+        let leaf_count = own
+            .get("leafCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                state
+                    .get("leaves")
+                    .and_then(Value::as_array)
+                    .map(|leaves| {
+                        leaves
+                            .iter()
+                            .filter(|l| l["userDid"].as_str() == Some(self.account_did.as_str()))
+                            .count() as u64
+                    })
+                    .unwrap_or(0)
+            });
+
+        if leaf_count == 0 {
+            let mut next = prior.clone();
+            next["stateVersion"] = json!(prior_sv + 1);
+            let zero_body = json!({
+                "$type": "blue.catbird.chat.defs#zeroLeafLeaveBody",
+                "signatureDomain": "CATBIRD-CHAT-LEAVE-ZERO-LEAF\0",
+                "transitionId": request_id,
+                "idempotencyKey": request_id,
+                "actorDid": self.account_did,
+                "actorDeviceId": canonical_dev_id,
+                "keyId": key_id,
+                "authGeneration": auth_gen,
+                "prior": prior,
+                "next": next,
+                "signedAt": chat_wire::now_rfc3339_millis(),
+            });
+            let answer = self
+                .submit_signed_chat_op(
+                    &session_token,
+                    &canonical_dev_id,
+                    Some(auth_gen),
+                    CanonicalOperation::RequestLeave,
+                    &zero_body,
+                    &signer,
+                )
+                .await?;
+            let seq = answer
+                .get("result")
+                .unwrap_or(&answer)
+                .pointer("/entry/seq")
+                .and_then(Value::as_i64);
+            self.apply_terminal_close(&canonical_cid, None, seq)?;
+            return Ok(LeaveConversationOutcome {
+                left_immediately: true,
+                leave_request_id: None,
+                rearchived_messages,
+            });
+        }
+
+        if let Some(existing_id) = resp
+            .get("pendingLeaveRequests")
+            .and_then(Value::as_array)
+            .and_then(|reqs| {
+                reqs.iter().find_map(|req| {
+                    let is_mine = req["requesterDid"].as_str() == Some(self.account_did.as_str());
+                    let is_pending = req["status"].as_str() == Some("pending");
+                    let same_coord = chat_wire::canonicalize_wire_coordinate(
+                        &req["prior"],
+                        Some(&canonical_cid),
+                    )
+                    .ok()
+                    .as_ref()
+                        == Some(&prior);
+                    (is_mine && is_pending && same_coord)
+                        .then(|| req["leaveRequestId"].as_str().map(str::to_owned))
+                        .flatten()
+                })
+            })
+        {
+            return Ok(LeaveConversationOutcome {
+                left_immediately: false,
+                leave_request_id: Some(existing_id),
+                rearchived_messages,
+            });
+        }
+
+        let leave_body = json!({
+            "$type": "blue.catbird.chat.defs#leaveRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-LEAVE-REQUEST\0",
+            "leaveRequestId": request_id,
+            "idempotencyKey": request_id,
+            "actorDid": self.account_did,
+            "actorDeviceId": canonical_dev_id,
+            "keyId": key_id,
+            "authGeneration": auth_gen,
+            "prior": prior,
+            "signedAt": chat_wire::now_rfc3339_millis(),
+        });
+        let answer = self
+            .submit_signed_chat_op(
+                &session_token,
+                &canonical_dev_id,
+                Some(auth_gen),
+                CanonicalOperation::RequestLeave,
+                &leave_body,
+                &signer,
+            )
+            .await?;
+        let res = answer.get("result").unwrap_or(&answer);
+        if res
+            .get("$type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t != "blue.catbird.chat.defs#durableLeaveRequestResult")
+        {
+            return Err(MLSError::Cryptography(
+                "unexpected RequestLeave response variant".into(),
+            ));
+        }
+        Ok(LeaveConversationOutcome {
+            left_immediately: false,
+            leave_request_id: Some(request_id),
+            rearchived_messages,
+        })
+    }
+
+    pub(crate) async fn fulfill_pending_group_leaves_impl(&self) -> Result<u32, MLSError> {
+        let (session_token, canonical_dev_id) = self.require_live_session()?;
+        let (signer, auth_gen) = self.load_enrolled_signer_and_auth_gen()?;
+        let convos = self
+            .require_db_mls()?
+            .backend()
+            .list_conversations(None, 200)?;
+        let mut total = 0u32;
+        for convo in convos {
+            if self.is_conversation_closed(&convo.conversation_id)? {
+                continue;
+            }
+            if let Ok(done) = self
+                .fulfill_pending_group_leave_for_conversation(
+                    &session_token,
+                    &canonical_dev_id,
+                    &signer,
+                    auth_gen,
+                    &convo.conversation_id,
+                )
+                .await
+            {
+                total = total.saturating_add(done);
+            }
+        }
+        Ok(total)
+    }
+
+    pub(crate) async fn fulfill_pending_group_leave_for_conversation(
+        &self,
+        session_token: &str,
+        canonical_dev_id: &str,
+        signer: &SignatureKeyPair,
+        auth_gen: i64,
+        conversation_id: &str,
+    ) -> Result<u32, MLSError> {
+        let Ok(convo_uuid) = uuid_v4(conversation_id, "conversationId") else {
+            return Ok(0);
+        };
+        let canonical_cid = convo_uuid.hyphenated().to_string();
+        if self.is_conversation_closed(&canonical_cid)? {
+            return Ok(0);
+        }
+        let resp = match self
+            .ds_signed_get(
+                session_token,
+                canonical_dev_id,
+                "blue.catbird.chat.getConversationState",
+                &[
+                    ("actorDeviceId", canonical_dev_id),
+                    ("conversationId", &canonical_cid),
+                ],
+                signer,
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(_) => return Ok(0),
+        };
+        let Some(requests) = resp
+            .get("pendingLeaveRequests")
+            .and_then(Value::as_array)
+            .filter(|r| !r.is_empty())
+        else {
+            return Ok(0);
+        };
+        let state = resp.get("state").unwrap_or(&resp);
+        if state
+            .get("conversationKind")
+            .or_else(|| state.get("kind"))
+            .and_then(Value::as_str)
+            != Some("group")
+        {
+            return Ok(0);
+        }
+        let prior =
+            chat_wire::canonicalize_wire_coordinate(&state["coordinates"], Some(&canonical_cid))?;
+        if prior["lifecycle"].as_str() != Some("active") {
+            return Ok(0);
+        }
+        let local_coords = self.load_or_build_conversation_coords(&canonical_cid)?;
+        if chat_wire::canonicalize_wire_coordinate(&local_coords, Some(&canonical_cid))? != prior {
+            return Ok(0);
+        }
+        let participants = state
+            .get("participants")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let ts = now_ms();
+        let mut sorted_reqs: Vec<&Value> = requests.iter().collect();
+        sorted_reqs.sort_by_key(|r| r["requestedAt"].as_str());
+        let chosen = sorted_reqs.into_iter().find_map(|req| {
+            if req["status"].as_str() != Some("pending") {
+                return None;
+            }
+            let requester_did = req["requesterDid"].as_str()?;
+            if requester_did == self.account_did {
+                return None;
+            }
+            if let Some(exp_str) = req["expiresAt"].as_str() {
+                if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(exp_str) {
+                    if exp_dt.timestamp_millis() <= ts {
+                        return None;
+                    }
+                }
+            }
+            let req_prior =
+                chat_wire::canonicalize_wire_coordinate(&req["prior"], Some(&canonical_cid))
+                    .ok()?;
+            if req_prior != prior {
+                return None;
+            }
+            let req_p = participants
+                .iter()
+                .find(|p| p["userDid"].as_str() == Some(requester_did))?;
+            if req_p["status"].as_str() != Some("active") {
+                return None;
+            }
+            if req_p["role"].as_str() == Some("admin") {
+                let other_admin = participants.iter().any(|p| {
+                    p["userDid"].as_str() != Some(requester_did)
+                        && p["status"].as_str() == Some("active")
+                        && p["role"].as_str() == Some("admin")
+                });
+                if !other_admin {
+                    return None;
+                }
+            }
+            let leave_request_id = req["leaveRequestId"].as_str()?.to_owned();
+            Some((leave_request_id, requester_did.to_owned()))
+        });
+        let Some((leave_request_id, requester_did)) = chosen else {
+            return Ok(0);
+        };
+
+        let db = self.require_db_mls()?;
+        let Some(convo) = db.backend().get_conversation(&canonical_cid)? else {
+            return Ok(0);
+        };
+        let prior_sv = prior["stateVersion"].as_i64().unwrap_or(0);
+        let prior_epoch = prior["epoch"].as_u64().unwrap_or(0);
+        let prior_gen = prior["generation"].as_i64().unwrap_or(0);
+        let prior_gch = chat_wire::json_bytes(&prior["groupContextHash"])?;
+        let prior_ctag = chat_wire::json_bytes(&prior["confirmationTag"])?;
+        let transition_uuid = uuid::Uuid::new_v4();
+        let transition_id = transition_uuid.to_string();
+
+        let staged = {
+            let backend = db.backend();
+            let meta_row = backend.get_group_metadata(&canonical_cid)?;
+            let overlay = KvWriteOverlay::new(backend);
+            let inner = {
+                let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
+                let Some(mut group) =
+                    MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                        .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+                else {
+                    return Ok(0);
+                };
+                let own_scoped = format!("{}#{canonical_dev_id}", self.account_did);
+                if !group.members().any(|m| {
+                    std::str::from_utf8(m.credential.serialized_content())
+                        == Ok(own_scoped.as_str())
+                }) {
+                    return Ok(0);
+                }
+                let prefix = format!("{requester_did}#");
+                let mut target_leaves = Vec::new();
+                let mut removed_leaves = Vec::new();
+                for m in group.members() {
+                    if let Ok(id_str) = std::str::from_utf8(m.credential.serialized_content()) {
+                        if let Some(dev_part) = id_str.strip_prefix(&prefix) {
+                            target_leaves.push(m.index);
+                            removed_leaves.push(json!({
+                                "$type": "blue.catbird.chat.defs#removeLeaf",
+                                "userDid": requester_did,
+                                "deviceId": dev_part,
+                            }));
+                        }
+                    }
+                }
+                if target_leaves.is_empty() {
+                    return Ok(0);
+                }
+                let aad_prior = chat_wire::build_aad_prior_coordinate(
+                    &convo_uuid,
+                    &convo.group_id,
+                    prior_gen,
+                    prior_sv,
+                    prior_epoch as i64,
+                    &prior_gch,
+                    &prior_ctag,
+                );
+                let commit_aad_val = json!({
+                    "protocolVersion": "1",
+                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+                    "generation": prior_gen,
+                    "transitionId": STANDARD.encode(transition_uuid.as_bytes()),
+                    "prior": aad_prior,
+                });
+                let commit_aad_bytes = canonical_commit_aad_bytes(&commit_aad_val)
+                    .map_err(|e| MLSError::Cryptography(format!("commit AAD: {e}")))?;
+                group.set_aad(commit_aad_bytes);
+                let (commit_msg, _, _) = group
+                    .remove_members(&provider, signer, &target_leaves)
+                    .map_err(|e| MLSError::Cryptography(format!("remove_members: {e:?}")))?;
+                group
+                    .merge_pending_commit(&provider)
+                    .map_err(|e| MLSError::Cryptography(format!("merge_pending_commit: {e:?}")))?;
+                group.set_aad(Vec::new());
+                let commit_bytes = commit_msg
+                    .tls_serialize_detached()
+                    .map_err(|e| MLSError::Internal(format!("serialize commit: {e:?}")))?;
+                let next_epoch = group.epoch().as_u64();
+                let (next_gch, next_ctag) =
+                    chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+                let meta_ver = meta_row
+                    .as_ref()
+                    .map(|m| m.metadata_version.max(1) as u64)
+                    .unwrap_or(1);
+                let title_s = meta_row
+                    .as_ref()
+                    .and_then(|m| m.title.clone())
+                    .unwrap_or_default();
+                let desc_s = meta_row
+                    .as_ref()
+                    .and_then(|m| m.description.clone())
+                    .unwrap_or_default();
+                let avatar_opt = meta_row
+                    .as_ref()
+                    .and_then(chat_wire::space_avatar_from_metadata_row);
+                let meta_key = derive_metadata_key_from_group(
+                    &mut group,
+                    provider.crypto(),
+                    provider.storage(),
+                    &convo.group_id,
+                    next_epoch,
+                )
+                .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
+                let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json(
+                    &meta_key,
+                    &convo.group_id,
+                    &convo_uuid,
+                    prior_gen,
+                    next_epoch,
+                    &next_gch,
+                    &next_ctag,
+                    &transition_id,
+                    meta_ver,
+                    1,
+                    &self.account_did,
+                    canonical_dev_id,
+                    auth_gen,
+                    signer.public(),
+                    &title_s,
+                    &desc_s,
+                    avatar_opt,
+                )?;
+                (
+                    commit_aad_val,
+                    commit_bytes,
+                    removed_leaves,
+                    next_epoch,
+                    next_gch,
+                    next_ctag,
+                    carried_snap,
+                )
+            };
+            (inner, overlay.into_batch())
+        };
+        let (
+            (
+                commit_aad_val,
+                commit_bytes,
+                removed_leaves,
+                next_epoch,
+                next_gch,
+                next_ctag,
+                carried_snap,
+            ),
+            kv_batch,
+        ) = staged;
+        let next_coords = json!({
+            "conversationId": canonical_cid,
+            "generation": prior_gen,
+            "stateVersion": prior_sv + 1,
+            "groupId": { "$bytes": STANDARD.encode(&convo.group_id) },
+            "epoch": next_epoch,
+            "groupContextHash": { "$bytes": STANDARD.encode(next_gch) },
+            "confirmationTag": { "$bytes": STANDARD.encode(&next_ctag) },
+            "lifecycle": "active",
+        });
+        let commit_sha256: [u8; 32] = Sha256::digest(&commit_bytes).into();
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#leaveCommitFulfillmentBody",
+            "signatureDomain": "CATBIRD-CHAT-LEAVE-FULFILL-COMMIT\0",
+            "transitionId": transition_id,
+            "idempotencyKey": transition_id,
+            "leaveRequestId": leave_request_id,
+            "actorDid": self.account_did,
+            "actorDeviceId": canonical_dev_id,
+            "keyId": derive_key_id(signer.public()),
+            "authGeneration": auth_gen,
+            "signedAt": chat_wire::now_rfc3339_millis(),
+            "prior": prior,
+            "next": next_coords,
+            "aad": commit_aad_val,
+            "manifest": {
+                "participantChanges": [{
+                    "$type": "blue.catbird.chat.defs#removeParticipant",
+                    "userDid": requester_did,
+                }],
+                "leafChanges": removed_leaves,
+            },
+            "commit": {
+                "framing": "mlsMessage",
+                "contentType": "publicMessageCommit",
+                "bytes": { "$bytes": STANDARD.encode(&commit_bytes) },
+                "sha256": STANDARD.encode(commit_sha256),
+            },
+            "metadataSnapshot": carried_snap,
+        });
+        let pending = chat_wire::PendingCommitTransition {
+            conversation_id: canonical_cid,
+            transition_id,
+            commit_sha256,
+            prior,
+            next: next_coords,
+            kv_batch,
+            removed_participant_did: Some(requester_did),
+        };
+        let applied = self
+            .submit_own_commit(
+                session_token,
+                canonical_dev_id,
+                auth_gen,
+                signer,
+                &body,
+                pending,
+            )
+            .await?;
+        Ok(u32::from(applied))
+    }
+
+    /// Remove a specific revoked own-account device leaf (`{account_did}#{target_device_id}`) from
+    /// every active local MLS group without removing the account participant.
+    pub(crate) async fn remove_specific_device_from_active_groups_impl(
+        &self,
+        target_device_id: &str,
+    ) -> Result<u32, MLSError> {
+        let (session_token, canonical_dev_id) = self.require_live_session()?;
+        let (signer, auth_gen) = self.load_enrolled_signer_and_auth_gen()?;
+        let target_scoped = format!("{}#{target_device_id}", self.account_did);
+        let convos = self
+            .require_db_mls()?
+            .backend()
+            .list_conversations(None, 200)?;
+        let mut updated = 0u32;
+        for convo in convos {
+            let cid = &convo.conversation_id;
+            if self.is_conversation_closed(cid)? {
+                continue;
+            }
+            let Ok(convo_uuid) = uuid_v4(cid, "conversationId") else {
+                continue;
+            };
+            let Ok(prior) = self.load_or_build_conversation_coords(cid) else {
+                continue;
+            };
+            let prior_sv = prior["stateVersion"].as_i64().unwrap_or(0);
+            let prior_epoch = prior["epoch"].as_u64().unwrap_or(0);
+            let prior_gen = prior["generation"].as_i64().unwrap_or(0);
+            let (Ok(prior_gch), Ok(prior_ctag)) = (
+                chat_wire::json_bytes(&prior["groupContextHash"]),
+                chat_wire::json_bytes(&prior["confirmationTag"]),
+            ) else {
+                continue;
+            };
+            let transition_uuid = uuid::Uuid::new_v4();
+            let transition_id = transition_uuid.to_string();
+            let db = self.require_db_mls()?;
+            let staged_opt = {
+                let backend = db.backend();
+                let meta_row = backend.get_group_metadata(cid)?;
+                let overlay = KvWriteOverlay::new(backend);
+                let inner_opt = {
+                    let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
+                    let Some(mut group) =
+                        MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                            .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+                    else {
+                        continue;
+                    };
+                    let mut target_leaves = Vec::new();
+                    let mut removed_leaves = Vec::new();
+                    for m in group.members() {
+                        if std::str::from_utf8(m.credential.serialized_content())
+                            == Ok(target_scoped.as_str())
+                        {
+                            target_leaves.push(m.index);
+                            removed_leaves.push(json!({
+                                "$type": "blue.catbird.chat.defs#removeLeaf",
+                                "userDid": self.account_did,
+                                "deviceId": target_device_id,
+                            }));
+                        }
+                    }
+                    if target_leaves.is_empty() {
+                        None
+                    } else {
+                        let aad_prior = chat_wire::build_aad_prior_coordinate(
+                            &convo_uuid,
+                            &convo.group_id,
+                            prior_gen,
+                            prior_sv,
+                            prior_epoch as i64,
+                            &prior_gch,
+                            &prior_ctag,
+                        );
+                        let commit_aad_val = json!({
+                            "protocolVersion": "1",
+                            "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+                            "generation": prior_gen,
+                            "transitionId": STANDARD.encode(transition_uuid.as_bytes()),
+                            "prior": aad_prior,
+                        });
+                        let commit_aad_bytes = canonical_commit_aad_bytes(&commit_aad_val)
+                            .map_err(|e| MLSError::Cryptography(format!("commit AAD: {e}")))?;
+                        group.set_aad(commit_aad_bytes);
+                        let (commit_msg, _, _) = group
+                            .remove_members(&provider, &signer, &target_leaves)
+                            .map_err(|e| {
+                                MLSError::Cryptography(format!("remove_members: {e:?}"))
+                            })?;
+                        group
+                            .merge_pending_commit(&provider)
+                            .map_err(|e| MLSError::Cryptography(format!("merge_commit: {e:?}")))?;
+                        group.set_aad(Vec::new());
+                        let commit_bytes = commit_msg
+                            .tls_serialize_detached()
+                            .map_err(|e| MLSError::Internal(format!("serialize commit: {e:?}")))?;
+                        let next_epoch = group.epoch().as_u64();
+                        let (next_gch, next_ctag) =
+                            chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+                        let meta_ver = meta_row
+                            .as_ref()
+                            .map(|m| m.metadata_version.max(1) as u64)
+                            .unwrap_or(1);
+                        let title_s = meta_row
+                            .as_ref()
+                            .and_then(|m| m.title.clone())
+                            .unwrap_or_default();
+                        let desc_s = meta_row
+                            .as_ref()
+                            .and_then(|m| m.description.clone())
+                            .unwrap_or_default();
+                        let avatar_opt = meta_row
+                            .as_ref()
+                            .and_then(chat_wire::space_avatar_from_metadata_row);
+                        let meta_key = derive_metadata_key_from_group(
+                            &mut group,
+                            provider.crypto(),
+                            provider.storage(),
+                            &convo.group_id,
+                            next_epoch,
+                        )
+                        .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
+                        let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json(
+                            &meta_key,
+                            &convo.group_id,
+                            &convo_uuid,
+                            prior_gen,
+                            next_epoch,
+                            &next_gch,
+                            &next_ctag,
+                            &transition_id,
+                            meta_ver,
+                            1,
+                            &self.account_did,
+                            &canonical_dev_id,
+                            auth_gen,
+                            signer.public(),
+                            &title_s,
+                            &desc_s,
+                            avatar_opt,
+                        )?;
+                        Some((
+                            commit_aad_val,
+                            commit_bytes,
+                            removed_leaves,
+                            next_epoch,
+                            next_gch,
+                            next_ctag,
+                            carried_snap,
+                        ))
+                    }
+                };
+                inner_opt.map(|inner| (inner, overlay.into_batch()))
+            };
+            let Some((
+                (
+                    commit_aad_val,
+                    commit_bytes,
+                    removed_leaves,
+                    next_epoch,
+                    next_gch,
+                    next_ctag,
+                    carried_snap,
+                ),
+                kv_batch,
+            )) = staged_opt
+            else {
+                continue;
+            };
+            let next_coords = json!({
+                "conversationId": cid,
+                "generation": prior_gen,
+                "stateVersion": prior_sv + 1,
+                "groupId": { "$bytes": STANDARD.encode(&convo.group_id) },
+                "epoch": next_epoch,
+                "groupContextHash": { "$bytes": STANDARD.encode(next_gch) },
+                "confirmationTag": { "$bytes": STANDARD.encode(&next_ctag) },
+                "lifecycle": "active",
+            });
+            let commit_sha256: [u8; 32] = Sha256::digest(&commit_bytes).into();
+            let body = json!({
+                "$type": "blue.catbird.chat.defs#commitTransitionBody",
+                "signatureDomain": "CATBIRD-CHAT-COMMIT\0",
+                "transitionId": transition_id,
+                "idempotencyKey": transition_id,
+                "actorDid": self.account_did,
+                "actorDeviceId": canonical_dev_id,
+                "keyId": derive_key_id(signer.public()),
+                "authGeneration": auth_gen,
+                "signedAt": chat_wire::now_rfc3339_millis(),
+                "prior": prior,
+                "next": next_coords,
+                "aad": commit_aad_val,
+                "manifest": {
+                    "participantChanges": [],
+                    "leafChanges": removed_leaves,
+                },
+                "commit": {
+                    "framing": "mlsMessage",
+                    "contentType": "publicMessageCommit",
+                    "bytes": { "$bytes": STANDARD.encode(&commit_bytes) },
+                    "sha256": STANDARD.encode(commit_sha256),
+                },
+                "metadataSnapshot": carried_snap,
+            });
+            let pending = chat_wire::PendingCommitTransition {
+                conversation_id: cid.clone(),
+                transition_id,
+                commit_sha256,
+                prior,
+                next: next_coords,
+                kv_batch,
+                removed_participant_did: None,
+            };
+            if self
+                .submit_own_commit(
+                    &session_token,
+                    &canonical_dev_id,
+                    auth_gen,
+                    &signer,
+                    &body,
+                    pending,
+                )
+                .await
+                .is_ok()
+            {
+                updated = updated.saturating_add(1);
+            }
+        }
+        Ok(updated)
+    }
+}
+
+/// Match an own-device entry (`status == "active"` or `"pending_approval"`) under `(device_id, pub_key)`,
+/// mirroring `chat_wire::own_active_device` widened for Wave-2 `pending_approval` devices.
+fn own_enrolled_device_entry<'a>(
+    devices: &'a Value,
+    canonical_device_id: &str,
+    pub_key: &[u8],
+) -> Option<&'a Value> {
+    devices["items"].as_array()?.iter().find(|item| {
+        let dev = item.get("device").unwrap_or(item);
+        let status = dev["status"].as_str().unwrap_or("");
+        dev["deviceId"].as_str() == Some(canonical_device_id)
+            && chat_wire::json_bytes(&dev["signaturePublicKey"])
+                .ok()
+                .as_deref()
+                == Some(pub_key)
+            && matches!(status, "active" | "pending_approval")
+    })
 }
 
 /// Root DIDs of `group`'s members (credential `did#device`), sorted and unique: the send- or

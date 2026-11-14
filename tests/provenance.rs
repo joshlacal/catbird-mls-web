@@ -77,6 +77,7 @@ fn vendored_artifacts_match_sealed_input_manifest() {
         let pinned = std::process::Command::new("jj")
             .current_dir(crate_root().join("../catbird-mls"))
             .args([
+                "--ignore-working-copy",
                 "file",
                 "show",
                 "-r",
@@ -113,13 +114,13 @@ fn vendored_fixture_corpus_matches_approved_counts() {
     .expect("signing-domain vectors are valid JSON");
     assert_eq!(
         signing["cases"].as_array().expect("cases").len(),
-        10,
-        "signing-domain corpus must match the sealed 10-case input"
+        11,
+        "signing-domain corpus must match the sealed 11-case input"
     );
     assert_eq!(
         signing["_catbird_mls_provenance"]["vectorSetCount"].as_u64(),
-        Some(24),
-        "signing-domain corpus must belong to the sealed 24-case vector set"
+        Some(25),
+        "signing-domain corpus must belong to the sealed 25-case vector set"
     );
 
     let contract: serde_json::Value = serde_json::from_slice(&read_bytes(&vendored(

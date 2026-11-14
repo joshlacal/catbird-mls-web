@@ -1444,13 +1444,15 @@ async fn existing_members_new_device_is_added_from_its_signed_request() {
     }
 }
 
-/// A `replace` re-adds exactly the requester device's current leaf, and only from another
-/// account. Bob's second device (outside any client) joins from its signed add; then it signs a
-/// replace. Bob's client, of the requester's own account, leaves it alone. Alice fulfills it with
-/// one Commit that removes exactly that leaf and adds its new KeyPackage (`removeLeaf`, then
-/// `addLeafByRecovery`): every identity stays and, besides the committer's own, only that leaf is
-/// new. Bob's client processes the Commit to Alice's leaves, and the device rejoins from its
-/// Welcome holding them.
+/// A `replace` re-adds exactly the requester device's current leaf from another leaf-holding
+/// device (either another account or an active sibling device `device != own_device`), while a
+/// device never fulfills its own `replace`. Bob's second device (outside any client) joins from
+/// its signed add; then it signs a replace. Alice fulfills it with one Commit that removes
+/// exactly that leaf and adds its new KeyPackage (`removeLeaf`, then `addLeafByRecovery`): every
+/// identity stays and, besides the committer's own, only that leaf is new. Bob's client processes
+/// the Commit to Alice's leaves, and `bob2` rejoins from its Welcome. A subsequent `bob2` replace
+/// is likewise fulfilled by Bob's sibling client (`BOB_DEVICE != BOB2_DEVICE`), whereas a
+/// self-replace signed by `BOB_DEVICE` itself is left unfulfilled by `bob.sync()`.
 ///
 /// Fail-before (web `7be78145`): setup fails, Bob never joins: `fulfill_leaf_recovery_inbox`
 /// (`wasm_client_sync.rs`) fulfilled only what `getLeafRecoveryInbox` listed and only as an Add,
@@ -1460,7 +1462,7 @@ async fn signed_replace_readds_the_exact_leaf() {
     let _restore = install_ds();
     let cid = "00000000-0000-4000-8000-00000000f003";
     let (mut alice, mut bob) = group_with(&did("replacealice"), &did("replacebob"), cid).await;
-    let bob2 = Device::new(&bob.did, BOB2_DEVICE);
+    let mut bob2 = Device::new(&bob.did, BOB2_DEVICE);
     bob2.request_recovery(cid, "add");
     alice.sync().await.expect("alice adds bob's second device");
     bob.sync().await.expect("bob applies the add");
@@ -1470,19 +1472,6 @@ async fn signed_replace_readds_the_exact_leaf() {
         (&request["status"], &request["recoveryKind"]),
         (&json!("open"), &json!("replace")),
         "{request}"
-    );
-    let entries = serde_json::from_str::<Vec<Value>>(&entriesJson(cid))
-        .unwrap()
-        .len();
-    bob.sync()
-        .await
-        .expect("a replace of its own account is no work");
-    assert!(fulfillments(BOB_DEVICE).is_empty());
-    assert_eq!(
-        serde_json::from_str::<Vec<Value>>(&entriesJson(cid))
-            .unwrap()
-            .len(),
-        entries
     );
 
     let before = alice.read(|db| leaves(db, cid)).await;
@@ -1522,6 +1511,68 @@ async fn signed_replace_readds_the_exact_leaf() {
         .collect();
     rejoined.sort();
     assert_eq!(rejoined, identities(&after));
+
+    // Active sibling device (`BOB_DEVICE != BOB2_DEVICE`) holding a leaf also fulfills replace.
+    bob2.provider = Provider::new().unwrap();
+    let sibling_req = bob2.request_recovery(cid, "replace");
+    bob.sync()
+        .await
+        .expect("sibling device holding a leaf fulfills same-account replace");
+    let sibling_replace = fulfillments(BOB_DEVICE)
+        .pop()
+        .expect("bob's sibling fulfillment");
+    assert_eq!(
+        sibling_replace["recoveryRequestId"],
+        sibling_req["recoveryRequestId"]
+    );
+    let after_sibling = bob.read(|db| leaves(db, cid)).await;
+    alice.sync().await.expect("alice processes sibling replace");
+    assert_eq!(alice.read(|db| leaves(db, cid)).await, after_sibling);
+    let (sibling_group, _, _) = bob2.join(&last_welcome(BOB2_DEVICE));
+    let mut sibling_rejoined: Vec<String> = sibling_group
+        .members()
+        .map(|member| String::from_utf8(member.credential.serialized_content().to_vec()).unwrap())
+        .collect();
+    sibling_rejoined.sort();
+    assert_eq!(sibling_rejoined, identities(&after_sibling));
+
+    // A device never fulfills its own `replace` (`device == own_device`).
+    let self_body = chat_wire::leaf_recovery_request_body(
+        &new_id(),
+        &bob.did,
+        BOB_DEVICE,
+        &derive_key_id(bob.signer.public()),
+        1,
+        &canonical(&state(cid)["coordinates"], cid),
+        "replace",
+        &chat_wire::now_rfc3339_millis(),
+    )
+    .unwrap();
+    let self_req = submit(
+        CanonicalOperation::RequestLeafRecovery,
+        self_body,
+        &bob.signer,
+    )["recovery"]
+        .take();
+    assert_eq!(
+        (&self_req["status"], &self_req["recoveryKind"]),
+        (&json!("open"), &json!("replace")),
+        "{self_req}"
+    );
+    let entries_before_self = serde_json::from_str::<Vec<Value>>(&entriesJson(cid))
+        .unwrap()
+        .len();
+    let bob_fulfillments_before = fulfillments(BOB_DEVICE).len();
+    bob.sync()
+        .await
+        .expect("a device never fulfills its own replace");
+    assert_eq!(fulfillments(BOB_DEVICE).len(), bob_fulfillments_before);
+    assert_eq!(
+        serde_json::from_str::<Vec<Value>>(&entriesJson(cid))
+            .unwrap()
+            .len(),
+        entries_before_self
+    );
 }
 
 /// A recovery joiner's verified roster comes only from the roster attestation in its Welcome's

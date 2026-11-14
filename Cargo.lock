@@ -521,6 +521,7 @@ name = "catbird-mls-web"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "atproto-spaces",
  "base64 0.22.1",
  "bytes",
  "catbird-atproto",
@@ -533,9 +534,11 @@ dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
  "hex",
+ "http",
  "js-sys",
  "labyrinth",
  "labyrinth-protocol",
+ "multibase",
  "openmls",
  "openmls_basic_credential",
  "openmls_libcrux_crypto",
@@ -550,6 +553,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",
+ "subtle",
  "thiserror 1.0.69",
  "tls_codec",
  "tracing",
@@ -558,6 +562,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "zeroize",
 ]
 
 [[package]]
@@ -573,6 +578,7 @@ dependencies = [
  "catbird-atproto",
  "chacha20poly1305",
  "chrono",
+ "cid",
  "ed25519-dalek 2.2.0",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -583,6 +589,8 @@ dependencies = [
  "hpke-rs",
  "hpke-rs-crypto",
  "hpke-rs-libcrux",
+ "http",
+ "ipld-core",
  "labyrinth",
  "labyrinth-protocol",
  "lazy_static",

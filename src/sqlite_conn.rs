@@ -126,13 +126,331 @@ async fn acquire_opfs_owner() -> Result<(), WasmSqliteError> {
     OPFS_OWNER.with(|owner| owner.set(true));
     Ok(())
 }
+const OPFS_RAW_VFS_NAME: &std::ffi::CStr = c"opfs-sahpool";
+const OPFS_SECTOR512_VFS_NAME: &std::ffi::CStr = c"opfs-sahpool-mc";
+const ENCRYPTED_OPFS_VFS_NAME: &std::ffi::CStr = c"multipleciphers-opfs-sahpool-mc";
+
+/// Thin SQLite VFS adapter between `sqlite3mc` and `opfs-sahpool` that reports
+/// SQLite's standard 512-byte sector size (`SQLITE_DEFAULT_SECTOR_SIZE`) while
+/// forwarding all file and namespace operations unchanged to `opfs-sahpool`.
+///
+/// Why this is required:
+/// `sqlite-wasm-vfs`'s `opfs-sahpool` advertises `xSectorSize = 4096`, matching
+/// our 4096-byte ChaCha20 database `page_size`. In `sqlite3mc` 2.x,
+/// `mcWriteMainJournal` leaves `mcFile->pageNo` set to the trailing 4-byte
+/// journal record checksum after each page record and encrypts any subsequent
+/// write whose byte length equals `pageSize` (`4096`). Whenever SQLite writes a
+/// second journal header (`cache_spill`, large multi-chunk transactions, or
+/// retained journals) with `JOURNAL_HDR_SZ == 4096 == pageSize`,
+/// `mcWriteMainJournal` mistakenly encrypts the plaintext journal header,
+/// corrupting `cksumInit` and aborting hot-journal crash recovery early.
+/// Reporting `xSectorSize = 512` sets `JOURNAL_HDR_SZ = 512 != 4096` without
+/// altering `opfs-sahpool`'s physical 4096-byte slot header offset or on-disk
+/// database format.
+mod opfs_sector512_vfs {
+    use super::{OPFS_RAW_VFS_NAME, OPFS_SECTOR512_VFS_NAME};
+    use sqlite_wasm_rs::*;
+    use std::ffi::{c_char, c_int, c_void};
+
+    const SQLITE_SECTOR_SIZE_512: c_int = 512;
+
+    #[repr(C, align(8))]
+    struct Sector512File {
+        base: sqlite3_file,
+    }
+
+    #[inline]
+    unsafe fn inner_file(p_file: *mut sqlite3_file) -> *mut sqlite3_file {
+        p_file.cast::<Sector512File>().add(1).cast::<sqlite3_file>()
+    }
+
+    #[inline]
+    unsafe fn raw_opfs_vfs() -> *mut sqlite3_vfs {
+        sqlite3_vfs_find(OPFS_RAW_VFS_NAME.as_ptr())
+    }
+
+    static SECTOR512_IO_METHODS: sqlite3_io_methods = sqlite3_io_methods {
+        iVersion: 1,
+        xClose: Some(io_close),
+        xRead: Some(io_read),
+        xWrite: Some(io_write),
+        xTruncate: Some(io_truncate),
+        xSync: Some(io_sync),
+        xFileSize: Some(io_file_size),
+        xLock: Some(io_lock),
+        xUnlock: Some(io_unlock),
+        xCheckReservedLock: Some(io_check_reserved_lock),
+        xFileControl: Some(io_file_control),
+        xSectorSize: Some(io_sector_size),
+        xDeviceCharacteristics: Some(io_device_characteristics),
+        xShmMap: None,
+        xShmLock: None,
+        xShmBarrier: None,
+        xShmUnmap: None,
+        xFetch: None,
+        xUnfetch: None,
+    };
+
+    unsafe extern "C" fn io_close(p_file: *mut sqlite3_file) -> c_int {
+        let inner = inner_file(p_file);
+        let rc = match (*inner).pMethods.as_ref().and_then(|m| m.xClose) {
+            Some(close) => close(inner),
+            None => SQLITE_OK,
+        };
+        (*p_file).pMethods = std::ptr::null();
+        rc
+    }
+
+    unsafe extern "C" fn io_read(
+        p_file: *mut sqlite3_file,
+        buf: *mut c_void,
+        amt: c_int,
+        offset: sqlite3_int64,
+    ) -> c_int {
+        let inner = inner_file(p_file);
+        ((*(*inner).pMethods).xRead.expect("inner xRead"))(inner, buf, amt, offset)
+    }
+
+    unsafe extern "C" fn io_write(
+        p_file: *mut sqlite3_file,
+        buf: *const c_void,
+        amt: c_int,
+        offset: sqlite3_int64,
+    ) -> c_int {
+        let inner = inner_file(p_file);
+        ((*(*inner).pMethods).xWrite.expect("inner xWrite"))(inner, buf, amt, offset)
+    }
+
+    unsafe extern "C" fn io_truncate(p_file: *mut sqlite3_file, size: sqlite3_int64) -> c_int {
+        let inner = inner_file(p_file);
+        ((*(*inner).pMethods).xTruncate.expect("inner xTruncate"))(inner, size)
+    }
+
+    unsafe extern "C" fn io_sync(p_file: *mut sqlite3_file, flags: c_int) -> c_int {
+        let inner = inner_file(p_file);
+        ((*(*inner).pMethods).xSync.expect("inner xSync"))(inner, flags)
+    }
+
+    unsafe extern "C" fn io_file_size(
+        p_file: *mut sqlite3_file,
+        p_size: *mut sqlite3_int64,
+    ) -> c_int {
+        let inner = inner_file(p_file);
+        ((*(*inner).pMethods).xFileSize.expect("inner xFileSize"))(inner, p_size)
+    }
+
+    unsafe extern "C" fn io_lock(p_file: *mut sqlite3_file, lock: c_int) -> c_int {
+        let inner = inner_file(p_file);
+        ((*(*inner).pMethods).xLock.expect("inner xLock"))(inner, lock)
+    }
+
+    unsafe extern "C" fn io_unlock(p_file: *mut sqlite3_file, lock: c_int) -> c_int {
+        let inner = inner_file(p_file);
+        ((*(*inner).pMethods).xUnlock.expect("inner xUnlock"))(inner, lock)
+    }
+
+    unsafe extern "C" fn io_check_reserved_lock(
+        p_file: *mut sqlite3_file,
+        p_res_out: *mut c_int,
+    ) -> c_int {
+        let inner = inner_file(p_file);
+        ((*(*inner).pMethods)
+            .xCheckReservedLock
+            .expect("inner xCheckReservedLock"))(inner, p_res_out)
+    }
+
+    unsafe extern "C" fn io_file_control(
+        p_file: *mut sqlite3_file,
+        op: c_int,
+        p_arg: *mut c_void,
+    ) -> c_int {
+        let inner = inner_file(p_file);
+        ((*(*inner).pMethods)
+            .xFileControl
+            .expect("inner xFileControl"))(inner, op, p_arg)
+    }
+
+    unsafe extern "C" fn io_sector_size(_p_file: *mut sqlite3_file) -> c_int {
+        SQLITE_SECTOR_SIZE_512
+    }
+
+    unsafe extern "C" fn io_device_characteristics(p_file: *mut sqlite3_file) -> c_int {
+        let inner = inner_file(p_file);
+        match (*(*inner).pMethods).xDeviceCharacteristics {
+            Some(dc) => dc(inner),
+            None => 0,
+        }
+    }
+
+    unsafe extern "C" fn vfs_open(
+        _p_vfs: *mut sqlite3_vfs,
+        z_name: sqlite3_filename,
+        p_file: *mut sqlite3_file,
+        flags: c_int,
+        p_out_flags: *mut c_int,
+    ) -> c_int {
+        (*p_file).pMethods = std::ptr::null();
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return SQLITE_CANTOPEN;
+        }
+        let inner = inner_file(p_file);
+        let rc = ((*real).xOpen.expect("real xOpen"))(real, z_name, inner, flags, p_out_flags);
+        if rc == SQLITE_OK {
+            (*p_file).pMethods = &SECTOR512_IO_METHODS;
+        }
+        rc
+    }
+
+    unsafe extern "C" fn vfs_delete(
+        _p_vfs: *mut sqlite3_vfs,
+        z_name: *const c_char,
+        sync_dir: c_int,
+    ) -> c_int {
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return SQLITE_IOERR_DELETE;
+        }
+        ((*real).xDelete.expect("real xDelete"))(real, z_name, sync_dir)
+    }
+
+    unsafe extern "C" fn vfs_access(
+        _p_vfs: *mut sqlite3_vfs,
+        z_name: *const c_char,
+        flags: c_int,
+        p_res_out: *mut c_int,
+    ) -> c_int {
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return SQLITE_IOERR_ACCESS;
+        }
+        ((*real).xAccess.expect("real xAccess"))(real, z_name, flags, p_res_out)
+    }
+
+    unsafe extern "C" fn vfs_full_pathname(
+        _p_vfs: *mut sqlite3_vfs,
+        z_name: *const c_char,
+        n_out: c_int,
+        z_out: *mut c_char,
+    ) -> c_int {
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return SQLITE_CANTOPEN;
+        }
+        ((*real).xFullPathname.expect("real xFullPathname"))(real, z_name, n_out, z_out)
+    }
+
+    unsafe extern "C" fn vfs_randomness(
+        _p_vfs: *mut sqlite3_vfs,
+        n_byte: c_int,
+        z_out: *mut c_char,
+    ) -> c_int {
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return 0;
+        }
+        match (*real).xRandomness {
+            Some(randomness) => randomness(real, n_byte, z_out),
+            None => 0,
+        }
+    }
+
+    unsafe extern "C" fn vfs_sleep(_p_vfs: *mut sqlite3_vfs, microseconds: c_int) -> c_int {
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return 0;
+        }
+        match (*real).xSleep {
+            Some(sleep) => sleep(real, microseconds),
+            None => 0,
+        }
+    }
+
+    unsafe extern "C" fn vfs_current_time(_p_vfs: *mut sqlite3_vfs, p_out: *mut f64) -> c_int {
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return SQLITE_ERROR;
+        }
+        match (*real).xCurrentTime {
+            Some(current_time) => current_time(real, p_out),
+            None => SQLITE_ERROR,
+        }
+    }
+
+    unsafe extern "C" fn vfs_get_last_error(
+        _p_vfs: *mut sqlite3_vfs,
+        n_buf: c_int,
+        z_buf: *mut c_char,
+    ) -> c_int {
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return 0;
+        }
+        match (*real).xGetLastError {
+            Some(last_err) => last_err(real, n_buf, z_buf),
+            None => 0,
+        }
+    }
+
+    unsafe extern "C" fn vfs_current_time_int64(
+        _p_vfs: *mut sqlite3_vfs,
+        p_out: *mut sqlite3_int64,
+    ) -> c_int {
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return SQLITE_ERROR;
+        }
+        match (*real).xCurrentTimeInt64 {
+            Some(current_time) => current_time(real, p_out),
+            None => SQLITE_ERROR,
+        }
+    }
+
+    pub unsafe fn ensure_registered() -> c_int {
+        if !sqlite3_vfs_find(OPFS_SECTOR512_VFS_NAME.as_ptr()).is_null() {
+            return SQLITE_OK;
+        }
+        let real = raw_opfs_vfs();
+        if real.is_null() {
+            return SQLITE_CANTOPEN;
+        }
+        let sz_os_file =
+            (std::mem::size_of::<Sector512File>() as c_int).saturating_add((*real).szOsFile);
+        let vfs = Box::leak(Box::new(sqlite3_vfs {
+            iVersion: 2,
+            szOsFile: sz_os_file,
+            mxPathname: (*real).mxPathname,
+            pNext: std::ptr::null_mut(),
+            zName: OPFS_SECTOR512_VFS_NAME.as_ptr(),
+            pAppData: std::ptr::null_mut(),
+            xOpen: Some(vfs_open),
+            xDelete: Some(vfs_delete),
+            xAccess: Some(vfs_access),
+            xFullPathname: Some(vfs_full_pathname),
+            xDlOpen: None,
+            xDlError: None,
+            xDlSym: None,
+            xDlClose: None,
+            xRandomness: Some(vfs_randomness),
+            xSleep: Some(vfs_sleep),
+            xCurrentTime: Some(vfs_current_time),
+            xGetLastError: Some(vfs_get_last_error),
+            xCurrentTimeInt64: Some(vfs_current_time_int64),
+            xSetSystemCall: None,
+            xGetSystemCall: None,
+            xNextSystemCall: None,
+        }));
+        sqlite3_vfs_register(vfs, 0)
+    }
+}
+
 impl SqliteConn {
     /// Register persistent OPFS storage in a dedicated Worker. A locked or
     /// unavailable pool is an error; never fall back to the default RAM VFS.
     /// Exactly one Worker per origin may own the pool at a time.
     pub async fn initialize_opfs() -> Result<(), WasmSqliteError> {
         acquire_opfs_owner().await?;
-        if unsafe { !sqlite3_vfs_find(c"multipleciphers-opfs-sahpool".as_ptr()).is_null() } {
+        if unsafe { !sqlite3_vfs_find(ENCRYPTED_OPFS_VFS_NAME.as_ptr()).is_null() } {
             return Ok(());
         }
         let pool = sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(
@@ -146,17 +464,24 @@ impl SqliteConn {
         })?;
         // DELETE releases the journal entry after each transaction, so the
         // original 128 slots still hold 128 persistent account databases.
-        // reserve_minimum_capacity grows existing smaller pools in place.
-        pool.reserve_minimum_capacity(128)
+        // ensure_capacity grows existing smaller pools in place.
+        pool.ensure_capacity(128)
             .await
             .map_err(|error| WasmSqliteError::Sqlite {
                 code: SQLITE_CANTOPEN,
                 message: format!("Protected OPFS capacity unavailable: {error}"),
             })?;
+        let shim_rc = unsafe { opfs_sector512_vfs::ensure_registered() };
+        if shim_rc != SQLITE_OK {
+            return Err(WasmSqliteError::Sqlite {
+                code: shim_rc,
+                message: "cannot register 512-sector OPFS VFS adapter".into(),
+            });
+        }
         // sqlite3mc encryption requires its wrapper around the persistent VFS,
         // not an open directly against the underlying OPFS implementation.
-        if unsafe { sqlite3_vfs_find(c"multipleciphers-opfs-sahpool".as_ptr()) }.is_null() {
-            let result = unsafe { sqlite3mc_vfs_create(c"opfs-sahpool".as_ptr(), 0) };
+        if unsafe { sqlite3_vfs_find(ENCRYPTED_OPFS_VFS_NAME.as_ptr()) }.is_null() {
+            let result = unsafe { sqlite3mc_vfs_create(OPFS_SECTOR512_VFS_NAME.as_ptr(), 0) };
             if result != SQLITE_OK {
                 return Err(WasmSqliteError::Sqlite {
                     code: result,
@@ -169,7 +494,7 @@ impl SqliteConn {
 
     /// Open a database at the given path with sqlite3mc ChaCha20 encryption
     /// (`PRAGMA cipher = 'chacha20';` BEFORE `PRAGMA key = "x'<64-hex>'";`,
-    /// rollback journal `DELETE` (retained-journal modes corrupt rollback on this VFS, never `WAL`)
+    /// rollback journal `DELETE` so closed transactions release OPFS SAH slots; never `WAL`).
     pub fn open(db_path: &str, key: &str) -> Result<Self, WasmSqliteError> {
         crate::browser_session::check()
             .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
@@ -198,7 +523,7 @@ impl SqliteConn {
                 c_path.as_ptr().cast(),
                 &mut db as *mut _,
                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                c"multipleciphers-opfs-sahpool".as_ptr().cast(),
+                ENCRYPTED_OPFS_VFS_NAME.as_ptr().cast(),
             )
         };
 
@@ -226,10 +551,12 @@ impl SqliteConn {
         // 1. PRAGMA cipher = 'chacha20';
         // 2. PRAGMA key = "x'<64-hex>'";
         // 3. PRAGMA page_size = 4096;
-        // 4. PRAGMA journal_mode = DELETE; (retained-journal modes corrupt rollback)
+        // 4. PRAGMA journal_mode = DELETE; (releases journal SAH slot after commit; never WAL)
         // 5. PRAGMA synchronous = FULL;
-        // DELETE has a residual crash window because rsqlite-vfs ignores xDelete's syncDir
-        // flag and sahpool does not flush its logical filename-header deletion.
+        // sqlite-wasm-vfs 0.3.0 reports LockLevel::None on fresh opens for hot-journal
+        // recovery and flushes the OPFS slot header when unlinking the rollback journal;
+        // opfs_sector512_vfs keeps JOURNAL_HDR_SZ = 512 != page_size so sqlite3mc never
+        // encrypts multi-chunk rollback journal headers.
         let init_pragmas = catbird_mls::storage::wasm_sqlite3mc_init_pragmas(&key_bytes);
         conn.exec_raw(&init_pragmas)?;
         // Force key validation now, before callers can reserve remote work.

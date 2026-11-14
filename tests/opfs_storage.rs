@@ -19,7 +19,7 @@ async fn encrypted_transaction_reopens_and_rollback_preserves_previous_state() {
     )
     .await
     .unwrap();
-    assert!(pool.get_capacity() >= 128);
+    assert!(pool.capacity() >= 128);
     let path = format!("transaction-{}.db", uuid::Uuid::new_v4());
     let key = "ab".repeat(32);
     {
@@ -60,8 +60,8 @@ async fn encrypted_transaction_reopens_and_rollback_preserves_previous_state() {
     );
     assert_eq!(
         rollback_modes,
-        ([true; 3], [false, true, false], [false, true, false]),
-        "the pinned VFS must preserve DELETE rollback and retain its known PERSIST/TRUNCATE defect"
+        ([true; 3], [true; 3], [true; 3]),
+        "the 512-sector OPFS adapter must preserve sqlite3mc rollback across DELETE, PERSIST, and TRUNCATE"
     );
     // Drop and reacquire the actual OPFS SyncAccessHandles before reopening.
     let pool = sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
@@ -70,8 +70,8 @@ async fn encrypted_transaction_reopens_and_rollback_preserves_previous_state() {
     )
     .await
     .unwrap();
-    pool.pause_vfs().unwrap();
-    pool.unpause_vfs().await.unwrap();
+    pool.pause().unwrap();
+    pool.resume().await.unwrap();
     let conn = SqliteConn::open(&path, &key).unwrap();
     assert_eq!(conn.get(b"crypto").unwrap().unwrap(), b"prepared");
     assert_eq!(

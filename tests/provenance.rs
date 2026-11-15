@@ -15,7 +15,7 @@ fn crate_root() -> PathBuf {
 }
 
 fn sibling(path: &str) -> PathBuf {
-    crate_root().join("../y9b-catbird-mls").join(path)
+    crate_root().join("../catbird-mls").join(path)
 }
 
 fn vendored(path: &str) -> PathBuf {
@@ -75,7 +75,7 @@ fn vendored_artifacts_match_sealed_input_manifest() {
         let output = read_bytes(&vendored(entry["target"].as_str().unwrap()));
         assert_eq!(sha256(&output), entry["sha256"].as_str().unwrap());
         let pinned = std::process::Command::new("jj")
-            .current_dir(crate_root().join("../y9b-catbird-mls"))
+            .current_dir(crate_root().join("../catbird-mls"))
             .args([
                 "--ignore-working-copy",
                 "file",
@@ -104,6 +104,30 @@ fn vendored_artifacts_match_sealed_input_manifest() {
             "Missing request contract {key}"
         );
     }
+}
+
+#[test]
+fn wasm_package_provenance_names_the_vendored_core_revision() {
+    let manifest: serde_json::Value = serde_json::from_slice(&read_bytes(&vendored(
+        "tests/fixtures/chat-artifact-provenance.json",
+    )))
+    .unwrap();
+    let package = &manifest["wasmPackage"];
+    assert_eq!(
+        package["coreRevision"], manifest["coreRevision"],
+        "pkg/ build provenance must name the same catbird-mls revision as the vendored artifacts"
+    );
+    for key in ["coreRevision", "labyrinthRevision", "catbirdAtprotoRevision"] {
+        let id = package[key].as_str().unwrap_or_else(|| panic!("missing {key}"));
+        assert!(
+            id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{key} must be a full commit id"
+        );
+    }
+    let wasm = package["files"]["catbird_mls_web_bg.wasm"]
+        .as_str()
+        .expect("wasm SHA-256 recorded");
+    assert!(wasm.len() == 64 && wasm.bytes().all(|b| b.is_ascii_hexdigit()));
 }
 
 #[test]

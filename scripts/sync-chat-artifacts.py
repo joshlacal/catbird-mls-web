@@ -11,7 +11,7 @@ root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument('--core-revision', required=True)
 args = parser.parse_args()
-revision = subprocess.check_output(['jj','--ignore-working-copy','log','-r',args.core_revision,'--no-graph','-T','commit_id','--limit','1'],cwd=root.parent/'catbird-mls',text=True).strip()
+revision = subprocess.check_output(['jj','--ignore-working-copy','log','-r',args.core_revision,'--no-graph','-T','commit_id','--limit','1'],cwd=root.parent/'y9b-catbird-mls',text=True).strip()
 artifacts = {
  'src/generated/blue.catbird.chat.defs.json':'src/orchestrator/generated/blue.catbird.chat.defs.json',
  'tests/fixtures/mls_chat_signing_domain_vectors.json':'src/orchestrator/generated/mls_chat_signing_domain_vectors.json',
@@ -21,7 +21,7 @@ artifacts = {
 manifest={'coreRevision':revision,'artifacts':[]}
 collected=[]
 for target,source in artifacts.items():
- data=subprocess.check_output(['jj','--ignore-working-copy','file','show','-r',revision,source],cwd=root.parent/'catbird-mls')
+ data=subprocess.check_output(['jj','--ignore-working-copy','file','show','-r',revision,source],cwd=root.parent/'y9b-catbird-mls')
  json.loads(data)
  collected.append((target,data))
  manifest['artifacts'].append({'target':target,'source':source,'sha256':hashlib.sha256(data).hexdigest()})

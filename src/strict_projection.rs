@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use uuid::{Uuid, Variant, Version};
 
 use catbird_mls::atproto::blue_catbird::chat::CanonicalDatetime;
-use catbird_mls::orchestrator::canonical_transport::{
+use catbird_mls::canonical_transport::{
     canonical_route, CanonicalOperation, CleanChatSigningContext, PreparedRequest, TransportError,
 };
 
@@ -1320,8 +1320,8 @@ pub(crate) fn prepare_signed_body(
 pub(crate) fn parse_generated_request(
     operation: CanonicalOperation,
     body: &[u8],
-) -> Result<catbird_mls::orchestrator::canonical_transport::CleanChatRequest, String> {
-    use catbird_mls::orchestrator::canonical_transport::CleanChatRequest;
+) -> Result<catbird_mls::canonical_transport::CleanChatRequest, String> {
+    use catbird_mls::canonical_transport::CleanChatRequest;
     macro_rules! parse {
         ($ty:path, $variant:ident) => {
             serde_json::from_slice::<$ty>(body)
@@ -1332,7 +1332,7 @@ pub(crate) fn parse_generated_request(
     use catbird_mls::atproto::blue_catbird::chat::{
         get_conversations::GetConversations, get_entries::GetEntries,
     };
-    use catbird_mls::orchestrator::canonical_transport::{
+    use catbird_mls::canonical_transport::{
         AcceptConversationRequestBody, AcknowledgeEntriesRequestBody,
         AcknowledgeWelcomeRequestBody, ActivateResetRequestBody, ApproveDeviceRequestBody,
         CancelLeafRecoveryRequestBody, CancelLeaveRequestBody, CloseConversationRequestBody,

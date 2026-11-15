@@ -13,31 +13,31 @@ use openmls_traits::OpenMlsProvider;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use catbird_mls::canonical_transport::{
+    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id, CanonicalOperation,
+};
 use catbird_mls::chat_v2::ids::BareDid;
 use catbird_mls::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
 use catbird_mls::chat_v2::transcript::SignedMutationKind;
 use catbird_mls::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND;
 use catbird_mls::client::chat_wire;
 use catbird_mls::client::QueuedLabyrinthArchivePayload;
+use catbird_mls::direct_request_bootstrap::{
+    DirectRequestBootstrap, DirectRequestIntroductionResult, DirectRequestWelcomeInput,
+    C33_OPENING_UNAVAILABLE,
+};
+use catbird_mls::direct_request_shared_crypto::decrypt_introduction_with_provider;
 use catbird_mls::messaging::receive::{
     extract_plaintext_body_and_verify_aad, verify_application_aad_archive_evidence,
     OriginalSenderArchiveAttestationEnvelope, PrivateMessagePlaintextEnvelope,
 };
 use catbird_mls::metadata::derive_metadata_key_from_group;
-use catbird_mls::orchestrator::canonical_transport::{
-    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id, CanonicalOperation,
-};
-use catbird_mls::orchestrator::direct_request_bootstrap::{
-    DirectRequestBootstrap, DirectRequestIntroductionResult, DirectRequestWelcomeInput,
-    C33_OPENING_UNAVAILABLE,
-};
-use catbird_mls::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
-use catbird_mls::orchestrator::MLSMessagePayload;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend};
 use catbird_mls::storage::{
     ConversationRow, KvWriteOverlay, LabyrinthQueueRow, MessageRow, OpenMlsKvProvider,
     OpenMlsKvStorage, RequestRow,
 };
+use catbird_mls::MLSMessagePayload;
 use catbird_mls::{ConversationSyncFailure, MLSError};
 
 use crate::sqlite_conn::SqliteConn;
@@ -377,10 +377,7 @@ impl WasmMlsClient {
         {
             return Some(tok.clone());
         }
-        crate::with_state(|s| Ok(s.auth_token.clone()))
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty())
+        crate::public_api_auth_token()
     }
 
     pub(crate) fn canonical_uuid_v4_device_id(&self) -> Option<String> {
@@ -729,7 +726,52 @@ impl WasmMlsClient {
         session_token: &str,
         did: &str,
     ) -> Result<Option<Vec<u8>>, MLSError> {
-        let clean_did = did.split('#').next().unwrap_or(did);
+        let clean_did = did.split('#').next().unwrap_or(did).trim();
+        let verify_target = |doc_bytes: Vec<u8>| -> Result<Vec<u8>, MLSError> {
+            let parsed: Value = serde_json::from_slice(&doc_bytes).map_err(|e| {
+                MLSError::Cryptography(format!(
+                    "DID document JSON parse failed for `{clean_did}`: {e}"
+                ))
+            })?;
+            if parsed.get("id").and_then(Value::as_str) != Some(clean_did) {
+                return Err(MLSError::Cryptography(format!(
+                    "DID document id mismatch for `{clean_did}`"
+                )));
+            }
+            Ok(doc_bytes)
+        };
+
+        // `did:plc:*` MUST resolve from the authoritative PLC directory rather than trusting own PDS.
+        if clean_did.starts_with("did:plc:") {
+            if !atproto_spaces::is_valid_did(clean_did) {
+                return Err(MLSError::invalid_input(format!(
+                    "invalid PLC DID `{clean_did}`"
+                )));
+            }
+            let plc_url = format!("https://plc.directory/{clean_did}");
+            match self.http.get(&plc_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let bytes = resp.bytes().await.map_err(|e| {
+                        MLSError::Internal(format!("read PLC directory body({clean_did}): {e}"))
+                    })?;
+                    let doc = chat_wire::extract_did_doc_from_resolve_response(&bytes)?;
+                    return Ok(Some(verify_target(doc)?));
+                }
+                Ok(resp) if resp.status().as_u16() == 404 => return Ok(None),
+                Ok(resp) => {
+                    return Err(MLSError::Internal(format!(
+                        "PLC directory resolve({clean_did}) failed with HTTP {}",
+                        resp.status().as_u16()
+                    )));
+                }
+                Err(e) => {
+                    return Err(MLSError::Internal(format!(
+                        "PLC directory resolve({clean_did}) failed: {e}"
+                    )));
+                }
+            }
+        }
+
         let pds_url = format!(
             "{}/xrpc/com.atproto.identity.resolveDid?did={}",
             self.pds_base(),
@@ -746,7 +788,9 @@ impl WasmMlsClient {
                 if let Ok(bytes) = resp.bytes().await {
                     if !bytes.is_empty() {
                         if let Ok(doc) = chat_wire::extract_did_doc_from_resolve_response(&bytes) {
-                            return Ok(Some(doc));
+                            if let Ok(verified) = verify_target(doc) {
+                                return Ok(Some(verified));
+                            }
                         }
                     }
                 }
@@ -757,8 +801,13 @@ impl WasmMlsClient {
             let wk_url = if clean_did == self.home_ds_did.split('#').next().unwrap_or("") {
                 format!("{}/.well-known/did.json", self.ds_base())
             } else {
-                let scheme = if decoded.starts_with("127.0.0.1") || decoded.starts_with("localhost")
-                {
+                let host_part = decoded.split('/').next().unwrap_or("");
+                let bare_host = if let Some(bracketed) = host_part.strip_prefix('[') {
+                    bracketed.split(']').next().unwrap_or("")
+                } else {
+                    host_part.split(':').next().unwrap_or("")
+                };
+                let scheme = if matches!(bare_host, "localhost" | "127.0.0.1" | "::1") {
                     "http"
                 } else {
                     "https"
@@ -772,7 +821,9 @@ impl WasmMlsClient {
                             if let Ok(doc) =
                                 chat_wire::extract_did_doc_from_resolve_response(&bytes)
                             {
-                                return Ok(Some(doc));
+                                if let Ok(verified) = verify_target(doc) {
+                                    return Ok(Some(verified));
+                                }
                             }
                         }
                     }
@@ -782,12 +833,193 @@ impl WasmMlsClient {
         Ok(None)
     }
 
+    async fn verify_pds_record_car_proof_wasm(
+        &self,
+        pds_endpoint: &str,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+        record_entry: &Value,
+        atproto_key: &atproto_spaces::tokens::SpaceVerifyingKey,
+    ) -> Result<(), MLSError> {
+        let expected_uri = format!("at://{did}/{collection}/{rkey}");
+        let expected_cid = record_entry["cid"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!("I4 missing record CID for `{expected_uri}`"))
+            })?;
+        let record_val = record_entry.get("value").ok_or_else(|| {
+            MLSError::Cryptography(format!("I4 missing record value for `{expected_uri}`"))
+        })?;
+        let inline_proof = record_entry.get("proof").and_then(|p| {
+            p.as_str()
+                .or_else(|| p.get("$bytes").and_then(Value::as_str))
+        });
+        let car_bytes = if let Some(b64) = inline_proof {
+            STANDARD.decode(b64).map_err(|e| {
+                MLSError::Cryptography(format!(
+                    "I4 inline CAR proof base64 decode failed for `{expected_uri}`: {e}"
+                ))
+            })?
+        } else {
+            let proof_url = format!(
+                "{}/xrpc/com.atproto.sync.getRecord?did={}&collection={}&rkey={}",
+                pds_endpoint.trim_end_matches('/'),
+                chat_wire::urlencode_form_component(did),
+                chat_wire::urlencode_form_component(collection),
+                chat_wire::urlencode_form_component(rkey),
+            );
+            let proof_resp = self.http.get(&proof_url).send().await.map_err(|e| {
+                MLSError::Cryptography(format!("I4 sync.getRecord({expected_uri}) failed: {e}"))
+            })?;
+            if !proof_resp.status().is_success() {
+                return Err(MLSError::Cryptography(format!(
+                    "I4 sync.getRecord({expected_uri}) failed with HTTP {}",
+                    proof_resp.status().as_u16()
+                )));
+            }
+            proof_resp
+                .bytes()
+                .await
+                .map_err(|e| MLSError::Internal(e.to_string()))?
+                .to_vec()
+        };
+        let (_, commit_rev) =
+            catbird_mls::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
+                &car_bytes,
+                did,
+                collection,
+                rkey,
+                Some(expected_cid),
+                record_val,
+                atproto_key,
+            )
+            .map_err(|e| {
+                MLSError::Cryptography(format!(
+                    "I4 CARv1 repo proof failed for `{expected_uri}`: {e}"
+                ))
+            })?;
+        if !catbird_mls::labyrinth::repo_proof::is_valid_tid(&commit_rev) {
+            return Err(MLSError::Cryptography(format!(
+                "I4 invalid ATProto commit rev TID `{commit_rev}` for `{expected_uri}`"
+            )));
+        }
+        if let Ok(db) = self.require_db_mls() {
+            let meta_key = format!("pds_repo_rev_floor:{did}");
+            let ts = now_ms();
+            db.write_tx(|tx| {
+                if let Some(existing) = tx.get_account_meta(&meta_key)? {
+                    if !catbird_mls::labyrinth::repo_proof::is_valid_tid(&existing) {
+                        return Err(MLSError::Cryptography(format!(
+                            "I4 corrupt pinned repository commit rev floor for `{did}`"
+                        )));
+                    }
+                    if commit_rev.as_str() < existing.as_str() {
+                        return Err(MLSError::Cryptography(format!(
+                            "I4 PDS repo rev rollback for `{expected_uri}`: `{commit_rev}` < `{existing}`"
+                        )));
+                    }
+                    if commit_rev.as_str() > existing.as_str() {
+                        tx.put_account_meta(&meta_key, &commit_rev, ts)?;
+                    }
+                } else {
+                    tx.put_account_meta(&meta_key, &commit_rev, ts)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn paginate_pds_collection_wasm(
+        &self,
+        pds_endpoint: &str,
+        did: &str,
+        collection: &str,
+        allow_404_empty: bool,
+    ) -> Result<Vec<Value>, MLSError> {
+        let mut all_records = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        let base = pds_endpoint.trim_end_matches('/');
+        for page_idx in 0..chat_wire::MAX_PDS_LIST_RECORDS_PAGES {
+            let mut list_url = format!(
+                "{base}/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit=100",
+                chat_wire::urlencode_form_component(did),
+                chat_wire::urlencode_form_component(collection),
+            );
+            if let Some(ref c) = cursor {
+                list_url.push_str(&format!(
+                    "&cursor={}",
+                    chat_wire::urlencode_form_component(c)
+                ));
+            }
+            let resp = self.http.get(&list_url).send().await.map_err(|e| {
+                MLSError::Internal(format!(
+                    "I4 PDS listRecords({did}, {collection}) failed: {e}"
+                ))
+            })?;
+            if page_idx == 0 && allow_404_empty && resp.status().as_u16() == 404 {
+                return Ok(Vec::new());
+            }
+            if !resp.status().is_success() {
+                return Err(MLSError::insufficient_permissions(format!(
+                    "I4: PDS listRecords({did}, {collection}) returned HTTP {}",
+                    resp.status().as_u16()
+                )));
+            }
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            let parsed_list: Value = serde_json::from_slice(&body).map_err(|e| {
+                MLSError::Cryptography(format!(
+                    "I4 listRecords({did}, {collection}) JSON parse failed: {e}"
+                ))
+            })?;
+            let page_records = parsed_list
+                .get("records")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    MLSError::Cryptography(format!(
+                        "I4 listRecords({did}, {collection}) missing records array"
+                    ))
+                })?;
+            all_records.extend(page_records.iter().cloned());
+            match parsed_list
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => break,
+                Some(next) => {
+                    if page_records.is_empty() || !seen_cursors.insert(next.to_owned()) {
+                        return Err(MLSError::Cryptography(format!(
+                            "I4 PDS listRecords({did}, {collection}) repeated/stalled cursor"
+                        )));
+                    }
+                    if page_idx + 1 == chat_wire::MAX_PDS_LIST_RECORDS_PAGES {
+                        return Err(MLSError::Cryptography(format!(
+                            "I4 PDS listRecords({did}, {collection}) truncated past {} pages",
+                            chat_wire::MAX_PDS_LIST_RECORDS_PAGES
+                        )));
+                    }
+                    cursor = Some(next.to_owned());
+                }
+            }
+        }
+        Ok(all_records)
+    }
+
     async fn fetch_peer_device_keys_via_pds(
         &self,
         session_token: &str,
         did: &str,
         persist: bool,
     ) -> Result<Vec<(String, Vec<u8>)>, MLSError> {
+        let require_repo_proof = did != self.account_did;
         let resolved_doc = self.resolve_did_document(session_token, did).await?;
         let atproto_key = resolved_doc
             .as_deref()
@@ -797,112 +1029,96 @@ impl WasmMlsClient {
             .as_deref()
             .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(doc, did))
             .unwrap_or_else(|| self.pds_base());
-        let list_url = format!(
-            "{}/xrpc/com.atproto.repo.listRecords?repo={}&collection=blue.catbird.chat.device&limit=100",
-            pds_endpoint.trim_end_matches('/'),
-            chat_wire::urlencode_form_component(did)
-        );
-        // Public record read on the DID's own PDS: a peer-controlled origin never receives this
-        // session's bearer token.
-        let resp =
-            self.http.get(&list_url).send().await.map_err(|e| {
-                MLSError::Internal(format!("I4 PDS listRecords({did}) failed: {e}"))
-            })?;
-        if !resp.status().is_success() {
-            return Err(MLSError::insufficient_permissions(format!(
-                "I4: PDS listRecords({did}) returned HTTP {}",
-                resp.status().as_u16()
-            )));
-        }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| MLSError::Internal(e.to_string()))?;
-        let pairs = chat_wire::parse_pds_device_list_records(did, &body)?;
-        if pairs.is_empty() {
+        let raw_device_records = self
+            .paginate_pds_collection_wasm(&pds_endpoint, did, "blue.catbird.chat.device", false)
+            .await?;
+        let entries = chat_wire::parse_pds_device_entries(did, &raw_device_records);
+        if entries.is_empty() {
             return Err(MLSError::insufficient_permissions(format!(
                 "I4: zero valid blue.catbird.chat.device records on PDS for `{did}`"
             )));
         }
-        if let Some(ref atproto_key) = atproto_key {
-            let parsed_list: Value = serde_json::from_slice(&body).map_err(|e| {
-                MLSError::Cryptography(format!("I4 listRecords JSON parse failed for `{did}`: {e}"))
-            })?;
-            let records = parsed_list
-                .get("records")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            for (device_id, _) in &pairs {
-                let expected_uri = format!("at://{did}/blue.catbird.chat.device/{device_id}");
-                let record_entry = records
-                    .iter()
-                    .find(|entry| entry["uri"].as_str() == Some(expected_uri.as_str()))
-                    .ok_or_else(|| {
-                        MLSError::Cryptography(format!(
-                            "I4 missing canonical record entry for `{expected_uri}`"
-                        ))
-                    })?;
-                let expected_cid = record_entry["cid"]
-                    .as_str()
-                    .filter(|c| !c.is_empty())
-                    .ok_or_else(|| {
-                        MLSError::Cryptography(format!(
-                            "I4 missing record CID for `{expected_uri}`"
-                        ))
-                    })?;
-                let record_val = record_entry.get("value").ok_or_else(|| {
-                    MLSError::Cryptography(format!("I4 missing record value for `{expected_uri}`"))
-                })?;
-                let inline_proof = record_entry.get("proof").and_then(|p| {
-                    p.as_str()
-                        .or_else(|| p.get("$bytes").and_then(Value::as_str))
-                });
-                let car_bytes = if let Some(b64) = inline_proof {
-                    STANDARD.decode(b64).map_err(|e| {
-                        MLSError::Cryptography(format!(
-                            "I4 inline CAR proof base64 decode failed for `{expected_uri}`: {e}"
-                        ))
-                    })?
-                } else {
-                    let proof_url = format!(
-                        "{}/xrpc/com.atproto.sync.getRecord?did={}&collection=blue.catbird.chat.device&rkey={}",
-                        pds_endpoint.trim_end_matches('/'),
-                        chat_wire::urlencode_form_component(did),
-                        chat_wire::urlencode_form_component(device_id),
-                    );
-                    let proof_resp = self.http.get(&proof_url).send().await.map_err(|e| {
-                        MLSError::Cryptography(format!(
-                            "I4 sync.getRecord({expected_uri}) failed: {e}"
-                        ))
-                    })?;
-                    if !proof_resp.status().is_success() {
-                        return Err(MLSError::Cryptography(format!(
-                            "I4 sync.getRecord({expected_uri}) failed with HTTP {}",
-                            proof_resp.status().as_u16()
-                        )));
-                    }
-                    proof_resp
-                        .bytes()
-                        .await
-                        .map_err(|e| MLSError::Internal(e.to_string()))?
-                        .to_vec()
-                };
-                catbird_mls::labyrinth::repo_proof::verify_car_record_json_match(
-                    &car_bytes,
+        if require_repo_proof || atproto_key.is_some() {
+            let Some(ref key) = atproto_key else {
+                return Err(MLSError::Cryptography(format!(
+                    "I4 missing #atproto repository signing key in DID document for `{did}`"
+                )));
+            };
+            for (device_id, _, record_entry) in &entries {
+                self.verify_pds_record_car_proof_wasm(
+                    &pds_endpoint,
                     did,
                     "blue.catbird.chat.device",
                     device_id,
-                    Some(expected_cid),
-                    record_val,
-                    atproto_key,
+                    record_entry,
+                    key,
                 )
-                .map_err(|e| {
-                    MLSError::Cryptography(format!(
-                        "I4 CARv1 repo proof failed for `{expected_uri}`: {e}"
-                    ))
-                })?;
+                .await?;
             }
+        }
+        let mut enrolled_map = BTreeMap::new();
+        for (device_id, pk, _) in &entries {
+            enrolled_map.insert(device_id.clone(), pk.clone());
+        }
+        let raw_revocation_records = self
+            .paginate_pds_collection_wasm(
+                &pds_endpoint,
+                did,
+                "blue.catbird.chat.deviceRevocation",
+                !require_repo_proof,
+            )
+            .await?;
+        let revocation_prefix = format!("at://{did}/blue.catbird.chat.deviceRevocation/");
+        let mut revoked_device_ids = std::collections::BTreeSet::new();
+        for rev_entry in &raw_revocation_records {
+            let Some(uri) = rev_entry.get("uri").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(rkey) = uri
+                .strip_prefix(&revocation_prefix)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.contains('/'))
+            else {
+                continue;
+            };
+            let Some(record_val) = rev_entry.get("value") else {
+                return Err(MLSError::Cryptography(format!(
+                    "I4 missing value on `{uri}`"
+                )));
+            };
+            if require_repo_proof || atproto_key.is_some() {
+                let Some(ref key) = atproto_key else {
+                    return Err(MLSError::Cryptography(format!(
+                        "I4 missing #atproto key for `{did}`"
+                    )));
+                };
+                self.verify_pds_record_car_proof_wasm(
+                    &pds_endpoint,
+                    did,
+                    "blue.catbird.chat.deviceRevocation",
+                    rkey,
+                    rev_entry,
+                    key,
+                )
+                .await?;
+            }
+            let target_id = chat_wire::verify_pds_device_revocation_record(
+                did,
+                rkey,
+                record_val,
+                &enrolled_map,
+            )?;
+            revoked_device_ids.insert(target_id);
+        }
+        let pairs: Vec<(String, Vec<u8>)> = entries
+            .into_iter()
+            .filter(|(device_id, _, _)| !revoked_device_ids.contains(device_id))
+            .map(|(device_id, pk, _)| (device_id, pk))
+            .collect();
+        if pairs.is_empty() {
+            return Err(MLSError::insufficient_permissions(format!(
+                "I4: all blue.catbird.chat.device records on PDS for `{did}` are revoked"
+            )));
         }
         if persist {
             let cached_json = serde_json::to_string(
@@ -2126,9 +2342,7 @@ impl WasmMlsClient {
         if raw_dr_entry["payloadPruned"] == true
             || (raw_dr_entry.get("directRequest").is_none()
                 && raw_dr_entry["$type"] == "blue.catbird.chat.defs#directRequestEntry"
-                && catbird_mls::orchestrator::direct_request_bootstrap::is_pruned_opening_entry(
-                    raw_dr_entry,
-                ))
+                && catbird_mls::direct_request_bootstrap::is_pruned_opening_entry(raw_dr_entry))
         {
             return self
                 .record_pruned_c33_opening(session_token, cid, raw_dr_entry)
@@ -2336,14 +2550,14 @@ impl WasmMlsClient {
             chat_wire::sequencer_receipt_kid(&effective_seq_did, entry_receipt)?,
         )?;
         let (entry_seq, _, dr_rcpt_json) =
-            catbird_mls::orchestrator::direct_request_bootstrap::verify_opening_receipt(
+            catbird_mls::direct_request_bootstrap::verify_opening_receipt(
                 &bootstrap,
                 entry_receipt,
                 &effective_seq_did,
                 &sequencer_receipt_key,
             )?;
         let (_, _, outcome_rcpt_json) =
-            catbird_mls::orchestrator::direct_request_bootstrap::verify_opening_receipt(
+            catbird_mls::direct_request_bootstrap::verify_opening_receipt(
                 &bootstrap,
                 &publication_receipt["body"]["receipt"]["sequencerReceipt"],
                 &effective_seq_did,
@@ -2384,7 +2598,7 @@ impl WasmMlsClient {
             &welcome_input.receipt_authority_did,
             &welcome_input.receipt_authority_key,
         )?;
-        catbird_mls::orchestrator::direct_request_shared_crypto::validate_request_welcome_receipt(
+        catbird_mls::direct_request_shared_crypto::validate_request_welcome_receipt(
             &welcome_input,
         )?;
         let ts = now_ms();
@@ -2568,10 +2782,9 @@ impl WasmMlsClient {
             .resolve_did_document(session_token, &authority)
             .await?
             .ok_or_else(|| missing("receipt authority document"))?;
-        let receipt =
-            catbird_mls::orchestrator::direct_request_bootstrap::verify_pruned_opening_entry(
-                entry, cid, &authority, &document,
-            )?;
+        let receipt = catbird_mls::direct_request_bootstrap::verify_pruned_opening_entry(
+            entry, cid, &authority, &document,
+        )?;
         if receipt["actorDid"].as_str() != Some(sender_did) {
             return Err(missing("receipt sender binding"));
         }

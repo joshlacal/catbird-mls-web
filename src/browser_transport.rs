@@ -21,7 +21,7 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
-use catbird_mls::orchestrator::canonical_transport::{
+use catbird_mls::canonical_transport::{
     canonical_route, CanonicalOperation, CleanChatSigningContext, PreparedRequest,
 };
 

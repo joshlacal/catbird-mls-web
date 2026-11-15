@@ -35,9 +35,9 @@ use catbird_mls::client::{
     REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
 use catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1;
-use catbird_mls::orchestrator::MLSMessagePayload;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
 use catbird_mls::storage::MessageRow;
+use catbird_mls::MLSMessagePayload;
 use catbird_mls_web::{verify_golden_transcript_json, SqliteConn, WasmMlsClient};
 use labyrinth::records::EpochPublicDef;
 use labyrinth_protocol::receipt::{sign_sequencer_receipt, SequencerReceiptPayload};
@@ -143,6 +143,7 @@ struct Wave2World {
     spent_delegations: BTreeSet<String>,
     mailbox_keys: BTreeMap<(String, String), StoredRecord>,
     chat_devices: BTreeMap<(String, String), StoredRecord>,
+    chat_device_revocations: BTreeMap<(String, String), StoredRecord>,
     chat_declarations: BTreeMap<String, StoredRecord>,
     ds_devices: BTreeMap<String, Vec<EnrolledDevice>>,
     epoch_heads: BTreeMap<String, Vec<EpochPublicDef>>,
@@ -816,6 +817,9 @@ fn dispatch_fetch_inner(
     headers: &[(String, String)],
     body: &[u8],
 ) -> WireResponse {
+    if let Some(did) = url.strip_prefix("https://plc.directory/") {
+        return WireResponse::json(200, build_did_doc(did, "https://pds.catbird.test"));
+    }
     if url.ends_with("/.well-known/did.json") {
         return WireResponse::json(200, build_did_doc(SEQUENCER, "https://ds.catbird.test"));
     }
@@ -859,6 +863,10 @@ fn dispatch_fetch_inner(
                     w.mailbox_keys.get(&(did.clone(), rkey.clone())).cloned()
                 } else if collection == "blue.catbird.chat.device" {
                     w.chat_devices.get(&(did.clone(), rkey.clone())).cloned()
+                } else if collection == "blue.catbird.chat.deviceRevocation" {
+                    w.chat_device_revocations
+                        .get(&(did.clone(), rkey.clone()))
+                        .cloned()
                 } else {
                     None
                 };
@@ -889,6 +897,63 @@ fn dispatch_fetch_inner(
             )
             .unwrap();
             WireResponse::bytes(200, "application/vnd.ipld.car", car)
+        }
+        "com.atproto.repo.createRecord" => {
+            let b: Value = serde_json::from_slice(body).unwrap();
+            let repo = b["repo"].as_str().unwrap();
+            let collection = b["collection"].as_str().unwrap();
+            let rkey = b["rkey"].as_str().unwrap_or("self");
+            let val = b.get("record").unwrap();
+            let rec = canonical_record(val).unwrap();
+            let cid = rec.cid.clone();
+            WORLD
+                .with(|cell| {
+                    let mut w = cell.borrow_mut();
+                    let key = (repo.to_owned(), rkey.to_owned());
+                    let already_exists = if collection == labyrinth::records::nsid::MAILBOX_KEYS {
+                        w.mailbox_keys.contains_key(&key)
+                    } else if collection == "blue.catbird.chat.device" {
+                        w.chat_devices.contains_key(&key)
+                    } else if collection == "blue.catbird.chat.deviceRevocation" {
+                        w.chat_device_revocations.contains_key(&key)
+                    } else if collection == "blue.catbird.chat.declaration" {
+                        w.chat_declarations.contains_key(repo)
+                    } else {
+                        false
+                    };
+                    if already_exists {
+                        return Err(WireResponse::json(
+                            400,
+                            json!({"error": "RecordAlreadyExists", "message": "record already exists"}),
+                        ));
+                    }
+                    match collection {
+                        c if c == labyrinth::records::nsid::MAILBOX_KEYS => {
+                            w.mailbox_keys.insert(key, rec);
+                        }
+                        "blue.catbird.chat.device" => {
+                            w.chat_devices.insert(key, rec);
+                        }
+                        "blue.catbird.chat.deviceRevocation" => {
+                            w.chat_device_revocations.insert(key, rec);
+                        }
+                        "blue.catbird.chat.declaration" => {
+                            w.chat_declarations.insert(repo.to_owned(), rec);
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .err()
+                .unwrap_or_else(|| {
+                    WireResponse::json(
+                        200,
+                        json!({
+                            "uri": format!("at://{repo}/{collection}/{rkey}"),
+                            "cid": cid,
+                        }),
+                    )
+                })
         }
         "com.atproto.repo.putRecord" => {
             let b: Value = serde_json::from_slice(body).unwrap();
@@ -948,6 +1013,8 @@ fn dispatch_fetch_inner(
                     w.mailbox_keys.get(&(repo.clone(), rkey.clone()))
                 } else if collection == "blue.catbird.chat.device" {
                     w.chat_devices.get(&(repo.clone(), rkey.clone()))
+                } else if collection == "blue.catbird.chat.deviceRevocation" {
+                    w.chat_device_revocations.get(&(repo.clone(), rkey.clone()))
                 } else {
                     None
                 };
@@ -982,6 +1049,16 @@ fn dispatch_fetch_inner(
                     }
                 } else if collection == "blue.catbird.chat.device" {
                     for ((owner, rkey), rec) in &w.chat_devices {
+                        if owner == repo {
+                            records.push(json!({
+                                "uri": format!("at://{repo}/{collection}/{rkey}"),
+                                "cid": rec.cid,
+                                "value": rec.value,
+                            }));
+                        }
+                    }
+                } else if collection == "blue.catbird.chat.deviceRevocation" {
+                    for ((owner, rkey), rec) in &w.chat_device_revocations {
                         if owner == repo {
                             records.push(json!({
                                 "uri": format!("at://{repo}/{collection}/{rkey}"),
@@ -2167,7 +2244,10 @@ async fn live_d4_otc_pairing_and_read_and_circle_owner_state() {
     .unwrap();
     assert!(!cleared_circle
         .pending_ops_json
-        .contains("did:plc:removedpeeraaaaaaaaaaaa"));
+        .contains("__acl__:did:plc:removedpeeraaaaaaaaaaaa"));
+    assert!(cleared_circle
+        .pending_ops_json
+        .contains("__acl_cleared__:did:plc:removedpeeraaaaaaaaaaaa"));
     let all_circles: Vec<CircleOwnerStateDto> =
         serde_wasm_bindgen::from_value(dev1.list_circle_owner_states().await.unwrap()).unwrap();
     assert_eq!(all_circles.len(), 1);
@@ -2560,7 +2640,7 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
         "WasmMlsClient handle must be closed after deleteAccountData"
     );
 
-    // 6. `retireCurrentDevice`: wipes local OPFS and deletes PDS `chat.device` without deleting account.
+    // 6. `retireCurrentDevice`: wipes local OPFS and publishes append-only PDS `chat.deviceRevocation` without deleting account.
     let carol = make_did("wave2retirecarol");
     let carol_dev = "00000000-0000-4000-8000-000000000409";
     let mut carol_client = open_client(&carol, carol_dev).await;
@@ -2569,8 +2649,13 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
     carol_client.retire_current_device().await.unwrap();
     assert!(!WORLD.with(|c| c.borrow().deleted_accounts.contains(&carol)));
     assert!(WORLD.with(|c| {
-        !c.borrow()
+        c.borrow()
             .chat_devices
+            .contains_key(&(carol.clone(), carol_dev.to_owned()))
+    }));
+    assert!(WORLD.with(|c| {
+        c.borrow()
+            .chat_device_revocations
             .contains_key(&(carol.clone(), carol_dev.to_owned()))
     }));
     let _ = SqliteConn::delete_opfs_database(&db_path_for(&bob, bob_dev));

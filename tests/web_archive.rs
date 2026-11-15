@@ -62,6 +62,7 @@ export function installArchiveFixture() {
     };
     switch (nsid) {
       case 'com.atproto.server.getServiceAuth': return reply({token: 'service-auth'});
+      case 'com.atproto.repo.createRecord':
       case 'com.atproto.repo.putRecord': {
         const r = JSON.parse(text);
         fx.records[`at://${r.repo}/${r.collection}/${r.rkey}`] = r.record;

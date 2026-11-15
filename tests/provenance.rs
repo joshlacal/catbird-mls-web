@@ -15,7 +15,7 @@ fn crate_root() -> PathBuf {
 }
 
 fn sibling(path: &str) -> PathBuf {
-    crate_root().join("../catbird-mls").join(path)
+    crate_root().join("../y9b-catbird-mls").join(path)
 }
 
 fn vendored(path: &str) -> PathBuf {
@@ -75,7 +75,7 @@ fn vendored_artifacts_match_sealed_input_manifest() {
         let output = read_bytes(&vendored(entry["target"].as_str().unwrap()));
         assert_eq!(sha256(&output), entry["sha256"].as_str().unwrap());
         let pinned = std::process::Command::new("jj")
-            .current_dir(crate_root().join("../catbird-mls"))
+            .current_dir(crate_root().join("../y9b-catbird-mls"))
             .args([
                 "--ignore-working-copy",
                 "file",

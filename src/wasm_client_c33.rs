@@ -18,16 +18,16 @@ use openmls_basic_credential::SignatureKeyPair;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use catbird_mls::canonical_transport::{
+    is_transient_wire_failure, retry_after_secs, MAX_RETRY_AFTER_SECS,
+};
 use catbird_mls::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
 use catbird_mls::client::chat_wire;
 use catbird_mls::client::QueuedLabyrinthArchivePayload;
-use catbird_mls::metadata::GroupMetadataV1;
-use catbird_mls::orchestrator::canonical_transport::{
-    is_transient_wire_failure, retry_after_secs, MAX_RETRY_AFTER_SECS,
-};
-use catbird_mls::orchestrator::direct_request_bootstrap::{
+use catbird_mls::direct_request_bootstrap::{
     self, DirectRequestBootstrap, DirectRequestBootstrapInput,
 };
+use catbird_mls::metadata::GroupMetadataV1;
 use catbird_mls::storage::driver_wasm::WasmSqlBackend;
 use catbird_mls::storage::{
     ConversationRow, KvWriteBatch, KvWriteOverlay, MessageRow, OpenMlsKvProvider, OpenMlsKvStorage,

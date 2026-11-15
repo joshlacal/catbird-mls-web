@@ -29,7 +29,7 @@ export function installDs() {
     const nsid = new URL(request.url).pathname.replace('/xrpc/', '');
     ds.calls[nsid] = (ds.calls[nsid] || 0) + 1;
     if (nsid === 'com.atproto.server.getServiceAuth') return reply({token: 'service-auth'});
-    if (nsid === 'com.atproto.repo.putRecord') return reply({uri: 'at://fixture', cid: 'bafyfixture'});
+    if (nsid === 'com.atproto.repo.putRecord' || nsid === 'com.atproto.repo.createRecord') return reply({uri: 'at://fixture', cid: 'bafyfixture'});
     if (nsid === 'blue.catbird.chat.getOwnDevices') {
       const header = request.headers.get('catbird-chat-read');
       if (!header || !request.headers.get('catbird-chat-read-signature')) return fail('InvalidSignature', 401);
@@ -243,6 +243,7 @@ async fn a_key_mismatch_refuses_before_any_pds_write() {
         .unwrap();
     assert!(error.contains("DeviceAlreadyExists"), "{error}");
     assert_eq!(dsCalls("com.atproto.repo.putRecord"), 0, "{error}");
+    assert_eq!(dsCalls("com.atproto.repo.createRecord"), 0, "{error}");
 
     answerEnrollWithKey(&other_key);
     let client = open(
@@ -260,6 +261,7 @@ async fn a_key_mismatch_refuses_before_any_pds_write() {
         "{error}"
     );
     assert_eq!(dsCalls("com.atproto.repo.putRecord"), 0, "{error}");
+    assert_eq!(dsCalls("com.atproto.repo.createRecord"), 0, "{error}");
     assert_eq!(dsKey(held).as_deref(), Some(other_key.as_str()));
 }
 

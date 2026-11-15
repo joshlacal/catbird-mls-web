@@ -11,16 +11,16 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use catbird_mls::canonical_transport::{derive_key_id, CanonicalOperation};
 use catbird_mls::chat_v2::transcript::{
     decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
 };
 use catbird_mls::client::{
     chat_wire, QueuedLabyrinthArchivePayload, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
-use catbird_mls::orchestrator::canonical_transport::{derive_key_id, CanonicalOperation};
-use catbird_mls::orchestrator::MLSMessagePayload;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
 use catbird_mls::storage::{ConversationRow, MessageRow};
+use catbird_mls::MLSMessagePayload;
 use catbird_mls_web::{SqliteConn, WasmMlsClient};
 use labyrinth_protocol::receipt::{sign_sequencer_receipt, SequencerReceiptPayload};
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
@@ -36,6 +36,7 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 #[wasm_bindgen(inline_js = r#"
 let originalFetch;
 let receiptFor;
+let pdsRepo;
 let ds;
 const bytes = (v) => (typeof v === 'string' ? v : v.$bytes);
 const compare = (a, b) => {
@@ -111,9 +112,10 @@ function openRecovery(b) {
   return view;
 }
 const entryAt = (cid, seq) => ds.entries[cid].find((e) => e.seq === seq);
-export function installDs(receipt, didDoc, crossHomeDidDoc) {
+export function installDs(receipt, repoOp, didDoc, crossHomeDidDoc) {
   originalFetch = globalThis.fetch;
   receiptFor = receipt;
+  pdsRepo = repoOp;
   ds = {records: {}, sends: [], accepted: {}, order: {}, seq: {}, entries: {}, held: [],
     hold: 0, lose: 0, refuse: false, enforce: true, keyGeneration: 1, acks: 0, repoReadAuth: [],
     transitions: [], loseTransition: 0, inventory: {}, welcomes: {}, inbox: {}, welcomeAcks: [],
@@ -126,6 +128,10 @@ export function installDs(receipt, didDoc, crossHomeDidDoc) {
       return r;
     };
     const url = new URL(request.url);
+    if (url.hostname === 'plc.directory') {
+      const did = decodeURIComponent(url.pathname.slice(1));
+      return reply(JSON.parse(pdsRepo('doc', did, 'https://pds.catbird.test', '', '')));
+    }
     if (url.pathname === '/.well-known/did.json')
       return reply(JSON.parse(url.hostname === 'home-b.catbird.test' ? crossHomeDidDoc : didDoc));
     const nsid = url.pathname.replace('/xrpc/', '');
@@ -134,16 +140,35 @@ export function installDs(receipt, didDoc, crossHomeDidDoc) {
     const device = url.searchParams.get('actorDeviceId');
     switch (nsid) {
       case 'com.atproto.server.getServiceAuth': return reply({token: 'service-auth'});
+      case 'com.atproto.repo.createRecord':
       case 'com.atproto.repo.putRecord': {
         const r = JSON.parse(text);
-        ds.records[`at://${r.repo}/${r.collection}/${r.rkey}`] = r.record;
-        return reply({uri: 'at://fixture', cid: 'bafyfixture'});
+        const uri = `at://${r.repo}/${r.collection}/${r.rkey}`;
+        ds.records[uri] = r.record;
+        return reply({uri, cid: pdsRepo('cid', JSON.stringify(r.record), '', '', '')});
+      }
+      case 'com.atproto.repo.getRecord': {
+        const uri = `at://${url.searchParams.get('repo')}/${url.searchParams.get('collection')}/${url.searchParams.get('rkey')}`;
+        return uri in ds.records
+          ? reply({uri, cid: pdsRepo('cid', JSON.stringify(ds.records[uri]), '', '', ''), value: ds.records[uri]})
+          : reply({error: 'RecordNotFound', message: uri}, 400);
       }
       case 'com.atproto.repo.listRecords': {
         ds.repoReadAuth.push(request.headers.get('authorization'));
         const prefix = `at://${url.searchParams.get('repo')}/${url.searchParams.get('collection')}/`;
         return reply({records: Object.entries(ds.records).filter(([uri]) => uri.startsWith(prefix))
-          .map(([uri, value]) => ({uri, cid: 'bafyfixture', value}))});
+          .map(([uri, value]) => ({uri, cid: pdsRepo('cid', JSON.stringify(value), '', '', ''), value}))});
+      }
+      case 'com.atproto.sync.getRecord': {
+        ds.repoReadAuth.push(request.headers.get('authorization'));
+        const did = url.searchParams.get('did'), col = url.searchParams.get('collection'), rkey = url.searchParams.get('rkey');
+        const uri = `at://${did}/${col}/${rkey}`;
+        if (!(uri in ds.records)) return reply({error: 'RecordNotFound'}, 404);
+        const b64 = pdsRepo('car', did, col, rkey, JSON.stringify(ds.records[uri]));
+        const car = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+        const rc = new Response(car, {status: 200, headers: {'content-type': 'application/vnd.ipld.car'}});
+        Object.defineProperty(rc, 'url', {value: request.url});
+        return rc;
       }
       case 'blue.catbird.chat.enrollDevice':
         ds.kps[b.deviceId] = b.keyPackages.slice();
@@ -288,7 +313,12 @@ export function dsTransitions() { return JSON.stringify(ds.transitions); }
 export function welcomeAcks() { return JSON.stringify(ds.welcomeAcks); }
 "#)]
 extern "C" {
-    fn installDs(receipt: &js_sys::Function, did_doc: &str, cross_home_did_doc: &str);
+    fn installDs(
+        receipt: &js_sys::Function,
+        repo_op: &js_sys::Function,
+        did_doc: &str,
+        cross_home_did_doc: &str,
+    );
     fn openConversation(cid: &str);
     fn holdNextSend();
     fn loseNextSendResponse();
@@ -438,6 +468,70 @@ fn with_current_receipt(mut entry: Value) -> Value {
     entry
 }
 
+fn pds_repo_key(did: &str) -> p256::SecretKey {
+    let mut h = Sha256::new();
+    h.update(b"test-pds-repo-key:");
+    h.update(did.as_bytes());
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&h.finalize());
+    seed[0] = (seed[0] & 0x7f) | 1;
+    p256::SecretKey::from_slice(&seed).unwrap()
+}
+
+fn pds_tid(seq: u64) -> String {
+    const ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
+    let v = (1u64 << 62) | seq;
+    (0..13)
+        .rev()
+        .map(|i| ALPHABET[((v >> (5 * i)) & 31) as usize] as char)
+        .collect()
+}
+
+fn pds_repo_op(op: String, a: String, b: String, c: String, d: String) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REV_SEQ: AtomicU64 = AtomicU64::new(1);
+    use atproto_spaces::kem::encode_p256_did_key;
+    use atproto_spaces::tokens::SpaceSigningKey;
+    use catbird_mls::labyrinth::repo_proof::{
+        build_repo_proof_car_v1, encode_atproto_json_record_dagcbor,
+    };
+    match op.as_str() {
+        "doc" => {
+            let sign_mb = encode_p256_did_key(&pds_repo_key(&a).public_key());
+            json!({
+                "id": a,
+                "verificationMethod": [{
+                    "id": format!("{a}#atproto"),
+                    "controller": a,
+                    "type": "Multikey",
+                    "publicKeyMultibase": sign_mb.strip_prefix("did:key:").unwrap(),
+                }],
+                "service": [{
+                    "id": format!("{a}#atproto_pds"),
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": b,
+                }],
+            })
+            .to_string()
+        }
+        "cid" => {
+            let v: Value = serde_json::from_str(&a).unwrap();
+            let (cid, _) = encode_atproto_json_record_dagcbor(&v).unwrap();
+            cid.to_string()
+        }
+        "car" => {
+            let v: Value = serde_json::from_str(&d).unwrap();
+            let (_, dagcbor) = encode_atproto_json_record_dagcbor(&v).unwrap();
+            let sk = SpaceSigningKey::from_p256_secret(&pds_repo_key(&a), "#atproto");
+            let rev = pds_tid(REV_SEQ.fetch_add(1, Ordering::Relaxed));
+            let (_, car) =
+                build_repo_proof_car_v1(&a, &rev, &[(format!("{b}/{c}"), dagcbor)], &sk).unwrap();
+            STANDARD.encode(car)
+        }
+        other => panic!("unknown pds_repo_op: {other}"),
+    }
+}
+
 /// The sequencer DID document retains every receipt method it ever signed with (G3).
 fn install_ds() -> RestoreFetch {
     let did_doc = |sequencer_did: &str| {
@@ -458,12 +552,16 @@ fn install_ds() -> RestoreFetch {
         json!({"id": sequencer_did, "verificationMethod": methods})
     };
     let receipt = Closure::<dyn Fn(String) -> String>::new(receipt_for);
+    let repo_op =
+        Closure::<dyn Fn(String, String, String, String, String) -> String>::new(pds_repo_op);
     installDs(
         receipt.as_ref().unchecked_ref(),
+        repo_op.as_ref().unchecked_ref(),
         &did_doc(SEQUENCER).to_string(),
         &did_doc(CROSS_HOME_DS).to_string(),
     );
     receipt.forget();
+    repo_op.forget();
     RestoreFetch
 }
 

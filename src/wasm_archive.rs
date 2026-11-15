@@ -16,11 +16,15 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use catbird_mls::canonical_transport::{
+    derive_key_id, CanonicalOperation, GatewayResponse, PreparedRequest,
+};
 use catbird_mls::client::{
     chat_wire, CircleOwnerStateDto, DeviceRevocationReport, LabyrinthBackupStatus,
     LabyrinthRotationExclusion, MailboxReadStateRecord, OtcInitiatedSession, OtcPairingCompletion,
     QueuedLabyrinthArchivePayload, RegisteredDeviceInfo, UploadedConversationAttachment,
 };
+use catbird_mls::labyrinth::session::{AuthorityResult, OrchestratorError};
 use catbird_mls::labyrinth::session::{
     LocalConversationAuthority, LocalGroupSnapshot, LocalLeafKeys,
 };
@@ -38,14 +42,10 @@ use catbird_mls::labyrinth::{
     LabyrinthSession, SessionDeps, SignerFault, StateVault, XrpcTransportError,
 };
 use catbird_mls::messaging::receive::OriginalSenderArchiveAttestationEnvelope;
-use catbird_mls::orchestrator::canonical_transport::{
-    derive_key_id, CanonicalOperation, GatewayResponse, PreparedRequest,
-};
-use catbird_mls::orchestrator::error::OrchestratorError;
-use catbird_mls::orchestrator::MLSMessagePayload;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend};
 use catbird_mls::storage::{MessageRow, MutationJournalRow, OpenMlsKvProvider, OpenMlsKvStorage};
 use catbird_mls::MLSError;
+use catbird_mls::MLSMessagePayload;
 use labyrinth::client::{Clock, CompositeDirectory, LoadedMessage};
 use labyrinth::mailbox::EpochPublic;
 use labyrinth::mek::{Mek, MekProvenance};
@@ -563,8 +563,7 @@ impl WasmLocalConversationAuthority {
     fn group_view(
         &self,
         conversation_id: &str,
-    ) -> catbird_mls::orchestrator::error::Result<Option<(Vec<u8>, u64, i64, Vec<(String, Vec<u8>)>)>>
-    {
+    ) -> AuthorityResult<Option<(Vec<u8>, u64, i64, Vec<(String, Vec<u8>)>)>> {
         let backend = self.db.backend();
         let Some(convo) = backend
             .get_conversation(conversation_id)
@@ -606,7 +605,7 @@ impl LocalConversationAuthority for WasmLocalConversationAuthority {
         &self,
         conversation_id: &str,
         queued_group_id_hex: Option<&str>,
-    ) -> catbird_mls::orchestrator::error::Result<Option<LocalGroupSnapshot>> {
+    ) -> AuthorityResult<Option<LocalGroupSnapshot>> {
         let Some((group_id, epoch, _, leaves)) = self.group_view(conversation_id)? else {
             return Ok(None);
         };
@@ -628,7 +627,7 @@ impl LocalConversationAuthority for WasmLocalConversationAuthority {
         &self,
         conversation_id: &str,
         did: &str,
-    ) -> catbird_mls::orchestrator::error::Result<Option<LocalLeafKeys>> {
+    ) -> AuthorityResult<Option<LocalLeafKeys>> {
         let Some((_, _, applied, leaves)) = self.group_view(conversation_id)? else {
             return Ok(None);
         };
@@ -658,7 +657,7 @@ impl LocalConversationAuthority for WasmLocalConversationAuthority {
     async fn authorized_chat_device_keys(
         &self,
         did: &str,
-    ) -> catbird_mls::orchestrator::error::Result<Option<Vec<[u8; 32]>>> {
+    ) -> AuthorityResult<Option<Vec<[u8; 32]>>> {
         if did == self.client.account_did {
             return Ok(None);
         }
@@ -1959,16 +1958,20 @@ impl WasmMlsClient {
         }
 
         let mut pds_record_deleted = false;
-        if let Ok(bytes) = serde_json::to_vec(&json!({
-            "repo": self.account_did,
-            "collection": "blue.catbird.chat.device",
-            "rkey": target_trimmed,
-        })) {
+        let created_at = chat_wire::now_rfc3339_millis();
+        if let Ok(bytes) = chat_wire::build_pds_device_revocation_create_record_body_at(
+            &self.account_did,
+            &own_device_id,
+            target_trimmed,
+            &created_at,
+            &actor_signer,
+            Some("revoked_by_sibling"),
+        ) {
             if let Ok((st, _)) = self
-                .pds_post_json(&session_token, "/xrpc/com.atproto.repo.deleteRecord", bytes)
+                .pds_post_json(&session_token, "/xrpc/com.atproto.repo.createRecord", bytes)
                 .await
             {
-                pds_record_deleted = (200..300).contains(&st);
+                pds_record_deleted = (200..300).contains(&st) || matches!(st, 400 | 409);
             }
         }
 
@@ -2053,15 +2056,19 @@ impl WasmMlsClient {
                             }
                         }
                     }
-                    if let Ok(bytes) = serde_json::to_vec(&json!({
-                        "repo": self.account_did,
-                        "collection": "blue.catbird.chat.device",
-                        "rkey": own_device_id,
-                    })) {
+                    let created_at = chat_wire::now_rfc3339_millis();
+                    if let Ok(bytes) = chat_wire::build_pds_device_revocation_create_record_body_at(
+                        &self.account_did,
+                        &own_device_id,
+                        &own_device_id,
+                        &created_at,
+                        &signer,
+                        Some("retired"),
+                    ) {
                         let _ = self
                             .pds_post_json(
                                 &session_token,
-                                "/xrpc/com.atproto.repo.deleteRecord",
+                                "/xrpc/com.atproto.repo.createRecord",
                                 bytes,
                             )
                             .await;

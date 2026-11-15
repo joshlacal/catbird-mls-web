@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
+use catbird_mls::canonical_transport::derive_key_id;
 use catbird_mls::client::{
     account_did_hash_hex, evaluate_spaces_eligibility, execute_pq_otc_handshake,
     generate_otc_offer, generate_recovery_code_vdevice, normalize_account_did,
@@ -19,7 +20,6 @@ use catbird_mls::client::{
     UploadedConversationAttachment,
 };
 use catbird_mls::groups::lifecycle::MemberRole;
-use catbird_mls::orchestrator::canonical_transport::derive_key_id;
 use catbird_mls::requests::c33::{
     validate_direct_request_key_package_lifetime, DIRECT_REQUEST_KP_MIN_LIFETIME_SECS,
     RECOVERY_KP_MAX_LIFETIME_SECS,
@@ -130,6 +130,7 @@ impl WasmMlsClient {
 
     fn wipe_and_close_local_storage(&mut self) -> Result<(), MLSError> {
         *self.auth_token.borrow_mut() = None;
+        crate::sync_public_api_state(&self.home_ds_endpoint, &self.home_ds_did, None);
         *self.pending_otc_initiator.borrow_mut() = None;
         *self.pending_otc_offer_digits.borrow_mut() = None;
         if let Some(db) = self.db.take() {
@@ -144,7 +145,13 @@ impl WasmMlsClient {
     /// Inject or refresh the `nest` BFF / OAuth bearer session token for live XRPC dispatches.
     #[wasm_bindgen(js_name = setAuthToken)]
     pub fn set_auth_token(&self, token: Option<String>) {
-        *self.auth_token.borrow_mut() = token.filter(|s| !s.trim().is_empty());
+        let cleaned = token.filter(|s| !s.trim().is_empty());
+        crate::sync_public_api_state(
+            &self.home_ds_endpoint,
+            &self.home_ds_did,
+            cleaned.as_deref(),
+        );
+        *self.auth_token.borrow_mut() = cleaned;
     }
 
     #[wasm_bindgen(js_name = accountDid)]

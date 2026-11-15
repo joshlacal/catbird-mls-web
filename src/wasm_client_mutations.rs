@@ -14,6 +14,10 @@ use openmls_traits::OpenMlsProvider;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use catbird_mls::canonical_transport::{
+    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id,
+    is_transient_wire_failure, CanonicalOperation,
+};
 use catbird_mls::chat_v2::ids::BareDid;
 use catbird_mls::chat_v2::transcript::direct_request as dr_transcript;
 use catbird_mls::chat_v2::transcript::SignedMutationKind;
@@ -22,6 +26,10 @@ use catbird_mls::client::{
     normalize_account_did, LeaveConversationOutcome, QueuedLabyrinthArchivePayload,
     UploadedConversationAttachment,
 };
+use catbird_mls::direct_request_keys::{
+    DirectRequestKeyPublication, DirectRequestKeyPublicationInput,
+};
+use catbird_mls::direct_request_shared_crypto::build_request_key_publication;
 use catbird_mls::groups::lifecycle::{enforce_admin_removal_policy, MemberRole};
 use catbird_mls::groups::metadata_v1::validate_metadata_snapshot_size;
 use catbird_mls::messaging::receive::{
@@ -31,17 +39,7 @@ use catbird_mls::messaging::receive::{
 use catbird_mls::metadata::{
     derive_metadata_key_from_group, encrypt_metadata_snapshot_with_nonce, GroupMetadataV1,
 };
-use catbird_mls::orchestrator::canonical_transport::{
-    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id,
-    is_transient_wire_failure, CanonicalOperation,
-};
-use catbird_mls::orchestrator::direct_request_keys::{
-    DirectRequestKeyPublication, DirectRequestKeyPublicationInput,
-};
-use catbird_mls::orchestrator::direct_request_shared_crypto::build_request_key_publication;
-use catbird_mls::orchestrator::types::{
-    MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload,
-};
+use catbird_mls::payload_types::{MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload};
 use catbird_mls::storage::driver_wasm::WasmSqlBackend;
 use catbird_mls::storage::{
     ConversationRow, GroupMetadataRow, KvWriteOverlay, LabyrinthQueueRow, MessageRow,
@@ -566,13 +564,50 @@ impl WasmMlsClient {
             pub_key,
         )?;
         let (st1, b1) = self
-            .pds_post_json(session_token, "/xrpc/com.atproto.repo.putRecord", dev_rec)
+            .pds_post_json(
+                session_token,
+                "/xrpc/com.atproto.repo.createRecord",
+                dev_rec,
+            )
             .await?;
         if !(200..300).contains(&st1) {
-            return Err(MLSError::Internal(format!(
-                "putRecord blue.catbird.chat.device HTTP {st1}: {}",
-                String::from_utf8_lossy(&b1)
-            )));
+            if matches!(st1, 400 | 409) {
+                let get_url = format!(
+                    "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.device&rkey={}",
+                    self.pds_base(),
+                    chat_wire::urlencode_form_component(&self.account_did),
+                    chat_wire::urlencode_form_component(canonical_dev_id),
+                );
+                let resp = self
+                    .http
+                    .get(&get_url)
+                    .bearer_auth(session_token)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        MLSError::Internal(format!(
+                            "getRecord blue.catbird.chat.device failed: {e}"
+                        ))
+                    })?;
+                if resp.status().is_success() {
+                    let existing: Value = resp.json().await.map_err(|e| {
+                        MLSError::Internal(format!("parse existing chat.device record: {e}"))
+                    })?;
+                    if !chat_wire::pds_device_record_matches(&existing["value"], pub_key) {
+                        return Err(MLSError::InvalidState("EnrollmentPdsRecordConflict".into()));
+                    }
+                } else {
+                    return Err(MLSError::Internal(format!(
+                        "createRecord blue.catbird.chat.device HTTP {st1}: {}",
+                        String::from_utf8_lossy(&b1)
+                    )));
+                }
+            } else {
+                return Err(MLSError::Internal(format!(
+                    "createRecord blue.catbird.chat.device HTTP {st1}: {}",
+                    String::from_utf8_lossy(&b1)
+                )));
+            }
         }
 
         let decl_rec = chat_wire::build_pds_chat_declaration_put_record_body(

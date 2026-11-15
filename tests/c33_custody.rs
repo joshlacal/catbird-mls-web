@@ -41,12 +41,13 @@ use wasm_bindgen_test::*;
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 #[wasm_bindgen(inline_js = r#"
-let originalFetch, ds, publishResponse, acceptResponse, controlReceipt;
-export function installDs(respond, accept, receipt, didDocs, preparation) {
+let originalFetch, ds, publishResponse, acceptResponse, controlReceipt, pdsRepo;
+export function installDs(respond, accept, receipt, repoOp, didDocs, preparation) {
   originalFetch = globalThis.fetch;
   publishResponse = respond;
   acceptResponse = accept;
   controlReceipt = receipt;
+  pdsRepo = repoOp;
   const docs = JSON.parse(didDocs);
   ds = {records: {}, keys: {}, prepares: [], publishes: [], lose: 0, reply: 'signed', accept: 'signed',
     inventory: {}, welcomes: {}, entries: {}, calls: {}, accepts: [], transitions: [], transition: 'echo',
@@ -58,6 +59,10 @@ export function installDs(respond, accept, receipt, didDocs, preparation) {
       return r;
     };
     const url = new URL(request.url);
+    if (url.hostname === 'plc.directory') {
+      const did = decodeURIComponent(url.pathname.slice(1));
+      return reply(JSON.parse(pdsRepo('doc', did, 'https://pds.catbird.blue', '', '')));
+    }
     // Every did:web host serves its own document.
     if (url.pathname === '/.well-known/did.json')
       return url.host in docs ? reply(docs[url.host]) : reply({error: 'NotFound'}, 404);
@@ -68,20 +73,33 @@ export function installDs(respond, accept, receipt, didDocs, preparation) {
     const b = text ? JSON.parse(text).signedRequest?.body : undefined;
     switch (nsid) {
       case 'com.atproto.server.getServiceAuth': return reply({token: 'service-auth'});
+      case 'com.atproto.repo.createRecord':
       case 'com.atproto.repo.putRecord': {
         const r = JSON.parse(text);
-        ds.records[`at://${r.repo}/${r.collection}/${r.rkey}`] = r.record;
-        return reply({uri: 'at://fixture', cid: 'bafyfixture'});
+        const uri = `at://${r.repo}/${r.collection}/${r.rkey}`;
+        ds.records[uri] = r.record;
+        return reply({uri, cid: pdsRepo('cid', JSON.stringify(r.record), '', '', '')});
       }
       case 'com.atproto.repo.listRecords': {
         const prefix = `at://${param('repo')}/${param('collection')}/`;
         return reply({records: Object.entries(ds.records).filter(([uri]) => uri.startsWith(prefix))
-          .map(([uri, value]) => ({uri, cid: 'bafyfixture', value}))});
+          .map(([uri, value]) => ({uri, cid: pdsRepo('cid', JSON.stringify(value), '', '', ''), value}))});
       }
       case 'com.atproto.repo.getRecord': {
         const uri = `at://${param('repo')}/${param('collection')}/${param('rkey')}`;
-        return uri in ds.records ? reply({uri, cid: 'bafyfixture', value: ds.records[uri]})
+        return uri in ds.records
+          ? reply({uri, cid: pdsRepo('cid', JSON.stringify(ds.records[uri]), '', '', ''), value: ds.records[uri]})
           : reply({error: 'RecordNotFound', message: uri}, 400);
+      }
+      case 'com.atproto.sync.getRecord': {
+        const did = param('did'), col = param('collection'), rkey = param('rkey');
+        const uri = `at://${did}/${col}/${rkey}`;
+        if (!(uri in ds.records)) return reply({error: 'RecordNotFound'}, 404);
+        const b64 = pdsRepo('car', did, col, rkey, JSON.stringify(ds.records[uri]));
+        const car = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+        const rc = new Response(car, {status: 200, headers: {'content-type': 'application/vnd.ipld.car'}});
+        Object.defineProperty(rc, 'url', {value: request.url});
+        return rc;
       }
       case 'blue.catbird.chat.enrollDevice':
         return reply({device: {deviceId: b.deviceId, keyId: b.keyId, signaturePublicKey: b.signaturePublicKey,
@@ -189,6 +207,7 @@ extern "C" {
         respond: &js_sys::Function,
         accept: &js_sys::Function,
         receipt: &js_sys::Function,
+        repo_op: &js_sys::Function,
         did_docs: &str,
         preparation: &str,
     );
@@ -543,20 +562,88 @@ fn control_receipt(request: String) -> String {
     .to_string()
 }
 
+fn pds_repo_key(did: &str) -> p256::SecretKey {
+    let mut h = Sha256::new();
+    h.update(b"test-pds-repo-key:");
+    h.update(did.as_bytes());
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&h.finalize());
+    seed[0] = (seed[0] & 0x7f) | 1;
+    p256::SecretKey::from_slice(&seed).unwrap()
+}
+
+fn pds_tid(seq: u64) -> String {
+    const ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
+    let v = (1u64 << 62) | seq;
+    (0..13)
+        .rev()
+        .map(|i| ALPHABET[((v >> (5 * i)) & 31) as usize] as char)
+        .collect()
+}
+
+fn pds_repo_op(op: String, a: String, b: String, c: String, d: String) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REV_SEQ: AtomicU64 = AtomicU64::new(1);
+    use atproto_spaces::kem::encode_p256_did_key;
+    use atproto_spaces::tokens::SpaceSigningKey;
+    use catbird_mls::labyrinth::repo_proof::{
+        build_repo_proof_car_v1, encode_atproto_json_record_dagcbor,
+    };
+    match op.as_str() {
+        "doc" => {
+            let sign_mb = encode_p256_did_key(&pds_repo_key(&a).public_key());
+            json!({
+                "id": a,
+                "verificationMethod": [{
+                    "id": format!("{a}#atproto"),
+                    "controller": a,
+                    "type": "Multikey",
+                    "publicKeyMultibase": sign_mb.strip_prefix("did:key:").unwrap(),
+                }],
+                "service": [{
+                    "id": format!("{a}#atproto_pds"),
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": b,
+                }],
+            })
+            .to_string()
+        }
+        "cid" => {
+            let v: Value = serde_json::from_str(&a).unwrap();
+            let (cid, _) = encode_atproto_json_record_dagcbor(&v).unwrap();
+            cid.to_string()
+        }
+        "car" => {
+            let v: Value = serde_json::from_str(&d).unwrap();
+            let (_, dagcbor) = encode_atproto_json_record_dagcbor(&v).unwrap();
+            let sk = SpaceSigningKey::from_p256_secret(&pds_repo_key(&a), "#atproto");
+            let rev = pds_tid(REV_SEQ.fetch_add(1, Ordering::Relaxed));
+            let (_, car) =
+                build_repo_proof_car_v1(&a, &rev, &[(format!("{b}/{c}"), dagcbor)], &sk).unwrap();
+            STANDARD.encode(car)
+        }
+        other => panic!("unknown pds_repo_op: {other}"),
+    }
+}
+
 fn install_ds() -> RestoreFetch {
     let respond = Closure::<dyn Fn(String, String) -> String>::new(publish_response);
     let accept = Closure::<dyn Fn(String, String) -> String>::new(accept_response);
     let receipt = Closure::<dyn Fn(String) -> String>::new(control_receipt);
+    let repo_op =
+        Closure::<dyn Fn(String, String, String, String, String) -> String>::new(pds_repo_op);
     installDs(
         respond.as_ref().unchecked_ref(),
         accept.as_ref().unchecked_ref(),
         receipt.as_ref().unchecked_ref(),
+        repo_op.as_ref().unchecked_ref(),
         &did_documents(),
         &preparation(),
     );
     respond.forget();
     accept.forget();
     receipt.forget();
+    repo_op.forget();
     RestoreFetch
 }
 

@@ -1232,6 +1232,530 @@ impl WasmMlsClient {
     }
 }
 
+fn minify_validated_json_raw(raw: &str) -> Vec<u8> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut in_string = false;
+    let mut escape = false;
+    for &b in bytes {
+        if in_string {
+            out.push(b);
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
+            continue;
+        } else {
+            if b == b'"' {
+                in_string = true;
+            }
+            out.push(b);
+        }
+    }
+    out
+}
+
+fn is_hex_len(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn verify_optional_tls_artifacts(node: &serde_json::Value) -> Result<usize, String> {
+    use openmls::prelude::tls_codec::Deserialize as _;
+    let mut decoded = 0usize;
+    match node {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if let Some(hex_str) = v.as_str() {
+                    if k == "key_package_tls_hex" || k == "keyPackageTlsHex" {
+                        let raw =
+                            hex::decode(hex_str).map_err(|e| format!("invalid {k} hex: {e}"))?;
+                        let kp_in = KeyPackageIn::tls_deserialize_exact(&raw)
+                            .map_err(|e| format!("invalid KeyPackage TLS in {k}: {e:?}"))?;
+                        let crypto = openmls_libcrux_crypto::Provider::default();
+                        let kp_verified = kp_in
+                            .validate(crypto.crypto(), ProtocolVersion::Mls10)
+                            .map_err(|e| {
+                            format!("KeyPackage validation failed in {k}: {e:?}")
+                        })?;
+                        if kp_verified.ciphersuite() != CIPHERSUITE {
+                            return Err(format!(
+                                "KeyPackage ciphersuite {:?} != expected {:?}",
+                                kp_verified.ciphersuite(),
+                                CIPHERSUITE
+                            ));
+                        }
+                        decoded += 1;
+                    } else if matches!(
+                        k.as_str(),
+                        "welcome_tls_hex"
+                            | "commit_tls_hex"
+                            | "private_message_tls_hex"
+                            | "mls_message_tls_hex"
+                            | "welcomeTlsHex"
+                            | "commitTlsHex"
+                            | "privateMessageTlsHex"
+                            | "mlsMessageTlsHex"
+                    ) {
+                        let raw =
+                            hex::decode(hex_str).map_err(|e| format!("invalid {k} hex: {e}"))?;
+                        let _msg = MlsMessageIn::tls_deserialize_exact(&raw)
+                            .map_err(|e| format!("invalid MlsMessage TLS in {k}: {e:?}"))?;
+                        decoded += 1;
+                    }
+                } else {
+                    decoded += verify_optional_tls_artifacts(v)?;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                decoded += verify_optional_tls_artifacts(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(decoded)
+}
+
+#[derive(serde::Deserialize)]
+struct GoldenTranscriptRawEnvelope {
+    schema_version: String,
+    index: u8,
+    slug: String,
+    category: String,
+    seed: u64,
+    wire_frames: Box<serde_json::value::RawValue>,
+    wire_digest_blake3: String,
+    conversations: serde_json::Value,
+    devices: serde_json::Value,
+    assertions: serde_json::Value,
+    post_state_blake3: String,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct GoldenWireFrameView {
+    seq: u64,
+    device_id: String,
+    method: String,
+    url: String,
+    status: u16,
+    request_body_blake3: String,
+    response_body_blake3: String,
+    #[serde(default)]
+    space: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GoldenMessageView {
+    message_id: String,
+    seq: i64,
+    epoch: i64,
+    sender_did: String,
+    plaintext: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GoldenConversationView {
+    conversation_id: String,
+    is_direct: bool,
+    epoch: u64,
+    tree_hash_hex: String,
+    roster: Vec<String>,
+    active_leaf_count: usize,
+    messages: Vec<GoldenMessageView>,
+    read_through_seq: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct GoldenDeviceView {
+    label: String,
+    did: String,
+    device_id: String,
+    home_ds_did: String,
+    handle_open: bool,
+    pending_approval: bool,
+    conversation_epochs: std::collections::BTreeMap<String, u64>,
+    read_watermarks: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoldenWasmVerificationReport {
+    index: u8,
+    slug: String,
+    category: String,
+    seed: u64,
+    wire_frame_count: usize,
+    conversation_count: usize,
+    message_count: usize,
+    open_device_count: usize,
+    tls_artifacts_decoded: usize,
+    wire_digest_blake3: String,
+    post_state_blake3: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GoldenManifestFileEntry {
+    filename: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoldenManifestVerificationReport {
+    verified_count: usize,
+    manifest_sha256: String,
+}
+
+/// Verify `MANIFEST.sha256` and raw SHA-256 digests of all 50 `T7-GOLDEN-50` transcripts inside WASM (`C5`).
+#[wasm_bindgen(js_name = verifyGoldenManifest)]
+pub fn verify_golden_manifest(manifest_raw: &str, entries_js: JsValue) -> Result<JsValue, JsValue> {
+    let files: Vec<GoldenManifestFileEntry> = serde_wasm_bindgen::from_value(entries_js)
+        .map_err(|e| JsValue::from_str(&format!("invalid file entries: {e}")))?;
+    let mut expected: Vec<(String, String)> = Vec::new();
+    for line in manifest_raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((sha, fname)) = trimmed.split_once("  ") else {
+            return Err(JsValue::from_str(&format!(
+                "malformed MANIFEST.sha256 line: {line}"
+            )));
+        };
+        if !is_hex_len(sha, 64) {
+            return Err(JsValue::from_str(&format!(
+                "invalid SHA-256 hex in MANIFEST.sha256 for {fname}"
+            )));
+        }
+        expected.push((sha.to_ascii_lowercase(), fname.to_owned()));
+    }
+    if expected.len() != 50 {
+        return Err(JsValue::from_str(&format!(
+            "MANIFEST.sha256 must list 50 transcripts, found {}",
+            expected.len()
+        )));
+    }
+    if files.len() != 50 {
+        return Err(JsValue::from_str(&format!(
+            "expected 50 transcript payloads, received {}",
+            files.len()
+        )));
+    }
+    let by_name: std::collections::BTreeMap<&str, &[u8]> = files
+        .iter()
+        .map(|f| (f.filename.as_str(), f.bytes.as_slice()))
+        .collect();
+    for (expected_sha, fname) in &expected {
+        let Some(raw_bytes) = by_name.get(fname.as_str()) else {
+            return Err(JsValue::from_str(&format!(
+                "missing transcript file listed in MANIFEST.sha256: {fname}"
+            )));
+        };
+        let actual_sha = hex::encode(Sha256::digest(raw_bytes));
+        if &actual_sha != expected_sha {
+            return Err(JsValue::from_str(&format!(
+                "SHA-256 mismatch for {fname}: expected {expected_sha}, got {actual_sha}"
+            )));
+        }
+    }
+    let manifest_sha256 = hex::encode(Sha256::digest(manifest_raw.as_bytes()));
+    to_js_val(&GoldenManifestVerificationReport {
+        verified_count: expected.len(),
+        manifest_sha256,
+    })
+}
+
+/// Cryptographically verify a `T7-GOLDEN-50` transcript JSON inside compiled WASM (`C5`),
+/// including `blake3` wire/post-state digests, `SpaceUri` & DID validation, optional TLS `0x004D`
+/// artifact decoding, and unified `WasmAccountDb<SqliteConn>` SQLite round-trip projection.
+#[wasm_bindgen(js_name = verifyGoldenTranscriptJson)]
+pub fn verify_golden_transcript_json(raw_json: &str) -> Result<JsValue, JsValue> {
+    const VALID_CATEGORIES: &[&str] = &[
+        "direct1_to1",
+        "group_chat",
+        "multidevice1_to4_leaves",
+        "epoch_ratchets",
+        "federated_ds_relay_reset",
+        "y7_pruning_space_backfill",
+        "d2_device_approval",
+        "d3_deletion",
+        "d4_pq_otc_reindex",
+        "y8_read_state",
+    ];
+
+    let env: GoldenTranscriptRawEnvelope = serde_json::from_str(raw_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid GoldenTranscript JSON: {e}")))?;
+    if env.schema_version != "catbird.golden-transcript.v1" {
+        return Err(JsValue::from_str(&format!(
+            "unsupported schema_version: {}",
+            env.schema_version
+        )));
+    }
+    if !(1..=50).contains(&env.index) || env.slug.trim().is_empty() {
+        return Err(JsValue::from_str("invalid transcript index or empty slug"));
+    }
+    if !VALID_CATEGORIES.contains(&env.category.as_str()) {
+        return Err(JsValue::from_str(&format!(
+            "unknown golden category: {}",
+            env.category
+        )));
+    }
+
+    let wire_bytes = minify_validated_json_raw(env.wire_frames.get());
+    let computed_wire_blake3 = blake3::hash(&wire_bytes).to_hex().to_string();
+    if computed_wire_blake3 != env.wire_digest_blake3 {
+        return Err(JsValue::from_str(&format!(
+            "wire_digest_blake3 mismatch on #{:02} ({}): expected {}, computed {}",
+            env.index, env.slug, env.wire_digest_blake3, computed_wire_blake3
+        )));
+    }
+
+    let post_state_bytes = serde_json::to_vec(&serde_json::json!({
+        "conversations": &env.conversations,
+        "devices": &env.devices,
+        "assertions": &env.assertions,
+    }))
+    .map_err(|e| JsValue::from_str(&format!("serialize post_state: {e}")))?;
+    let computed_post_blake3 = blake3::hash(&post_state_bytes).to_hex().to_string();
+    if computed_post_blake3 != env.post_state_blake3 {
+        return Err(JsValue::from_str(&format!(
+            "post_state_blake3 mismatch on #{:02} ({}): expected {}, computed {}",
+            env.index, env.slug, env.post_state_blake3, computed_post_blake3
+        )));
+    }
+
+    let wire_frames_val: serde_json::Value = serde_json::from_str(env.wire_frames.get())
+        .map_err(|e| JsValue::from_str(&format!("parse wire_frames value: {e}")))?;
+    let wire_frames: Vec<GoldenWireFrameView> = serde_json::from_str(env.wire_frames.get())
+        .map_err(|e| JsValue::from_str(&format!("parse typed wire_frames: {e}")))?;
+    let conversations: Vec<GoldenConversationView> = serde_json::from_value(env.conversations)
+        .map_err(|e| JsValue::from_str(&format!("parse typed conversations: {e}")))?;
+    let devices: Vec<GoldenDeviceView> = serde_json::from_value(env.devices)
+        .map_err(|e| JsValue::from_str(&format!("parse typed devices: {e}")))?;
+
+    let mut prev_wire_seq = 0u64;
+    for wf in &wire_frames {
+        if wf.seq <= prev_wire_seq {
+            return Err(JsValue::from_str("non-monotonic wire_frames.seq"));
+        }
+        prev_wire_seq = wf.seq;
+        if wf.device_id.trim().is_empty() || wf.method.trim().is_empty() || wf.url.trim().is_empty()
+        {
+            return Err(JsValue::from_str(
+                "empty device_id/method/url in wire_frame",
+            ));
+        }
+        if wf.status < 100 || wf.status >= 600 {
+            return Err(JsValue::from_str("invalid HTTP status in wire_frame"));
+        }
+        if !is_hex_len(&wf.request_body_blake3, 64) || !is_hex_len(&wf.response_body_blake3, 64) {
+            return Err(JsValue::from_str(
+                "invalid 64-hex request/response blake3 digest in wire_frame",
+            ));
+        }
+        if let Some(space) = &wf.space {
+            atproto_spaces::SpaceUri::parse_hedged(space).map_err(|e| {
+                JsValue::from_str(&format!("invalid wire_frame SpaceUri '{space}': {e}"))
+            })?;
+        }
+    }
+
+    let mut tls_artifacts_decoded =
+        verify_optional_tls_artifacts(&wire_frames_val).map_err(|e| JsValue::from_str(&e))?;
+    for v in env.extra.values() {
+        tls_artifacts_decoded +=
+            verify_optional_tls_artifacts(v).map_err(|e| JsValue::from_str(&e))?;
+    }
+
+    let mut total_messages = 0usize;
+    for conv in &conversations {
+        if conv.conversation_id.trim().is_empty() {
+            return Err(JsValue::from_str("empty conversation_id"));
+        }
+        if !conv.tree_hash_hex.is_empty() && !is_hex_len(&conv.tree_hash_hex, 64) {
+            return Err(JsValue::from_str("invalid tree_hash_hex length"));
+        }
+        for member_did in &conv.roster {
+            normalize_account_did(member_did).map_err(mls_to_js_err)?;
+        }
+        let mut prev_msg_seq = 0i64;
+        for msg in &conv.messages {
+            normalize_account_did(&msg.sender_did).map_err(mls_to_js_err)?;
+            if msg.seq <= 0 || msg.seq < prev_msg_seq {
+                return Err(JsValue::from_str(&format!(
+                    "I2 monotonic seq violated in {}: {} after {}",
+                    conv.conversation_id, msg.seq, prev_msg_seq
+                )));
+            }
+            prev_msg_seq = msg.seq;
+            total_messages += 1;
+        }
+        if conv.is_direct && conv.roster.len() > 2 {
+            return Err(JsValue::from_str(
+                "direct conversation exceeded 2 root DIDs",
+            ));
+        }
+        let _ = conv.active_leaf_count;
+    }
+
+    let mut open_device_count = 0usize;
+    for (dev_idx, dev) in devices.iter().enumerate() {
+        let norm_did = normalize_account_did(&dev.did).map_err(mls_to_js_err)?;
+        if !atproto_spaces::is_valid_did(&dev.home_ds_did) {
+            return Err(JsValue::from_str(&format!(
+                "invalid home_ds_did: {}",
+                dev.home_ds_did
+            )));
+        }
+        let mailbox_uri = personal_mailbox_space_uri(&norm_did);
+        atproto_spaces::SpaceUri::parse(&mailbox_uri)
+            .map_err(|e| JsValue::from_str(&format!("invalid mailbox SpaceUri: {e}")))?;
+
+        if dev.pending_approval && !dev.read_watermarks.is_empty() {
+            return Err(JsValue::from_str(&format!(
+                "D-2 violation: pending-approval device {} recorded read_watermarks",
+                dev.label
+            )));
+        }
+        if !dev.handle_open {
+            continue;
+        }
+        open_device_count += 1;
+
+        // Exercise real WASM SQLite (`WasmAccountDb<Rc<SqliteConn>>`) persistence & readback.
+        let key_hex = hex::encode(Sha256::digest(
+            format!("golden-50:{}:{}:{dev_idx}", env.index, dev.device_id).as_bytes(),
+        ));
+        let conn = Rc::new(
+            SqliteConn::open_in_memory(&key_hex)
+                .map_err(|e| JsValue::from_str(&format!("WASM SQLite open_in_memory: {e}")))?,
+        );
+        let db = WasmAccountDb::new(conn);
+        db.write_tx(|tx| {
+            tx.put_account_meta("owner_did", &norm_did, 1)?;
+            tx.put_account_meta("device_id", &dev.device_id, 1)?;
+            tx.put_account_meta("home_ds_did", &dev.home_ds_did, 1)?;
+            tx.put_account_meta(
+                "device_pending_approval",
+                if dev.pending_approval {
+                    "true"
+                } else {
+                    "false"
+                },
+                1,
+            )?;
+            for (cid, &epoch) in &dev.conversation_epochs {
+                let Some(conv) = conversations.iter().find(|c| &c.conversation_id == cid) else {
+                    continue;
+                };
+                let max_seq = conv.messages.iter().map(|m| m.seq).max().unwrap_or(0);
+                let watermark = dev.read_watermarks.get(cid).copied().unwrap_or(0) as i64;
+                let unread_count =
+                    conv.messages.iter().filter(|m| m.seq > watermark).count() as i64;
+                let group_id = Sha256::digest(cid.as_bytes()).to_vec();
+                tx.upsert_conversation(&catbird_mls::storage::ConversationRow {
+                    conversation_id: cid.clone(),
+                    group_id: group_id.clone(),
+                    generation: 0,
+                    epoch: epoch as i64,
+                    last_seq: max_seq.max(conv.read_through_seq as i64),
+                    sequencer_did: dev.home_ds_did.clone(),
+                    space_uri: Some(mailbox_uri.clone()),
+                    title: (!conv.is_direct).then(|| format!("group-{cid}")),
+                    unread_count,
+                    updated_at_ms: 1_763_000_000_000 + (env.index as i64),
+                })?;
+                if watermark > 0 {
+                    tx.put_account_meta(
+                        &format!("read_watermark:{cid}"),
+                        &watermark.to_string(),
+                        1,
+                    )?;
+                }
+                for msg in &conv.messages {
+                    tx.insert_message(&catbird_mls::storage::MessageRow {
+                        message_id: msg.message_id.clone(),
+                        conversation_id: cid.clone(),
+                        group_id: group_id.clone(),
+                        epoch: msg.epoch,
+                        seq: msg.seq,
+                        sender_did: msg.sender_did.clone(),
+                        sender_device_id: dev.device_id.clone(),
+                        plaintext_json: serde_json::json!({
+                            "type": "text",
+                            "text": msg.plaintext,
+                        })
+                        .to_string(),
+                        created_at_ms: 1_763_000_000_000 + msg.seq,
+                        is_own: msg.sender_did == norm_did,
+                    })?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(mls_to_js_err)?;
+
+        let stored_owner = db
+            .backend()
+            .get_account_meta("owner_did")
+            .map_err(mls_to_js_err)?;
+        if stored_owner.as_deref() != Some(norm_did.as_str()) {
+            return Err(JsValue::from_str("owner_did round-trip mismatch"));
+        }
+        let stored_convos = db
+            .backend()
+            .list_conversations(None, 100)
+            .map_err(mls_to_js_err)?;
+        for (cid, &expected_epoch) in &dev.conversation_epochs {
+            let Some(conv) = conversations.iter().find(|c| &c.conversation_id == cid) else {
+                continue;
+            };
+            let Some(row) = stored_convos.iter().find(|r| &r.conversation_id == cid) else {
+                return Err(JsValue::from_str(&format!(
+                    "missing persisted conversation {cid}"
+                )));
+            };
+            if row.epoch != expected_epoch as i64 {
+                return Err(JsValue::from_str(&format!(
+                    "conversation epoch mismatch for {cid}"
+                )));
+            }
+            let stored_msgs = db
+                .backend()
+                .list_messages(cid, None, 250)
+                .map_err(mls_to_js_err)?;
+            if stored_msgs.len() != conv.messages.len() {
+                return Err(JsValue::from_str(&format!(
+                    "persisted message count mismatch for {cid}: {} != {}",
+                    stored_msgs.len(),
+                    conv.messages.len()
+                )));
+            }
+        }
+    }
+
+    to_js_val(&GoldenWasmVerificationReport {
+        index: env.index,
+        slug: env.slug,
+        category: env.category,
+        seed: env.seed,
+        wire_frame_count: wire_frames.len(),
+        conversation_count: conversations.len(),
+        message_count: total_messages,
+        open_device_count,
+        tls_artifacts_decoded,
+        wire_digest_blake3: computed_wire_blake3,
+        post_state_blake3: computed_post_blake3,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::uuid_v4;

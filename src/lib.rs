@@ -84,7 +84,7 @@ pub use browser_transport::{
 pub use credentials::SqliteCredentialStore as SqliteCredentialStoreExport;
 pub use mls_storage::{WasmSqliteStorage, WasmStorageBackend as WasmStorageBackendExport};
 pub use sqlite_conn::{SqliteConn, WasmSqliteError};
-pub use wasm_client::WasmMlsClient;
+pub use wasm_client::{verify_golden_manifest, verify_golden_transcript_json, WasmMlsClient};
 pub use wasm_mls_context::WasmMLSContext as WasmMLSContextExport;
 
 // ---------------------------------------------------------------------------

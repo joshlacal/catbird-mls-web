@@ -38,7 +38,7 @@ use catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1;
 use catbird_mls::orchestrator::MLSMessagePayload;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
 use catbird_mls::storage::MessageRow;
-use catbird_mls_web::{SqliteConn, WasmMlsClient};
+use catbird_mls_web::{verify_golden_transcript_json, SqliteConn, WasmMlsClient};
 use labyrinth::records::EpochPublicDef;
 use labyrinth_protocol::receipt::{sign_sequencer_receipt, SequencerReceiptPayload};
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
@@ -2653,4 +2653,28 @@ fn add_bob_leaf_to_local_group(alice: &str, alice_dev: &str, bob: &str, bob_dev:
         )
     })
     .unwrap();
+}
+
+#[wasm_bindgen_test]
+fn wave2_golden_50_wasm_conformance_verifies_transcript_and_tamper_fails_closed() {
+    let raw = include_str!(
+        "../../catbird-sim/fixtures/golden_50/transcript_01_direct_1to1_bootstrap_accept_reply.json"
+    );
+    let report_js = verify_golden_transcript_json(raw).expect("verify golden transcript #01");
+    let report: Value = serde_wasm_bindgen::from_value(report_js).unwrap();
+    assert_eq!(report["index"], 1);
+    assert_eq!(report["category"], "direct1_to1");
+    assert!(report["wireFrameCount"].as_u64().unwrap() > 0);
+    assert!(report["conversationCount"].as_u64().unwrap() >= 1);
+    assert!(report["openDeviceCount"].as_u64().unwrap() >= 1);
+
+    // Tampered wire_digest_blake3 must fail closed.
+    let mut tampered: Value = serde_json::from_str(raw).unwrap();
+    tampered["wire_digest_blake3"] = json!("0".repeat(64));
+    let err = verify_golden_transcript_json(&serde_json::to_string(&tampered).unwrap())
+        .expect_err("tampered wire_digest_blake3 must fail");
+    assert!(err
+        .as_string()
+        .unwrap_or_default()
+        .contains("wire_digest_blake3 mismatch"));
 }

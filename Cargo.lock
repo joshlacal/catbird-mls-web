@@ -523,6 +523,7 @@ dependencies = [
  "async-trait",
  "atproto-spaces",
  "base64 0.22.1",
+ "blake3",
  "bytes",
  "catbird-atproto",
  "catbird_mls",

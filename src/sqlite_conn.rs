@@ -567,6 +567,53 @@ impl SqliteConn {
         Ok(conn)
     }
 
+    /// Open an isolated in-memory unified SQLite database (`:memory:`) for
+    /// deterministic WASM conformance replay (`T7-GOLDEN-50` / `Spec §6.1`).
+    pub fn open_in_memory(key: &str) -> Result<Self, WasmSqliteError> {
+        crate::browser_session::check()
+            .map_err(|error| WasmSqliteError::Serialization(error.into()))?;
+        if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(WasmSqliteError::Serialization(
+                "database key must be 64 hexadecimal characters".into(),
+            ));
+        }
+        let decoded_key = hex::decode(key)
+            .map_err(|e| WasmSqliteError::Serialization(format!("invalid hex key: {e}")))?;
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&decoded_key);
+
+        let mut db: *mut sqlite3 = std::ptr::null_mut();
+        let ret = unsafe {
+            sqlite3_open_v2(
+                c":memory:".as_ptr().cast(),
+                &mut db as *mut _,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MEMORY,
+                std::ptr::null(),
+            )
+        };
+        if ret != SQLITE_OK || db.is_null() {
+            if !db.is_null() {
+                unsafe {
+                    sqlite3_close(db);
+                }
+            }
+            return Err(WasmSqliteError::Sqlite {
+                code: ret,
+                message: "Failed to open in-memory database".to_string(),
+            });
+        }
+
+        let conn = Self {
+            db,
+            db_path: ":memory:".to_owned(),
+        };
+        let init_pragmas = catbird_mls::storage::wasm_sqlite3mc_init_pragmas(&key_bytes);
+        let _ = conn.exec_raw(&init_pragmas);
+        conn.exec_raw("SELECT count(*) FROM sqlite_master;")?;
+        conn.exec_raw(catbird_mls::storage::UNIFIED_SCHEMA_DDL)?;
+        Ok(conn)
+    }
+
     /// Synchronous transaction on this shared connection. Never await inside
     /// the closure: the OPFS connection belongs to a single Worker.
     /// Nested transactions fail before running the closure.

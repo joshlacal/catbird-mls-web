@@ -164,6 +164,7 @@ async fn external_join_cannot_overwrite_request_candidate_after_reopen() {
             avatar_blob_locator: None,
             avatar_content_type: None,
             space_avatar: None,
+            extra: Default::default(),
         },
     };
     let record = MlsCryptoContext::prepare_direct_request_bootstrap(&context, &input).unwrap();

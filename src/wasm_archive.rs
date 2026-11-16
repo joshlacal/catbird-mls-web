@@ -1111,6 +1111,7 @@ impl WasmMlsClient {
                     ),
                     has_recovery_code: false,
                     has_passkey_prf: false,
+                    recovery_needs_attention: false,
                     epoch_seq: 0,
                     active_device_ids: vec![self.device_id.clone()],
                     recovery_method_stale: false,

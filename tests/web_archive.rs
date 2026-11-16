@@ -219,7 +219,28 @@ fn queue_own_send(
     cid: &str,
     mid: &str,
 ) -> QueuedLabyrinthArchivePayload {
-    let frame = chat_wire::canonical_labyrinth_frame_json(TEXT);
+    queue_own_send_with_frame(
+        alice,
+        bob,
+        signer,
+        cid,
+        mid,
+        2,
+        TEXT,
+        chat_wire::canonical_labyrinth_frame_json(TEXT),
+    )
+}
+
+fn queue_own_send_with_frame(
+    alice: &str,
+    bob: &str,
+    signer: &SignatureKeyPair,
+    cid: &str,
+    mid: &str,
+    seq: u64,
+    display: &str,
+    frame: String,
+) -> QueuedLabyrinthArchivePayload {
     let nonce = [7u8; 32];
     let commitment =
         PrivateMessageAadEnvelope::for_payload(&nonce, frame.as_bytes()).archive_commitment;
@@ -244,7 +265,7 @@ fn queue_own_send(
             sender_device_did_url: format!("{alice}#{ALICE_DEVICE}"),
             entry_id: mid.into(),
             archive_commitment: commitment,
-            seq: 2,
+            seq: seq.try_into().unwrap(),
             issued_at_ms,
         },
     )
@@ -253,7 +274,7 @@ fn queue_own_send(
         "sequencerDid": SEQUENCER, "conversationId": cid, "generation": 0,
         "groupId": STANDARD.encode(&group_id), "epoch": 1, "senderDid": alice,
         "senderDeviceId": ALICE_DEVICE, "entryId": mid,
-        "archiveCommitment": STANDARD.encode(commitment), "seq": 2, "issuedAtMs": issued_at_ms,
+        "archiveCommitment": STANDARD.encode(commitment), "seq": seq, "issuedAtMs": issued_at_ms,
         "kid": signed.key_id, "signature": STANDARD.encode(signed.signature),
     });
     let sec1 = sequencer_key().verifying_key().to_encoded_point(false);
@@ -277,12 +298,12 @@ fn queue_own_send(
         group_id_hex: hex::encode(&group_id),
         epoch: 1,
         expected_member_dids: vec![alice.into(), bob.into()],
-        seq: 2,
+        seq: seq as i64,
         sender_did: alice.into(),
         sender_device_id: ALICE_DEVICE.into(),
         sequencer_did: SEQUENCER.into(),
         space_uri: None,
-        plaintext_json: TEXT.into(),
+        plaintext_json: display.into(),
         labyrinth_frame_json: frame,
         mls_ciphertext_b64: String::new(),
         frame_nonce_b64: Some(STANDARD.encode(nonce)),
@@ -296,7 +317,7 @@ fn queue_own_send(
                 item_id: mid.into(),
                 conversation_id: cid.into(),
                 group_id_hex: queued.group_id_hex.clone(),
-                seq: 2,
+                seq: seq as i64,
                 payload_bytes: serde_json::to_vec(&queued).unwrap(),
                 created_at_ms: issued_at_ms,
             })
@@ -315,6 +336,138 @@ fn queued_rows(did: &str) -> usize {
         .list_labyrinth_queue(None, 10)
         .unwrap()
         .len()
+}
+
+/// An older queue row can reach flush without the new enqueue gate. Its authenticated sender
+/// veto must still prevent MEK distribution and the Space write.
+#[wasm_bindgen_test]
+async fn flush_drops_sender_veto_before_archive_write() {
+    let _fetch = install();
+    let (alice, bob) = (did("archivevetoalice"), did("archivevetobob"));
+    let cid = "00000000-0000-4000-8000-0000000c0011";
+    let mid = "00000000-0000-4000-8000-0000000d0011";
+    let (alice_signer, _) = enroll(&alice, &bob).await;
+    let frame = json!({
+        "version": 1,
+        "messageType": "system",
+        "text": "History backup turned off",
+        "historyBackupChange": false,
+        "backupPolicy": 1,
+        "noBackup": true,
+    })
+    .to_string();
+    queue_own_send_with_frame(
+        &alice,
+        &bob,
+        &alice_signer,
+        cid,
+        mid,
+        2,
+        &frame,
+        frame.clone(),
+    );
+
+    let client = open(&alice, ALICE_DEVICE).await;
+    assert_eq!(client.flush_labyrinth_queue().await.unwrap(), 0);
+    assert_eq!(queued_rows(&alice), 0);
+    assert!(space_writes().is_empty());
+}
+
+/// A locally retained, sequenced off decision also vetoes an unflagged old queue row.
+#[wasm_bindgen_test]
+async fn flush_drops_queue_row_after_sequenced_policy_off() {
+    let _fetch = install();
+    let (alice, bob) = (did("archiveflipalice"), did("archiveflipbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0012";
+    let mid = "00000000-0000-4000-8000-0000000d0012";
+    let (alice_signer, _) = enroll(&alice, &bob).await;
+    queue_own_send(&alice, &bob, &alice_signer, cid, mid);
+    account_db(&alice)
+        .write_tx(|tx| {
+            tx.put_account_meta(
+                &format!("archive.policy.flips:{cid}"),
+                r#"[{"seq":1,"enabled":false}]"#,
+                js_sys::Date::now() as i64,
+            )
+        })
+        .unwrap();
+
+    let client = open(&alice, ALICE_DEVICE).await;
+    assert_eq!(client.flush_labyrinth_queue().await.unwrap(), 0);
+    assert_eq!(queued_rows(&alice), 0);
+    assert!(space_writes().is_empty());
+}
+
+/// Creation-time queue order may put a later message before an older off control. Flush must
+/// process the policy before it decides to archive either message.
+#[wasm_bindgen_test]
+async fn flush_observes_all_queued_opt_outs_before_selecting_rows() {
+    let _fetch = install();
+    let (alice, bob) = (did("archiveorderalice"), did("archiveorderbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0013";
+    let message_id = "00000000-0000-4000-8000-0000000d0013";
+    let control_id = "00000000-0000-4000-8000-0000000d0014";
+    let (alice_signer, _) = enroll(&alice, &bob).await;
+    let normal = queue_own_send(&alice, &bob, &alice_signer, cid, message_id);
+    let frame = json!({
+        "version": 1, "messageType": "system", "text": "History backup turned off",
+        "historyBackupChange": false, "backupPolicy": 1, "noBackup": true,
+    })
+    .to_string();
+    let control = queue_own_send_with_frame(
+        &alice,
+        &bob,
+        &alice_signer,
+        cid,
+        control_id,
+        1,
+        &frame,
+        frame.clone(),
+    );
+    account_db(&alice)
+        .write_tx(|tx| {
+            tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
+                item_id: control_id.into(),
+                conversation_id: cid.into(),
+                group_id_hex: control.group_id_hex.clone(),
+                seq: 1,
+                payload_bytes: serde_json::to_vec(&control).unwrap(),
+                created_at_ms: normal.created_at_ms + 1,
+            })
+        })
+        .unwrap();
+
+    let client = open(&alice, ALICE_DEVICE).await;
+    assert_eq!(client.flush_labyrinth_queue().await.unwrap(), 0);
+    assert_eq!(queued_rows(&alice), 0);
+    assert!(space_writes().is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn flush_stops_before_writing_when_policy_queue_row_is_malformed() {
+    let _fetch = install();
+    let (alice, bob) = (did("archivemalformedalice"), did("archivemalformedbob"));
+    let cid = "00000000-0000-4000-8000-0000000c0014";
+    let mid = "00000000-0000-4000-8000-0000000d0015";
+    let (alice_signer, _) = enroll(&alice, &bob).await;
+    let normal = queue_own_send(&alice, &bob, &alice_signer, cid, mid);
+    account_db(&alice)
+        .write_tx(|tx| {
+            tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
+                item_id: "00000000-0000-4000-8000-0000000d0016".into(),
+                conversation_id: cid.into(),
+                group_id_hex: normal.group_id_hex,
+                seq: 1,
+                payload_bytes: b"{}".to_vec(),
+                created_at_ms: normal.created_at_ms + 1,
+            })
+        })
+        .unwrap();
+
+    let client = open(&alice, ALICE_DEVICE).await;
+    assert!(client.flush_labyrinth_queue().await.is_err());
+    assert_eq!(queued_rows(&alice), 2);
+    assert!(space_writes().is_empty());
 }
 
 /// Fails before the fix: the flush sealed the batch under a local random `convo_sender_mek:`

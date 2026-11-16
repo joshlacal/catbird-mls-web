@@ -42,23 +42,30 @@ use catbird_mls::metadata::{
 use catbird_mls::payload_types::{MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload};
 use catbird_mls::storage::driver_wasm::WasmSqlBackend;
 use catbird_mls::storage::{
-    ConversationRow, GroupMetadataRow, KvWriteOverlay, LabyrinthQueueRow, MessageRow,
-    OpenMlsKvProvider, OpenMlsKvStorage,
+    ConversationRow, GroupMetadataRow, KvWriteOverlay, MessageRow, OpenMlsKvProvider,
+    OpenMlsKvStorage,
 };
 use catbird_mls::MLSError;
 
+use crate::wasm_archive_policy;
 use crate::wasm_client_sync::{apply_verified_roster_effects, store_roster};
 
 use crate::wasm_client::{now_ms, now_secs, WasmMlsClient, CIPHERSUITE};
 
 pub(crate) fn canonical_labyrinth_frame_for_text(input: &str) -> (String, String) {
-    let frame = chat_wire::canonical_labyrinth_frame_json(input);
-    if serde_json::from_str::<Value>(input)
-        .ok()
-        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
-        .is_some()
-    {
-        return (input.to_string(), frame);
+    if let Ok(value) = serde_json::from_str::<Value>(input) {
+        if value.get("text").and_then(Value::as_str).is_some() {
+            let mut frame: Value =
+                serde_json::from_str(&chat_wire::canonical_labyrinth_frame_json(input))
+                    .unwrap_or_else(|_| value.clone());
+            // A simple `{text, noBackup}` display object is upgraded to a typed MLS frame by
+            // chat_wire. Carry its explicit sender veto across that normalization.
+            if let (Some(no_backup), Some(object)) = (value.get("noBackup"), frame.as_object_mut())
+            {
+                object.insert("noBackup".into(), no_backup.clone());
+            }
+            return (input.to_string(), frame.to_string());
+        }
     }
     let display = json!({ "text": input }).to_string();
     let frame_out = chat_wire::canonical_labyrinth_frame_json(&display);
@@ -1320,6 +1327,7 @@ impl WasmMlsClient {
                     avatar_blob_locator: None,
                     avatar_content_type: None,
                     space_avatar: None,
+                    extra: Default::default(),
                 };
                 tx.upsert_group_metadata(&chat_wire::group_metadata_row_from_v1(
                     conversation_id,
@@ -1750,9 +1758,6 @@ impl WasmMlsClient {
         let mut frame_nonce = [0u8; 32];
         getrandom::getrandom(&mut frame_nonce)
             .map_err(|e| MLSError::Internal(format!("getrandom: {e}")))?;
-        let archive_commitment =
-            PrivateMessageAadEnvelope::for_payload(&frame_nonce, frame_json.as_bytes())
-                .archive_commitment;
         let ts = now_ms();
 
         let prior_coords = self.load_or_build_conversation_coords(&canonical_convo_id)?;
@@ -1787,6 +1792,13 @@ impl WasmMlsClient {
                 })?;
                 return Ok((signer, auth_gen, pending));
             }
+            // Policy is sampled with the sender-generation reservation. The stamped frame is
+            // journaled byte-for-byte, so a retry cannot silently loosen an earlier decision.
+            let frame_json =
+                wasm_archive_policy::stamp_outgoing(tx, &canonical_convo_id, frame_json)?;
+            let archive_commitment =
+                PrivateMessageAadEnvelope::for_payload(&frame_nonce, frame_json.as_bytes())
+                    .archive_commitment;
             let auth_gen = tx
                 .get_account_meta("auth_generation")?
                 .and_then(|s| s.parse::<i64>().ok())
@@ -1900,7 +1912,7 @@ impl WasmMlsClient {
                     sequencer_did: convo.sequencer_did,
                     space_uri: convo.space_uri,
                     plaintext_json: display_json.to_string(),
-                    labyrinth_frame_json: frame_json.to_string(),
+                    labyrinth_frame_json: frame_json,
                     mls_ciphertext_b64: STANDARD.encode(&ciphertext),
                     frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
                     sequencer_receipt_json: None,
@@ -2030,14 +2042,7 @@ impl WasmMlsClient {
                 ts,
             )?;
             tx.dequeue_labyrinth_item(&queued.message_id)?;
-            tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                item_id: queued.message_id.clone(),
-                conversation_id: queued.conversation_id.clone(),
-                group_id_hex: queued.group_id_hex.clone(),
-                seq: authoritative_seq,
-                payload_bytes: queued_bytes,
-                created_at_ms: ts,
-            })?;
+            wasm_archive_policy::enqueue(tx, &queued)?;
             tx.delete_account_meta(&journal_key)?;
             Ok((row, gap_convo))
         })
@@ -2153,17 +2158,11 @@ impl WasmMlsClient {
                                 .as_ref()
                                 .map(|m| m.metadata_version.max(1) as u64)
                                 .unwrap_or(1);
-                            let title_s = meta_row
-                                .as_ref()
-                                .and_then(|m| m.title.clone())
-                                .unwrap_or_default();
-                            let desc_s = meta_row
-                                .as_ref()
-                                .and_then(|m| m.description.clone())
-                                .unwrap_or_default();
-                            let avatar_opt = meta_row
-                                .as_ref()
-                                .and_then(chat_wire::space_avatar_from_metadata_row);
+                            let carried_meta = wasm_archive_policy::carried_metadata(
+                                backend,
+                                conversation_id,
+                                meta_row.as_ref(),
+                            )?;
                             let meta_key = derive_metadata_key_from_group(
                                 &mut group,
                                 provider.crypto(),
@@ -2174,25 +2173,25 @@ impl WasmMlsClient {
                             .map_err(|e| {
                                 MLSError::Cryptography(format!("derive metadata key: {e}"))
                             })?;
-                            let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json(
-                                &meta_key,
-                                &convo.group_id,
-                                &convo_uuid,
-                                prior_gen,
-                                next_epoch,
-                                &next_gch,
-                                &next_ctag,
-                                &transition_id,
-                                meta_ver,
-                                1,
-                                &self.account_did,
-                                &canonical_dev_id,
-                                auth_gen,
-                                signer.public(),
-                                &title_s,
-                                &desc_s,
-                                avatar_opt,
-                            )?;
+                            let carried_snap =
+                                chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
+                                    &meta_key,
+                                    &convo.group_id,
+                                    &convo_uuid,
+                                    prior_gen,
+                                    next_epoch,
+                                    &next_gch,
+                                    &next_ctag,
+                                    &transition_id,
+                                    meta_ver,
+                                    1,
+                                    &self.account_did,
+                                    &canonical_dev_id,
+                                    auth_gen,
+                                    signer.public(),
+                                    &carried_meta,
+                                    wasm_archive_policy::metadata_nonce()?,
+                                )?;
                             Some((
                                 commit_aad_val,
                                 commit_bytes,
@@ -2331,14 +2330,25 @@ impl WasmMlsClient {
             .as_ref()
             .and_then(chat_wire::space_avatar_from_metadata_row);
 
-        let meta_v1 = GroupMetadataV1 {
-            version: 1,
-            title: title.clone(),
-            description: description.clone(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-            space_avatar: preserved_avatar,
-        };
+        let mut meta_v1 = existing_meta
+            .as_ref()
+            .map(chat_wire::group_metadata_v1_from_row)
+            .unwrap_or_else(|| GroupMetadataV1::new("", ""));
+        meta_v1.version = 1;
+        meta_v1.title = title.clone();
+        meta_v1.description = description.clone();
+        meta_v1.avatar_blob_locator = None;
+        meta_v1.avatar_content_type = preserved_avatar
+            .as_ref()
+            .and_then(|avatar| avatar.mime_type.clone());
+        meta_v1.space_avatar = preserved_avatar;
+        meta_v1.extra.insert(
+            "historyBackup".into(),
+            json!(wasm_archive_policy::current_enabled(
+                backend,
+                conversation_id
+            )?),
+        );
         let serialized = serde_json::to_vec(&meta_v1)
             .map_err(|e| MLSError::Internal(format!("serialize GroupMetadataV1: {e}")))?;
         validate_metadata_snapshot_size(&serialized)?;
@@ -3237,17 +3247,11 @@ impl WasmMlsClient {
                     .as_ref()
                     .map(|m| m.metadata_version.max(1) as u64)
                     .unwrap_or(1);
-                let title_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.title.clone())
-                    .unwrap_or_default();
-                let desc_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.description.clone())
-                    .unwrap_or_default();
-                let avatar_opt = meta_row
-                    .as_ref()
-                    .and_then(chat_wire::space_avatar_from_metadata_row);
+                let carried_meta = wasm_archive_policy::carried_metadata(
+                    backend,
+                    &canonical_cid,
+                    meta_row.as_ref(),
+                )?;
                 let meta_key = derive_metadata_key_from_group(
                     &mut group,
                     provider.crypto(),
@@ -3256,7 +3260,7 @@ impl WasmMlsClient {
                     next_epoch,
                 )
                 .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
-                let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json(
+                let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
                     &meta_key,
                     &convo.group_id,
                     &convo_uuid,
@@ -3271,9 +3275,8 @@ impl WasmMlsClient {
                     canonical_dev_id,
                     auth_gen,
                     signer.public(),
-                    &title_s,
-                    &desc_s,
-                    avatar_opt,
+                    &carried_meta,
+                    wasm_archive_policy::metadata_nonce()?,
                 )?;
                 (
                     commit_aad_val,
@@ -3465,17 +3468,8 @@ impl WasmMlsClient {
                             .as_ref()
                             .map(|m| m.metadata_version.max(1) as u64)
                             .unwrap_or(1);
-                        let title_s = meta_row
-                            .as_ref()
-                            .and_then(|m| m.title.clone())
-                            .unwrap_or_default();
-                        let desc_s = meta_row
-                            .as_ref()
-                            .and_then(|m| m.description.clone())
-                            .unwrap_or_default();
-                        let avatar_opt = meta_row
-                            .as_ref()
-                            .and_then(chat_wire::space_avatar_from_metadata_row);
+                        let carried_meta =
+                            wasm_archive_policy::carried_metadata(backend, cid, meta_row.as_ref())?;
                         let meta_key = derive_metadata_key_from_group(
                             &mut group,
                             provider.crypto(),
@@ -3484,25 +3478,25 @@ impl WasmMlsClient {
                             next_epoch,
                         )
                         .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
-                        let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json(
-                            &meta_key,
-                            &convo.group_id,
-                            &convo_uuid,
-                            prior_gen,
-                            next_epoch,
-                            &next_gch,
-                            &next_ctag,
-                            &transition_id,
-                            meta_ver,
-                            1,
-                            &self.account_did,
-                            &canonical_dev_id,
-                            auth_gen,
-                            signer.public(),
-                            &title_s,
-                            &desc_s,
-                            avatar_opt,
-                        )?;
+                        let carried_snap =
+                            chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
+                                &meta_key,
+                                &convo.group_id,
+                                &convo_uuid,
+                                prior_gen,
+                                next_epoch,
+                                &next_gch,
+                                &next_ctag,
+                                &transition_id,
+                                meta_ver,
+                                1,
+                                &self.account_did,
+                                &canonical_dev_id,
+                                auth_gen,
+                                signer.public(),
+                                &carried_meta,
+                                wasm_archive_policy::metadata_nonce()?,
+                            )?;
                         Some((
                             commit_aad_val,
                             commit_bytes,

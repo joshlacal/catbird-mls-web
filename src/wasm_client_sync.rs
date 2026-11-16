@@ -34,13 +34,13 @@ use catbird_mls::messaging::receive::{
 use catbird_mls::metadata::derive_metadata_key_from_group;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend};
 use catbird_mls::storage::{
-    ConversationRow, KvWriteOverlay, LabyrinthQueueRow, MessageRow, OpenMlsKvProvider,
-    OpenMlsKvStorage, RequestRow,
+    ConversationRow, KvWriteOverlay, MessageRow, OpenMlsKvProvider, OpenMlsKvStorage, RequestRow,
 };
 use catbird_mls::MLSMessagePayload;
 use catbird_mls::{ConversationSyncFailure, MLSError};
 
 use crate::sqlite_conn::SqliteConn;
+use crate::wasm_archive_policy;
 use crate::wasm_client::{now_ms, uuid_v4, WasmMlsClient};
 use crate::wasm_client_mutations::{
     conversation_close_key, get_commit_transition, is_terminal_refusal, pending_send_key,
@@ -1663,16 +1663,7 @@ impl WasmMlsClient {
             }
             let staged: QueuedLabyrinthArchivePayload = serde_json::from_str(&staged_str)
                 .map_err(|e| MLSError::Internal(format!("parse c33_pending_opening: {e}")))?;
-            let payload_bytes = serde_json::to_vec(&staged)
-                .map_err(|e| MLSError::Internal(format!("serialize c33_pending_opening: {e}")))?;
-            tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                item_id: staged.message_id.clone(),
-                conversation_id: conversation_id.to_string(),
-                group_id_hex: staged.group_id_hex.clone(),
-                seq: staged.seq,
-                payload_bytes,
-                created_at_ms: ts,
-            })?;
+            wasm_archive_policy::enqueue(tx, &staged)?;
             tx.put_account_meta(&key, "archived", ts)?;
             let mut reqs = tx.list_requests(None)?;
             for r in &mut reqs {
@@ -3259,6 +3250,7 @@ impl WasmMlsClient {
             {
                 let row = chat_wire::group_metadata_row_from_v1(cid, m_ver, m_epoch, &meta, ts)?;
                 title = row.title.clone();
+                wasm_archive_policy::accept_snapshot(tx, cid, transition_seq, &meta, false, ts)?;
                 tx.upsert_group_metadata(&row)?;
             }
             tx.put_account_meta(
@@ -3613,17 +3605,8 @@ impl WasmMlsClient {
             .as_ref()
             .map(|m| m.metadata_version.max(1) as u64)
             .unwrap_or(1);
-        let title_s = meta_row
-            .as_ref()
-            .and_then(|m| m.title.clone())
-            .unwrap_or_default();
-        let desc_s = meta_row
-            .as_ref()
-            .and_then(|m| m.description.clone())
-            .unwrap_or_default();
-        let avatar_opt = meta_row
-            .as_ref()
-            .and_then(chat_wire::space_avatar_from_metadata_row);
+        let carried_meta =
+            wasm_archive_policy::carried_metadata(db.backend(), cid, meta_row.as_ref())?;
         let meta_key = derive_metadata_key_from_group(
             &mut group,
             provider.crypto(),
@@ -3632,7 +3615,7 @@ impl WasmMlsClient {
             next_epoch,
         )
         .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
-        let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json(
+        let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
             &meta_key,
             &convo.group_id,
             &convo_uuid,
@@ -3647,9 +3630,8 @@ impl WasmMlsClient {
             canonical_dev_id,
             auth_gen,
             signer.public(),
-            &title_s,
-            &desc_s,
-            avatar_opt,
+            &carried_meta,
+            wasm_archive_policy::metadata_nonce()?,
         )?;
         drop(provider);
         let kv_batch = overlay.into_batch();
@@ -4247,6 +4229,9 @@ impl WasmMlsClient {
                     "I13: cached archive proof binding mismatch".into(),
                 ));
             }
+            let mut policy_evidence = evidence.clone();
+            policy_evidence.seq = entry_seq;
+            wasm_archive_policy::observe_frame(tx, &policy_evidence)?;
             convo.last_seq = convo.last_seq.max(entry_seq);
             convo.updated_at_ms = ts;
             tx.upsert_conversation(&convo)
@@ -4878,6 +4863,7 @@ impl WasmMlsClient {
                         let row =
                             chat_wire::group_metadata_row_from_v1(cid, m_ver, m_epoch, &meta, ts)?;
                         c.title = row.title.clone();
+                        wasm_archive_policy::accept_snapshot(tx, cid, entry_seq, &meta, false, ts)?;
                         tx.upsert_group_metadata(&row)?;
                     }
                     tx.put_account_meta(
@@ -5553,14 +5539,11 @@ impl WasmMlsClient {
                     // Witness copy: pre-removal history must not depend on its sender flushing.
                     // An own-account message stays the sending device's archive duty.
                     if sender_did != self.account_did {
-                        tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                            item_id: msg_id.to_string(),
-                            conversation_id: cid.to_string(),
-                            group_id_hex: archive.group_id_hex.clone(),
-                            seq: entry_seq,
-                            payload_bytes: archive_bytes,
-                            created_at_ms: ts,
-                        })?;
+                        wasm_archive_policy::enqueue(tx, &archive)?;
+                    } else {
+                        // A sibling's own message is its sending device's archive duty, but its
+                        // authenticated policy frame still applies to this device.
+                        wasm_archive_policy::observe_frame(tx, &archive)?;
                     }
                     c.last_seq = c.last_seq.max(entry_seq);
                     if sender_did != self.account_did {
@@ -5737,6 +5720,9 @@ impl WasmMlsClient {
                                 cid, m_ver, m_epoch, &meta, ts,
                             )?;
                             c.title = row.title.clone();
+                            wasm_archive_policy::accept_snapshot(
+                                tx, cid, entry_seq, &meta, true, ts,
+                            )?;
                             tx.upsert_group_metadata(&row)?;
                         }
                     }

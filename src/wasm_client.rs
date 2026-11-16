@@ -564,6 +564,33 @@ impl WasmMlsClient {
         to_js_val(&row)
     }
 
+    /// Publish an MLS-authenticated policy change. The control message itself never enters
+    /// history backup, while its sequenced setting applies to later messages.
+    #[wasm_bindgen(js_name = setHistoryBackupEnabled)]
+    pub async fn set_history_backup_enabled(
+        &self,
+        conversation_id: String,
+        enabled: bool,
+    ) -> Result<JsValue, JsValue> {
+        let frame = serde_json::json!({
+            "version": 1,
+            "messageType": "system",
+            "text": if enabled { "History backup turned on" } else { "History backup turned off" },
+            "historyBackupChange": enabled,
+            "backupPolicy": 1,
+            "noBackup": true,
+        });
+        let row = self
+            .send_message_impl(
+                &conversation_id,
+                &uuid::Uuid::new_v4().to_string(),
+                &frame.to_string(),
+            )
+            .await
+            .map_err(mls_to_js_err)?;
+        to_js_val(&row)
+    }
+
     #[wasm_bindgen(js_name = uploadConversationAttachment)]
     pub async fn upload_conversation_attachment(
         &self,

@@ -55,6 +55,7 @@ use labyrinth::store::space::{SpaceRef, SpaceRpc as _};
 use labyrinth::store::{MailboxDirectory, ThreadStore as _, TimeRange};
 
 use crate::sqlite_conn::SqliteConn;
+use crate::wasm_archive_policy;
 use crate::wasm_archive_space::{VerifiedArchiveInventory, WASM_UNAUTHENTICATED_DENIAL};
 use crate::wasm_client::{now_ms, WasmMlsClient};
 
@@ -2310,7 +2311,9 @@ impl WasmMlsClient {
                 }
             }
         }
-        let rows = db.backend().list_labyrinth_queue(None, 100)?;
+        // Scan the whole local queue for older opt-outs before selecting a bounded upload batch.
+        // Queue order is creation time, which need not match the sequencer's message order.
+        let rows = db.backend().list_labyrinth_queue(None, usize::MAX)?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -2344,24 +2347,11 @@ impl WasmMlsClient {
 
         let mut first_error = None;
         let mut groups: BTreeMap<_, Vec<(String, QueuedLabyrinthArchivePayload)>> = BTreeMap::new();
+        let mut decoded = Vec::new();
         for row in rows {
             match serde_json::from_slice::<QueuedLabyrinthArchivePayload>(&row.payload_bytes) {
                 Ok(payload) if payload.conversation_id == row.conversation_id => {
-                    let space = payload.space_uri.clone().unwrap_or_else(|| {
-                        SpaceRef::conversation(
-                            &payload.sequencer_did,
-                            &format!("{}-0", payload.conversation_id),
-                        )
-                        .to_string()
-                    });
-                    let key = (
-                        payload.conversation_id.clone(),
-                        space,
-                        payload.group_id_hex.clone(),
-                        payload.epoch,
-                        payload.expected_member_dids.clone(),
-                    );
-                    groups.entry(key).or_default().push((row.item_id, payload));
+                    decoded.push((row.item_id, payload))
                 }
                 _ => {
                     first_error.get_or_insert(MLSError::Internal(format!(
@@ -2370,6 +2360,48 @@ impl WasmMlsClient {
                     )));
                 }
             }
+        }
+        // A malformed row could be an earlier opt-out. Do not publish any selected row until
+        // every queued policy frame can be inspected.
+        if let Some(error) = first_error.take() {
+            return Err(error);
+        }
+        // Queue order is creation time, not sequencer order. Apply every old opt-out before
+        // selecting any row, but let an opt-in wait for the verified entry replay.
+        db.write_tx(|tx| {
+            for (_, payload) in &decoded {
+                wasm_archive_policy::observe_frame_tighten_only(tx, payload)?;
+            }
+            Ok(())
+        })?;
+        for (item_id, payload) in decoded.into_iter().take(100) {
+            // Re-check old queue rows before any MEK distribution or Space write. Rows from
+            // older clients may predate the sender flag or a later policy flip.
+            let allowed = db.write_tx(|tx| {
+                let allowed = wasm_archive_policy::should_enqueue(tx, &payload)?;
+                if !allowed {
+                    tx.dequeue_labyrinth_item(&item_id)?;
+                }
+                Ok(allowed)
+            })?;
+            if !allowed {
+                continue;
+            }
+            let space = payload.space_uri.clone().unwrap_or_else(|| {
+                SpaceRef::conversation(
+                    &payload.sequencer_did,
+                    &format!("{}-0", payload.conversation_id),
+                )
+                .to_string()
+            });
+            let key = (
+                payload.conversation_id.clone(),
+                space,
+                payload.group_id_hex.clone(),
+                payload.epoch,
+                payload.expected_member_dids.clone(),
+            );
+            groups.entry(key).or_default().push((item_id, payload));
         }
         let mut flushed = 0;
         for ((_, space, ..), items) in groups {

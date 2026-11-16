@@ -47,6 +47,7 @@ mod request_runtime;
 pub mod sqlite_conn;
 mod strict_projection;
 mod wasm_archive;
+mod wasm_archive_policy;
 mod wasm_archive_space;
 pub mod wasm_client;
 mod wasm_client_c33;
@@ -1944,6 +1945,7 @@ mod legacy_orchestrator_shim {
                 avatar_blob_locator: avatar_blob_locator.clone(),
                 avatar_content_type: avatar_content_type.clone(),
                 space_avatar: None,
+                extra: Default::default(),
             };
 
             let ciphertext = metadata::encrypt_metadata_blob(
@@ -2305,6 +2307,7 @@ mod legacy_orchestrator_shim {
                 avatar_blob_locator: avatar_blob_locator.clone(),
                 avatar_content_type: avatar_content_type.clone(),
                 space_avatar: None,
+                extra: Default::default(),
             };
 
             // 4. Encrypt + upload metadata blob (under fresh epoch's key).

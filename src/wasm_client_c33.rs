@@ -422,6 +422,7 @@ impl WasmMlsClient {
                     avatar_blob_locator: None,
                     avatar_content_type: None,
                     space_avatar: None,
+                    extra: Default::default(),
                 },
             },
             now_secs(),

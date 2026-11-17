@@ -1551,13 +1551,20 @@ impl WasmMlsClient {
                     Ok(())
                 })?;
             }
-            let at_u64 = parsed_revoked_ms
+            let raw_at_u64 = parsed_revoked_ms
                 .and_then(|ms| u64::try_from(ms.max(1)).ok())
                 .unwrap_or(1);
+            let archive_bound_u64 = if deletion_authority::is_valid_self_deletion_revocation_record(
+                record_val, &target_id,
+            ) {
+                deletion_authority::self_deletion_archive_revocation_bound_ms(raw_at_u64)
+            } else {
+                raw_at_u64
+            };
             revoked_times
                 .entry(target_id)
-                .and_modify(|prev| *prev = (*prev).min(at_u64))
-                .or_insert(at_u64);
+                .and_modify(|prev| *prev = (*prev).min(archive_bound_u64))
+                .or_insert(archive_bound_u64);
         }
         let mut pairs = Vec::new();
         let mut revoked_pairs = Vec::new();
@@ -5032,6 +5039,9 @@ impl WasmMlsClient {
                                                     seq,
                                                     signed_at_ms: write.signed_at_ms,
                                                     operation_id: write.operation_id.clone(),
+                                                    actor_device_id: Some(
+                                                        write.actor_device_id.clone(),
+                                                    ),
                                                 };
                                                 let applied_ok = self.apply_verified_account_deletion(
                                                     cid,
@@ -6125,7 +6135,11 @@ impl WasmMlsClient {
                             "I13: account deletion authority does not verify".into(),
                         ));
                     }
-                    if reason != UnverifiedDeletionReason::OtherConversation {
+                    if !matches!(
+                        reason,
+                        UnverifiedDeletionReason::OtherConversation
+                            | UnverifiedDeletionReason::Replayed
+                    ) {
                         tracing::warn!(
                             cid,
                             entry_seq,

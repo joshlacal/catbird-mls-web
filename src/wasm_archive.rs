@@ -766,9 +766,6 @@ impl LocalConversationAuthority for WasmLocalConversationAuthority {
         &self,
         did: &str,
     ) -> AuthorityResult<Vec<[u8; 32]>> {
-        if did == self.client.account_did {
-            return Ok(Vec::new());
-        }
         Ok(self
             .revoked_chat_device_keys_with_times(did)
             .await?
@@ -781,9 +778,6 @@ impl LocalConversationAuthority for WasmLocalConversationAuthority {
         &self,
         did: &str,
     ) -> AuthorityResult<Vec<([u8; 32], u64)>> {
-        if did == self.client.account_did {
-            return Ok(Vec::new());
-        }
         if self
             .client
             .resolve_did_document(&self.session_token, did)
@@ -810,7 +804,8 @@ impl LocalConversationAuthority for WasmLocalConversationAuthority {
             if let Some((_, revoked)) = found {
                 return Ok(revoked);
             }
-            if self.is_pds_repo_tombstoned_sync(did)
+            if did == self.client.account_did
+                || self.is_pds_repo_tombstoned_sync(did)
                 || self.verified_deleted_ms_sync(did)?.is_some()
             {
                 return Ok(Vec::new());
@@ -975,15 +970,6 @@ type WasmRestoreCopy = (
     chat_wire::StoredArchivedReceipt,
 );
 
-fn canonical_labyrinth_frame_json(plaintext_json: &str) -> String {
-    if let Ok(payload) = MLSMessagePayload::decode(plaintext_json.as_bytes()) {
-        if let Ok(encoded) = serde_json::to_string(&payload) {
-            return encoded;
-        }
-    }
-    plaintext_json.to_owned()
-}
-
 fn wasm_restore_copies(
     conversation_id: &str,
     self_did: &str,
@@ -1093,7 +1079,10 @@ fn select_wasm_restore_copy<'a>(
             && local.sender_did == row.sender_did
             && local.sender_device_id == row.sender_device_id
             && (local_gap
-                || canonical_labyrinth_frame_json(&local.plaintext_json) == row.plaintext_json)
+                || chat_wire::archive_frame_matches_local_plaintext(
+                    &local.plaintext_json,
+                    &row.plaintext_json,
+                ))
     });
     let first = matching.next()?;
     (!local_gap || matching.next().is_none()).then_some(first)
@@ -1119,6 +1108,21 @@ fn hide_deleted_accounts_wasm(
             deleted.insert(did.clone(), marker);
         } else if tombstoned_dids.contains(did) {
             deleted.insert(did.clone(), StoredAccountDeletion::SeqOnly(i64::MAX));
+        }
+    }
+    for m in messages.iter() {
+        if let (Some(sender), Some(r)) = (m.sender.as_deref(), m.archived_receipt.as_ref()) {
+            if let Some(marker) = deleted.get(sender) {
+                let seq = i64::try_from(r.signed.payload.seq).unwrap_or(i64::MAX);
+                if let Ok((_, sender_device_id)) = r.signed.payload.split_sender_device() {
+                    if marker.self_deleted_device_post_entry(seq, sender_device_id) {
+                        return Err(MLSError::Cryptography(
+                            "archive contains frame from self-deleted device at or after accountDeletedEntry"
+                                .into(),
+                        ));
+                    }
+                }
+            }
         }
     }
     let before = messages.len();
@@ -1968,7 +1972,9 @@ impl WasmMlsClient {
             let deletions = state["accountDeletions"].as_array().ok_or_else(|| {
                 MLSError::Cryptography("getConversationState is missing accountDeletions".into())
             })?;
-            for entry in deletions {
+            let mut ordered_deletions: Vec<&Value> = deletions.iter().collect();
+            ordered_deletions.sort_by_key(|entry| entry["seq"].as_i64().unwrap_or(i64::MAX));
+            for entry in ordered_deletions {
                 let seq = entry["seq"].as_i64().filter(|seq| *seq >= 1).ok_or_else(|| {
                     MLSError::Cryptography("account deletion has no positive seq".into())
                 })?;
@@ -1983,7 +1989,11 @@ impl WasmMlsClient {
                     )
                     .await?
                 {
-                    if reason == UnverifiedDeletionReason::OtherConversation {
+                    if matches!(
+                        reason,
+                        UnverifiedDeletionReason::OtherConversation
+                            | UnverifiedDeletionReason::Replayed
+                    ) {
                         continue;
                     }
                     if pinned.is_some() {
@@ -2081,7 +2091,9 @@ impl WasmMlsClient {
                 "getConversationState is missing accountDeletions".into(),
             )
         })?;
-        for entry in deletions {
+        let mut ordered_deletions: Vec<&Value> = deletions.iter().collect();
+        ordered_deletions.sort_by_key(|entry| entry["seq"].as_i64().unwrap_or(i64::MAX));
+        for entry in ordered_deletions {
             let seq = entry["seq"].as_i64().filter(|seq| *seq >= 1).ok_or_else(|| {
                 MLSError::Cryptography("account deletion has no positive seq".into())
             })?;
@@ -2095,7 +2107,11 @@ impl WasmMlsClient {
                 )
                 .await?
             {
-                if reason != UnverifiedDeletionReason::OtherConversation {
+                if !matches!(
+                    reason,
+                    UnverifiedDeletionReason::OtherConversation
+                        | UnverifiedDeletionReason::Replayed
+                ) {
                     tracing::warn!(
                         conversation_id,
                         ?reason,
@@ -2424,7 +2440,10 @@ impl WasmMlsClient {
                         .is_some_and(|(row, _, _)| {
                             row.seq == existing.seq
                                 && row.sender_did == existing.sender_did
-                                && row.plaintext_json == existing.plaintext_json
+                                && chat_wire::archive_frame_matches_local_plaintext(
+                                    &existing.plaintext_json,
+                                    &row.plaintext_json,
+                                )
                         });
                 if !matches_verified {
                     tx.delete_message(conversation_id, &existing.message_id)?;

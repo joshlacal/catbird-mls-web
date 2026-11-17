@@ -18,9 +18,11 @@ use catbird_mls::chat_v2::transcript::{
 use catbird_mls::client::deletion_authority::{
     self as deletion_authority, UnverifiedAccountDeletion, UnverifiedDeletionReason,
 };
+use catbird_mls::client::send_counter::send_counter_gap_key;
 use catbird_mls::client::{
     chat_wire, QueuedLabyrinthArchivePayload, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
+use catbird_mls::metadata::derive_metadata_key_from_group;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
 use catbird_mls::storage::{ConversationRow, MessageRow};
 use catbird_mls::MLSMessagePayload;
@@ -710,6 +712,37 @@ async fn group(members: &[(&str, &str)], cid: &str) -> Vec<WasmMlsClient> {
                 .into_group(&mls)
                 .unwrap();
         }
+        let (init_gch, init_ctag) =
+            chat_wire::compute_group_context_hash_and_tag(&group, &creator_mls).unwrap();
+        let meta_key = derive_metadata_key_from_group(
+            &mut group,
+            creator_mls.crypto(),
+            creator_mls.storage(),
+            &group_id,
+            1,
+        )
+        .unwrap();
+        let convo_uuid = uuid::Uuid::parse_str(cid).unwrap();
+        let initial_snapshot = chat_wire::build_encrypted_metadata_snapshot_json(
+            &meta_key,
+            &group_id,
+            &convo_uuid,
+            0,
+            1,
+            &init_gch,
+            &init_ctag,
+            &uuid::Uuid::new_v4().to_string(),
+            1,
+            1,
+            creator,
+            creator_device,
+            1,
+            creator_signer.public(),
+            "",
+            "",
+            None,
+        )
+        .unwrap();
         for db in &dbs {
             let mls = db.openmls_provider().unwrap();
             let stored = MlsGroup::load(mls.storage(), &GroupId::from_slice(&group_id))
@@ -741,6 +774,11 @@ async fn group(members: &[(&str, &str)], cid: &str) -> Vec<WasmMlsClient> {
                 tx.put_account_meta(
                     &format!("conversation_coords:{cid}"),
                     &coordinates.to_string(),
+                    0,
+                )?;
+                tx.put_account_meta(
+                    &format!("metadata_snapshot_json:{cid}"),
+                    &initial_snapshot.to_string(),
                     0,
                 )
             })
@@ -1197,37 +1235,80 @@ async fn sync_requires_contiguous_entry_seq_and_increasing_peer_send_counter() {
 
     send(&bob_client, cid, 4, "counter five").await.unwrap();
     let genuine = entry_at(cid, 5);
-    for (counter, label) in [(4, "distinct duplicate"), (3, "rewind")] {
-        setEntry(
-            cid,
-            &resigned(
-                &genuine,
-                CanonicalOperation::SendMessage,
-                &bob_signer,
-                |body| body["sendCounter"] = json!(counter),
-            )
-            .to_string(),
-        );
-        let error = alice_client
-            .sync()
-            .await
-            .expect_err(&format!("{label} peer counter is refused"))
-            .as_string()
-            .unwrap_or_default();
-        assert!(
-            error.contains("non-increasing peer sendCounter"),
-            "{label}: {error}"
-        );
+
+    // Within an epoch, a duplicate or rewound positive sendCounter is recorded as evidence only
+    // and never blocks delivery or lowers the high-water mark.
+    setEntry(
+        cid,
+        &resigned(
+            &genuine,
+            CanonicalOperation::SendMessage,
+            &bob_signer,
+            |body| body["sendCounter"] = json!(4),
+        )
+        .to_string(),
+    );
+    alice_client
+        .sync()
+        .await
+        .expect("duplicate counter is evidence only");
+    assert_eq!(
+        (
+            conversation_row(&alice_client, cid).last_seq,
+            ackedUpTo(cid, ALICE_DEVICE)
+        ),
+        (5, 5)
+    );
+    let peer_key = chat_wire::peer_send_counter_key(cid, 0, 1, &bob, BOB_DEVICE);
+
+    send(&bob_client, cid, 5, "counter rewind").await.unwrap();
+    let rewind_genuine = entry_at(cid, 6);
+    setEntry(
+        cid,
+        &resigned(
+            &rewind_genuine,
+            CanonicalOperation::SendMessage,
+            &bob_signer,
+            |body| body["sendCounter"] = json!(3),
+        )
+        .to_string(),
+    );
+    alice_client
+        .sync()
+        .await
+        .expect("rewound counter is also evidence only");
+    assert_eq!(
+        (
+            conversation_row(&alice_client, cid).last_seq,
+            ackedUpTo(cid, ALICE_DEVICE)
+        ),
+        (6, 6)
+    );
+    drop(alice_client);
+    {
+        let alice_backend = account_db(&alice);
+        for (seq, label) in [(5, "duplicate"), (6, "rewind")] {
+            let evidence = alice_backend
+                .backend()
+                .get_account_meta(&send_counter_gap_key(cid, seq))
+                .unwrap();
+            assert!(
+                evidence.as_deref().is_some_and(|e| e.contains("regressed")),
+                "{label} evidence: {evidence:?}"
+            );
+        }
         assert_eq!(
-            (
-                conversation_row(&alice_client, cid).last_seq,
-                ackedUpTo(cid, ALICE_DEVICE)
-            ),
-            (4, 4),
-            "{label}"
+            alice_backend
+                .backend()
+                .get_account_meta(&peer_key)
+                .unwrap()
+                .as_deref(),
+            Some("4")
         );
     }
-    setEntry(cid, &genuine.to_string());
+
+    let alice_client = open(&alice, ALICE_DEVICE).await;
+    send(&bob_client, cid, 6, "counter seven").await.unwrap();
     alice_client
         .sync()
         .await
@@ -1237,8 +1318,20 @@ async fn sync_requires_contiguous_entry_seq_and_increasing_peer_send_counter() {
             conversation_row(&alice_client, cid).last_seq,
             ackedUpTo(cid, ALICE_DEVICE)
         ),
-        (5, 5)
+        (7, 7)
     );
+    drop(alice_client);
+    {
+        let alice_backend = account_db(&alice);
+        assert_eq!(
+            alice_backend
+                .backend()
+                .get_account_meta(&peer_key)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+    }
 }
 
 /// A conflicting application prior becomes durable fork evidence only after the actor is a
@@ -2497,6 +2590,11 @@ async fn forged_metadata_never_changes_the_snapshot_or_coordinates() {
     let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
     drop(alice_client);
     let initial = stored_coords(&alice, cid);
+    let initial_snapshot = account_db(&alice)
+        .backend()
+        .get_account_meta(&format!("metadata_snapshot_json:{cid}"))
+        .unwrap();
+    assert!(initial_snapshot.is_some());
     let alice_client = open(&alice, ALICE_DEVICE).await;
     enroll(&dave, DAVE_DEVICE).await;
     bob_client
@@ -2544,7 +2642,7 @@ async fn forged_metadata_never_changes_the_snapshot_or_coordinates() {
     };
     assert_eq!(
         (stored_coords(&alice, cid), snapshot(&alice)),
-        (initial, None)
+        (initial, initial_snapshot)
     );
     setEntry(cid, &genuine.to_string());
     let alice_client = open(&alice, ALICE_DEVICE).await;

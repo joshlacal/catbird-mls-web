@@ -1,37 +1,37 @@
 {
-  "coreRevision": "7aff644276aa1a8af3dee1811f22458105cac1a8",
+  "coreRevision": "2feb5347d724a2ffa77a7116662b8ea3c620bbc7",
   "artifacts": [
     {
       "target": "src/generated/blue.catbird.chat.defs.json",
       "source": "src/orchestrator/generated/blue.catbird.chat.defs.json",
-      "sha256": "463988d02f2ebcd95c7685e09f492c3c7b8a54382913224db877ca6e8dda012b"
+      "sha256": "22f415fc0015a259fa0adcb16b0285369cb77facce4ca51e5f7e4d8489825b94"
     },
     {
       "target": "tests/fixtures/mls_chat_signing_domain_vectors.json",
       "source": "src/orchestrator/generated/mls_chat_signing_domain_vectors.json",
-      "sha256": "47629e6643deb10841ede3b89077bbcdf38e173520dd01c484c5d15daf7b46e0"
+      "sha256": "3ad1347525bedf017642221b3d05151815f136a0690a0b6f0c0e87ac3dbbab81"
     },
     {
       "target": "tests/fixtures/mls_chat_contract_vectors.json",
       "source": "src/orchestrator/generated/mls_chat_contract_vectors.json",
-      "sha256": "1cdfc130149ef20cff1405df38c18cc236dfe89a8cb2386806883c2c33a0a93a"
+      "sha256": "49f00976f4e7f896ddd295ad4523a05ca45d798681622dc1a869b0a054bb1880"
     },
     {
       "target": "tests/fixtures/mls_chat_control_fingerprint_source.json",
       "source": "src/orchestrator/generated/mls_chat_control_fingerprint_source.json",
-      "sha256": "767d6765652d5b4a44f95f9526f545e6d7ab30b610d967940d47ad4162c3642e"
+      "sha256": "ef3e17f75ce8257af1e0d7f2f80909cc08ff9b6c80f53c98b44b8aea9301ac22"
     }
   ],
   "wasmPackage": {
-    "coreRevision": "7aff644276aa1a8af3dee1811f22458105cac1a8",
-    "labyrinthRevision": "6443279ea0153a2563ec528230b715bd83a6e225",
-    "catbirdAtprotoRevision": "86e1088ca11023ed9d25910b8500668604f8d647",
+    "coreRevision": "2feb5347d724a2ffa77a7116662b8ea3c620bbc7",
+    "labyrinthRevision": "182e76d00d66f7a1b72bbc4248438bd68e25a2fa",
+    "catbirdAtprotoRevision": "2b42978527ccf3f7b0382e4b6f2448c4c3590aad",
     "build": "./build.sh (wasm-pack 0.14.0 --target web --release with its bundled wasm-opt; rustc 1.99.1 per rust-toolchain.toml; build.sh's extra wasm-opt -Oz pass skipped because no wasm-opt is on PATH)",
     "files": {
-      "catbird_mls_web_bg.wasm": "731425d05d4703ee9a401f088f5ad6ab51fbb21dbc7be743a076f4bbd3d93cb2",
-      "catbird_mls_web.js": "e742b4dce68ef3eee8dc5d109c6ea4b71b34e0c459c6ef4875a3d20b653fd97a",
-      "catbird_mls_web.d.ts": "6ee0f6c7bc61700cb39a62b3af4961d0bed271ca9a14f7bdc6a0847bd48be1ea",
-      "catbird_mls_web_bg.wasm.d.ts": "455e27251d28db6718ea7f392e4c24ebb330ff03a34b9a0f859800cb1ea70511"
+      "catbird_mls_web_bg.wasm": "22ce5f7e7200e8836b157631c6a423a7bcdc27d5b4248716bba799a6e7bec228",
+      "catbird_mls_web.js": "f23d53807e865a7dbe7f989c0f4a9dfda72dd0e648ce2587d694533a063d5df1",
+      "catbird_mls_web.d.ts": "c6c74ad7ec41aeff3f154bedb6282322a4bf8ced31f41c767f60701426fb8011",
+      "catbird_mls_web_bg.wasm.d.ts": "05571b40185faf14c7c956b8e50849977b83eaec8b44e3d74908fcff7617f992"
     }
   }
 }

@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "26380cefa2e4734925efabb178d83052e10a46c7",
-    "sourceSha256": "992206c3cfba8db1733c5795d75aacb8352d68d187fe4c793dfc8fe73adfc2a4",
-    "sourceTree": "0f8bcc02c7f70a14de01b7b60a3a5f329bb7143f"
+    "sourceRevision": "31c161d22c6b0be185f7b0fe6a4fa98b889f0f0a",
+    "sourceSha256": "28b7711295ebbd2ae67fc664e0088d5c7db088eca7b54a9d894675c7f35f2b61",
+    "sourceTree": "87ed7888eecdca122a80309b6731ffc7cefbc676"
   },
   "defs": {
     "accessEndedEvent": {
@@ -71,6 +71,12 @@
         "receivedAt": {
           "ref": "#canonicalDatetime",
           "type": "ref"
+        },
+        "revocationProof": {
+          "description": "Optional; present only together with actorWrite. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. A CARv1 repository proof in the com.atproto.sync.getRecord shape: the signed repository commit of deletedDid, the MST path, and the record block for the create-only blue.catbird.chat.deviceRevocation/{actorDeviceId} record where targetDeviceId == actorDeviceId, createdAt == actorWrite.signedAt, and reason == 'deleteAccountData:' || operationId. Because deviceRevocation is create-only, a valid CARv1 under deletedDid's #atproto key proves actorDeviceId had not been revoked prior to signing deletion even after deletedDid's repository is gone.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "bytes"
         },
         "seq": {
           "maximum": 9007199254740991,
@@ -1707,7 +1713,7 @@
       "type": "object"
     },
     "deviceCapability": {
-      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy. Version 2 with directRequestProfile advertises parser support only; admission additionally requires active revisioned exact-package DirectRequestGrant signatures.",
+      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy. Version 2 with directRequestProfile advertises parser support only; admission additionally requires active revisioned exact-package DirectRequestGrant signatures. This exact profile, including the empty KeyPackage, LeafNode and GroupContext extension lists, is fixed for protocol versions 1 and 2. A later protocol version may define optional LeafNode extensions in the RFC 9420 private-use range; such leaves appear only in conversations of that version, which the service never returns to a session whose supportedProtocolVersions does not list it. GroupContext extensions, GroupContextExtensions proposals and RequiredCapabilities stay unused. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon.",
       "properties": {
         "addByValue": {
           "const": "supported",

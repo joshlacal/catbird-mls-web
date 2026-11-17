@@ -165,6 +165,7 @@ struct Wave2World {
     get_own_devices_fault_once: bool,
     delete_account_fault: bool,
     deleted_accounts: BTreeSet<String>,
+    deleted_account_proofs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
     sequence: u64,
 }
 
@@ -1459,9 +1460,24 @@ fn dispatch_fetch_inner(
                     json!({"error": "InternalServerError", "message": "injected D-3 remote failure"}),
                 );
             }
+            let decode_hdr = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .and_then(|(_, v)| {
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(v)
+                            .ok()
+                    })
+                    .unwrap_or_default()
+            };
+            let key_proof = decode_hdr(catbird_mls::labyrinth::write_auth::KEY_PROOF_HEADER);
+            let rev_proof = decode_hdr(catbird_mls::labyrinth::write_auth::REVOCATION_PROOF_HEADER);
             WORLD.with(|cell| {
                 let mut w = cell.borrow_mut();
                 w.deleted_accounts.insert(account.clone());
+                w.deleted_account_proofs
+                    .insert(account.clone(), (key_proof, rev_proof));
                 w.epoch_heads.remove(&account);
                 w.ds_devices.remove(&account);
             });
@@ -3166,14 +3182,71 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
         "local OPFS conversations must survive when remote deleteAccountData fails (D-3)"
     );
 
-    //    Lift fault -> `deleteAccountData` purges remote Space/PDS/DS state AND wipes local OPFS!
+    //    Lift fault -> `deleteAccountData` purges remote Space/PDS/DS state, sends keyProof +
+    //    revocationProof CARv1 headers + publishes self-deletion deviceRevocation, AND wipes local OPFS!
     WORLD.with(|c| c.borrow_mut().delete_account_fault = false);
     alice_client.delete_account_data().await.unwrap();
     assert!(WORLD.with(|c| c.borrow().deleted_accounts.contains(&alice)));
+    WORLD.with(|c| {
+        let w = c.borrow();
+        let rev = w
+            .chat_device_revocations
+            .get(&(alice.clone(), alice_dev.to_owned()))
+            .expect("deleteAccountData must publish self-deletion deviceRevocation on PDS");
+        assert!(
+            rev.value["reason"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("deleteAccountData:")),
+            "unexpected revocation reason: {:?}",
+            rev.value["reason"]
+        );
+        let (kp, rp) = w
+            .deleted_account_proofs
+            .get(&alice)
+            .expect("deleteAccountData must attach CARv1 proofs");
+        assert!(!kp.is_empty(), "keyProof header must be non-empty");
+        assert!(!rp.is_empty(), "revocationProof header must be non-empty");
+    });
     assert!(
         alice_client.list_conversations(None, 20).is_err(),
         "WasmMlsClient handle must be closed after deleteAccountData"
     );
+
+    // 5b. Sibling-revoked device must fail closed on `deleteAccountData` BEFORE calling DS or wiping DB.
+    let dave = make_did("wave2siblingrevokeddave");
+    let dave_dev = "00000000-0000-4000-8000-000000000408";
+    let mut dave_client = open_client(&dave, dave_dev).await;
+    let _ = enroll(&dave_client).await;
+    let _ = dave_client.enable_labyrinth_live().await.unwrap();
+    WORLD.with(|c| {
+        let rec = canonical_record(&json!({
+            "$type": "blue.catbird.chat.deviceRevocation",
+            "targetDeviceId": dave_dev,
+            "actorDeviceId": "00000000-0000-4000-8000-000000000499",
+            "signerPublicKey": { "$bytes": STANDARD.encode([0x11u8; 32]) },
+            "signature": { "$bytes": STANDARD.encode([0x22u8; 64]) },
+            "algorithm": "ed25519",
+            "createdAt": "2026-11-16T00:00:00.000Z",
+            "reason": "revoked_by_sibling",
+        }))
+        .unwrap();
+        c.borrow_mut()
+            .chat_device_revocations
+            .insert((dave.clone(), dave_dev.to_owned()), rec);
+    });
+    assert!(
+        dave_client.delete_account_data().await.is_err(),
+        "sibling-revoked device must fail closed on deleteAccountData"
+    );
+    assert!(
+        !WORLD.with(|c| c.borrow().deleted_accounts.contains(&dave)),
+        "sibling-revoked device must abort BEFORE calling deleteAccountData on DS"
+    );
+    assert!(
+        dave_client.list_conversations(None, 20).is_ok(),
+        "sibling-revoked device must keep local OPFS intact"
+    );
+    let _ = SqliteConn::delete_opfs_database(&db_path_for(&dave, dave_dev));
 
     // 6. `retireCurrentDevice`: wipes local OPFS and publishes append-only PDS `chat.deviceRevocation` without deleting account.
     let carol = make_did("wave2retirecarol");

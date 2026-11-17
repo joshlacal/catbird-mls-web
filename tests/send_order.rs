@@ -1987,14 +1987,15 @@ async fn account_deletions_remain_quarantined_without_historical_nonrevocation()
 
     let elsewhere = account_deletion_entry(other_cid, &bob, 3, true);
     setEntry(cid, &elsewhere.to_string());
-    alice_client
+    let synced = alice_client
         .sync()
         .await
-        .expect_err("cross-conversation deletion evidence must not advance this cursor");
-    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+        .expect("cross-conversation deletion evidence advances cursor without purging");
+    assert_eq!(synced, 2);
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 4);
     assert_eq!(
         timeline(&alice_client, cid),
-        timeline_of(&[(2, "from a living account")])
+        timeline_of(&[(2, "from a living account"), (4, "after the deletion")])
     );
     drop(alice_client);
     let db = account_db(&alice);

@@ -166,6 +166,7 @@ struct Wave2World {
     delete_account_fault: bool,
     deleted_accounts: BTreeSet<String>,
     deleted_account_proofs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+    pds_repo_status_for: BTreeMap<String, (u16, String)>,
     sequence: u64,
 }
 
@@ -1068,6 +1069,9 @@ fn dispatch_fetch_inner(
             let collection = params.get("collection").unwrap();
             WORLD.with(|cell| {
                 let w = cell.borrow();
+                if let Some((status, code)) = w.pds_repo_status_for.get(repo) {
+                    return WireResponse::json(*status, json!({ "error": code, "message": "mock PDS repo status" }));
+                }
                 let mut records = Vec::new();
                 if collection == labyrinth::records::nsid::MAILBOX_KEYS {
                     for ((owner, rkey), rec) in &w.mailbox_keys {
@@ -3246,6 +3250,16 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
         dave_client.list_conversations(None, 20).is_ok(),
         "sibling-revoked device must keep local OPFS intact"
     );
+    drop(dave_client);
+    {
+        let db = SqliteConn::open(&db_path_for(&dave, dave_dev), &"ab".repeat(32)).unwrap();
+        assert!(
+            db.get_account_meta("delete_account_retry_state")
+                .unwrap()
+                .is_none(),
+            "sibling-revoked device must not persist delete_account_retry_state"
+        );
+    }
     let _ = SqliteConn::delete_opfs_database(&db_path_for(&dave, dave_dev));
 
     // 6. `retireCurrentDevice`: wipes local OPFS and publishes append-only PDS `chat.deviceRevocation` without deleting account.

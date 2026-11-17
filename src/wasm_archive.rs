@@ -242,6 +242,11 @@ impl WebArchiveGateway {
             }
             resp.body
         };
+        if car_bytes.len() > deletion_authority::MAX_REVOCATION_PROOF_BYTES {
+            return Err(labyrinth::Error::Backend(
+                "mailboxKeys CAR proof exceeds byte limit".into(),
+            ));
+        }
         let record_val = response
             .get("value")
             .ok_or(labyrinth::Error::Malformed("getRecord missing value"))?;
@@ -573,9 +578,35 @@ struct WasmLocalConversationAuthority {
     client: WasmMlsClient,
     db: WasmAccountDb<Rc<SqliteConn>>,
     session_token: String,
+    tombstoned_pds_dids: std::sync::Mutex<BTreeSet<String>>,
+    preverified_deleted_dids: BTreeMap<String, u64>,
 }
 
 impl WasmLocalConversationAuthority {
+    fn is_pds_repo_tombstoned_sync(&self, did: &str) -> bool {
+        self.tombstoned_pds_dids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(did)
+    }
+
+    fn verified_deleted_ms_sync(&self, did: &str) -> AuthorityResult<Option<u64>> {
+        let key = deletion_authority::verified_deleted_account_key(did);
+        let db_ms = self
+            .db
+            .backend()
+            .get_account_meta(&key)
+            .map_err(OrchestratorError::Mls)?
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .map(|ms| u64::try_from(ms.max(0)).unwrap_or(0));
+        let pre_ms = self.preverified_deleted_dids.get(did).copied();
+        Ok(match (db_ms, pre_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        })
+    }
+
     fn group_view(
         &self,
         conversation_id: &str,
@@ -684,12 +715,38 @@ impl LocalConversationAuthority for WasmLocalConversationAuthority {
             .map_err(OrchestratorError::Mls)?
             .is_some()
         {
-            let (pairs, revoked) = self
+            let (found, tombstoned) = self
                 .client
-                .fetch_verified_peer_pds_devices_and_revoked(&self.session_token, did)
+                .fetch_pds_device_and_revocation_keys_or_tombstone_via_pds(
+                    &self.session_token,
+                    did,
+                    true,
+                )
                 .await
                 .map_err(OrchestratorError::Mls)?;
+            if tombstoned {
+                self.tombstoned_pds_dids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(did.to_owned());
+                return Ok(None);
+            }
+            let Some((pairs, revoked)) = found else {
+                if self.is_pds_repo_tombstoned_sync(did)
+                    || self.verified_deleted_ms_sync(did)?.is_some()
+                {
+                    return Ok(None);
+                }
+                return Err(OrchestratorError::Credential(format!(
+                    "peer PDS holds zero valid chat.device records for `{did}`"
+                )));
+            };
             if pairs.is_empty() && revoked.is_empty() {
+                if self.is_pds_repo_tombstoned_sync(did)
+                    || self.verified_deleted_ms_sync(did)?.is_some()
+                {
+                    return Ok(None);
+                }
                 return Err(OrchestratorError::Credential(format!(
                     "peer PDS holds zero valid chat.device records for `{did}`"
                 )));
@@ -734,14 +791,84 @@ impl LocalConversationAuthority for WasmLocalConversationAuthority {
             .map_err(OrchestratorError::Mls)?
             .is_some()
         {
-            let (_, revoked) = self
+            let (found, tombstoned) = self
                 .client
-                .fetch_verified_peer_pds_devices_and_revoked(&self.session_token, did)
+                .fetch_pds_device_and_revocation_keys_or_tombstone_via_pds(
+                    &self.session_token,
+                    did,
+                    true,
+                )
                 .await
                 .map_err(OrchestratorError::Mls)?;
-            return Ok(revoked);
+            if tombstoned {
+                self.tombstoned_pds_dids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(did.to_owned());
+                return Ok(Vec::new());
+            }
+            if let Some((_, revoked)) = found {
+                return Ok(revoked);
+            }
+            if self.is_pds_repo_tombstoned_sync(did)
+                || self.verified_deleted_ms_sync(did)?.is_some()
+            {
+                return Ok(Vec::new());
+            }
+            return Err(OrchestratorError::Credential(format!(
+                "peer PDS holds zero valid chat.device records for `{did}`"
+            )));
         }
         Ok(Vec::new())
+    }
+
+    async fn shared_group_leaf_keys(
+        &self,
+        did: &str,
+    ) -> AuthorityResult<Option<Vec<[u8; 32]>>> {
+        if did == self.client.account_did {
+            return Ok(None);
+        }
+        let convos = self
+            .db
+            .backend()
+            .list_conversations(None, 500)
+            .map_err(OrchestratorError::Mls)?;
+        let mut shared = BTreeSet::new();
+        let mut saw_live_shared_group = false;
+        for convo in convos {
+            let Some((_, _, applied, leaves)) = self.group_view(&convo.conversation_id)? else {
+                continue;
+            };
+            if applied <= 0 || !leaves.iter().any(|(m, _)| *m == self.client.account_did) {
+                continue;
+            }
+            let mut peer_present = false;
+            for (member, key) in leaves {
+                if member == did {
+                    peer_present = true;
+                    let k: [u8; 32] = key.as_slice().try_into().map_err(|_| {
+                        OrchestratorError::Credential("MLS leaf signing key is not Ed25519".into())
+                    })?;
+                    shared.insert(k);
+                }
+            }
+            if peer_present {
+                saw_live_shared_group = true;
+            }
+        }
+        if !saw_live_shared_group {
+            return Ok(None);
+        }
+        Ok(Some(shared.into_iter().collect()))
+    }
+
+    async fn verified_deleted_account_ms(&self, did: &str) -> AuthorityResult<Option<u64>> {
+        self.verified_deleted_ms_sync(did)
+    }
+
+    async fn is_pds_repo_tombstoned(&self, did: &str) -> AuthorityResult<bool> {
+        Ok(self.is_pds_repo_tombstoned_sync(did))
     }
 }
 
@@ -975,6 +1102,7 @@ fn select_wasm_restore_copy<'a>(
 fn hide_deleted_accounts_wasm(
     db: &WasmAccountDb<Rc<SqliteConn>>,
     conversation_id: &str,
+    tombstoned_dids: &BTreeSet<String>,
     messages: &mut Vec<LoadedMessage>,
 ) -> Result<usize, MLSError> {
     use catbird_mls::client::deletion_authority::StoredAccountDeletion;
@@ -989,13 +1117,8 @@ fn hide_deleted_accounts_wasm(
             let marker = AppliedAccountDeletion::decode(&raw)
                 .unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
             deleted.insert(did.clone(), marker);
-        } else if let Some(raw) = db
-            .backend()
-            .get_labyrinth_state(&deletion_authority::pds_deletion_marker_key(conversation_id, did))?
-        {
-            let marker = AppliedAccountDeletion::decode(&raw)
-                .unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
-            deleted.insert(did.clone(), marker);
+        } else if tombstoned_dids.contains(did) {
+            deleted.insert(did.clone(), StoredAccountDeletion::SeqOnly(i64::MAX));
         }
     }
     let before = messages.len();
@@ -1014,6 +1137,21 @@ fn hide_deleted_accounts_wasm(
 impl WasmMlsClient {
     pub(crate) fn wasm_archive_deps_with_gateway(
         &self,
+    ) -> Result<(SessionDeps, Arc<WebArchiveGateway>), MLSError> {
+        self.wasm_archive_deps_with_gateway_preverified(BTreeMap::new())
+    }
+
+    pub(crate) fn wasm_archive_deps_preverified(
+        &self,
+        preverified_deleted_dids: BTreeMap<String, u64>,
+    ) -> Result<SessionDeps, MLSError> {
+        self.wasm_archive_deps_with_gateway_preverified(preverified_deleted_dids)
+            .map(|(deps, _)| deps)
+    }
+
+    pub(crate) fn wasm_archive_deps_with_gateway_preverified(
+        &self,
+        preverified_deleted_dids: BTreeMap<String, u64>,
     ) -> Result<(SessionDeps, Arc<WebArchiveGateway>), MLSError> {
         let db_conn = self.require_db_mls()?.backend().clone();
         let (session_token, device_id) = self.require_live_session()?;
@@ -1059,6 +1197,8 @@ impl WasmMlsClient {
                 client: self.http_view(),
                 db: WasmAccountDb::new(db_conn),
                 session_token,
+                tombstoned_pds_dids: std::sync::Mutex::new(BTreeSet::new()),
+                preverified_deleted_dids,
             })),
             sequencer_receipt_key: None,
             default_conversation_authority_did: None,
@@ -1773,31 +1913,10 @@ impl WasmMlsClient {
         Ok(u32::try_from(archived).unwrap_or(u32::MAX))
     }
 
-    async fn quarantine_listed_account_deletions(
+    async fn preverify_wasm_conversation_deletions(
         &self,
         conversation_id: &str,
-        history: &[LoadedMessage],
-    ) -> Result<(), MLSError> {
-        if history.is_empty() {
-            return Ok(());
-        }
-        let pinned = self
-            .require_db_mls()?
-            .backend()
-            .get_conversation(conversation_id)?
-            .map(|conversation| conversation.sequencer_did)
-            .filter(|did| !did.is_empty());
-        let sequencer = pinned
-            .or_else(|| {
-                history
-                    .iter()
-                    .filter_map(|message| message.archived_receipt.as_ref())
-                    .max_by_key(|receipt| receipt.signed.payload.seq)
-                    .map(|receipt| receipt.signed.payload.sequencer_did.clone())
-            })
-            .ok_or_else(|| {
-                MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into())
-            })?;
+    ) -> Result<(Option<Value>, BTreeMap<String, u64>), MLSError> {
         let (session_token, device_id) = self.require_live_session()?;
         let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
         let state = match self
@@ -1820,20 +1939,142 @@ impl WasmMlsClient {
                     "ConversationNotFound" | "NotEntitled" | "AccessOutsideMembershipInterval"
                 ) =>
             {
-                return Err(MLSError::InvalidState(
-                    "ArchiveDeletionInventoryUnavailable".into(),
-                ));
+                return Ok((None, BTreeMap::new()));
             }
             Err(MLSError::Internal(msg))
                 if msg.contains("ConversationNotFound")
                     || msg.contains("NotEntitled")
                     || msg.contains("AccessOutsideMembershipInterval") =>
             {
-                return Err(MLSError::InvalidState(
-                    "ArchiveDeletionInventoryUnavailable".into(),
-                ));
+                return Ok((None, BTreeMap::new()));
             }
             Err(error) => return Err(error),
+        };
+        let pinned = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(conversation_id)?
+            .map(|conversation| conversation.sequencer_did)
+            .filter(|did| !did.is_empty());
+        let candidate_sequencer = pinned.clone().or_else(|| {
+            state["state"]["sequencerDid"]
+                .as_str()
+                .or_else(|| state["sequencerDid"].as_str())
+                .filter(|did| !did.is_empty())
+                .map(str::to_owned)
+        });
+        let mut preverified = BTreeMap::new();
+        if let Some(sequencer) = candidate_sequencer {
+            let deletions = state["accountDeletions"].as_array().ok_or_else(|| {
+                MLSError::Cryptography("getConversationState is missing accountDeletions".into())
+            })?;
+            for entry in deletions {
+                let seq = entry["seq"].as_i64().filter(|seq| *seq >= 1).ok_or_else(|| {
+                    MLSError::Cryptography("account deletion has no positive seq".into())
+                })?;
+                if let Some(reason) = self
+                    .process_account_deletion_with_persistence(
+                        &session_token,
+                        conversation_id,
+                        &sequencer,
+                        entry,
+                        seq,
+                        pinned.is_some(),
+                    )
+                    .await?
+                {
+                    if reason == UnverifiedDeletionReason::OtherConversation {
+                        continue;
+                    }
+                    if pinned.is_some() {
+                        tracing::warn!(
+                            conversation_id,
+                            ?reason,
+                            "archive restore blocked on unverified account deletion"
+                        );
+                        return Err(MLSError::InvalidState(
+                            "ArchiveDeletionUnverified".into(),
+                        ));
+                    }
+                } else if let Some(deleted_did) = entry["deletedDid"].as_str() {
+                    if let Ok(write) = deletion_authority::parse_actor_write(entry) {
+                        let ms = u64::try_from(write.signed_at_ms.max(0)).unwrap_or(0);
+                        preverified
+                            .entry(deleted_did.to_owned())
+                            .and_modify(|prev: &mut u64| *prev = (*prev).min(ms))
+                            .or_insert(ms);
+                    }
+                }
+            }
+        }
+        Ok((Some(state), preverified))
+    }
+
+    async fn quarantine_listed_account_deletions(
+        &self,
+        conversation_id: &str,
+        history: &[LoadedMessage],
+        prefetched_state: Option<Value>,
+    ) -> Result<BTreeSet<String>, MLSError> {
+        if history.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let pinned = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(conversation_id)?
+            .map(|conversation| conversation.sequencer_did)
+            .filter(|did| !did.is_empty());
+        let sequencer = pinned
+            .or_else(|| {
+                history
+                    .iter()
+                    .filter_map(|message| message.archived_receipt.as_ref())
+                    .max_by_key(|receipt| receipt.signed.payload.seq)
+                    .map(|receipt| receipt.signed.payload.sequencer_did.clone())
+            })
+            .ok_or_else(|| {
+                MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into())
+            })?;
+        let (session_token, device_id) = self.require_live_session()?;
+        let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
+        let state = match prefetched_state {
+            Some(state) => state,
+            None => match self
+                .ds_signed_get(
+                    &session_token,
+                    &device_id,
+                    "blue.catbird.chat.getConversationState",
+                    &[
+                        ("actorDeviceId", &device_id),
+                        ("conversationId", conversation_id),
+                    ],
+                    &signer,
+                )
+                .await
+            {
+                Ok(state) => state,
+                Err(MLSError::InvalidState(code))
+                    if matches!(
+                        code.as_str(),
+                        "ConversationNotFound" | "NotEntitled" | "AccessOutsideMembershipInterval"
+                    ) =>
+                {
+                    return Err(MLSError::InvalidState(
+                        "ArchiveDeletionInventoryUnavailable".into(),
+                    ));
+                }
+                Err(MLSError::Internal(msg))
+                    if msg.contains("ConversationNotFound")
+                        || msg.contains("NotEntitled")
+                        || msg.contains("AccessOutsideMembershipInterval") =>
+                {
+                    return Err(MLSError::InvalidState(
+                        "ArchiveDeletionInventoryUnavailable".into(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            },
         };
         let deletions = state["accountDeletions"].as_array().ok_or_else(|| {
             MLSError::Cryptography(
@@ -1881,27 +2122,22 @@ impl WasmMlsClient {
                 let has_seq = backend
                     .get_labyrinth_state(&chat_wire::account_deletion_key(conversation_id, &did))?
                     .is_some();
-                let has_pds = backend
-                    .get_labyrinth_state(&deletion_authority::pds_deletion_marker_key(
-                        conversation_id,
-                        &did,
-                    ))?
-                    .is_some();
-                if !has_seq && !has_pds {
+                if !has_seq {
                     unchecked.push(did);
                 }
             }
             unchecked
         };
+        let mut tombstoned_dids = BTreeSet::new();
         for sender_did in foreign_senders {
-            self.verify_foreign_sender_pds_deletion_wasm(
-                &session_token,
-                conversation_id,
-                &sender_did,
-            )
-            .await?;
+            if self
+                .verify_foreign_sender_pds_deletion_wasm(&session_token, &sender_did)
+                .await?
+            {
+                tombstoned_dids.insert(sender_did);
+            }
         }
-        Ok(())
+        Ok(tombstoned_dids)
     }
 
     async fn list_pds_revocations_or_tombstone_wasm(
@@ -1945,10 +2181,7 @@ impl WasmMlsClient {
                     .ok()
                     .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned));
                 if matches!(status, 400 | 404)
-                    && matches!(
-                        err_code.as_deref(),
-                        Some("RepoNotFound" | "RepoDeactivated" | "RepoTakendown")
-                    )
+                    && matches!(err_code.as_deref(), Some("RepoNotFound" | "RepoTakendown"))
                 {
                     return Ok(None);
                 }
@@ -1987,9 +2220,8 @@ impl WasmMlsClient {
     async fn verify_foreign_sender_pds_deletion_wasm(
         &self,
         session_token: &str,
-        conversation_id: &str,
         sender_did: &str,
-    ) -> Result<(), MLSError> {
+    ) -> Result<bool, MLSError> {
         let Some(doc_bytes) = self
             .resolve_did_document(session_token, sender_did)
             .await
@@ -2011,17 +2243,12 @@ impl WasmMlsClient {
             .list_pds_revocations_or_tombstone_wasm(&pds_endpoint, sender_did)
             .await?
         else {
-            let key = deletion_authority::pds_deletion_marker_key(conversation_id, sender_did);
-            self.require_db_mls()?.write_tx(|tx| {
-                tx.put_labyrinth_state(&key, i64::MAX.to_string().as_bytes(), now_ms())
-            })?;
-            return Ok(());
+            return Ok(true);
         };
         let rev_prefix = format!(
             "at://{sender_did}/{}/",
             deletion_authority::DEVICE_REVOCATION_COLLECTION
         );
-        let mut verified_deletion: Option<AppliedAccountDeletion> = None;
         for rec_entry in &records {
             let Some(uri) = rec_entry.get("uri").and_then(Value::as_str) else {
                 continue;
@@ -2047,12 +2274,31 @@ impl WasmMlsClient {
             if !is_self_deletion {
                 continue;
             }
+            let Some(rev_cid) = rec_entry
+                .get("cid")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+            else {
+                return Err(MLSError::InvalidState(
+                    "ArchiveDeletionUnverified".into(),
+                ));
+            };
+            let Some(atproto_key) =
+                atproto_spaces::did_resolver::DidDocument::parse_json(sender_did, &doc_bytes)
+                    .ok()
+                    .and_then(|d| d.atproto_key)
+            else {
+                return Err(MLSError::InvalidState(
+                    "ArchiveDeletionUnverified".into(),
+                ));
+            };
             let device_car = self
                 .fetch_pds_record_car_wasm(
                     &pds_endpoint,
                     sender_did,
                     deletion_authority::DEVICE_RECORD_COLLECTION,
                     rkey,
+                    deletion_authority::MAX_REVOCATION_PROOF_BYTES,
                 )
                 .await
                 .map_err(|_| MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()))?;
@@ -2062,34 +2308,59 @@ impl WasmMlsClient {
                     sender_did,
                     deletion_authority::DEVICE_REVOCATION_COLLECTION,
                     rkey,
+                    deletion_authority::MAX_REVOCATION_PROOF_BYTES,
                 )
                 .await
                 .map_err(|_| MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()))?;
-            let Some(applied) = deletion_authority::verify_foreign_self_deletion_from_cars(
+            let (_, dev_rev) =
+                catbird_mls::labyrinth::repo_proof::verify_car_record_proof_with_rev(
+                    &device_car,
+                    sender_did,
+                    deletion_authority::DEVICE_RECORD_COLLECTION,
+                    rkey,
+                    &atproto_key,
+                )
+                .map_err(|_| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
+            self.observe_pds_repo_rev_floor_wasm(
+                sender_did,
+                &dev_rev,
+                &format!(
+                    "at://{sender_did}/{}/{rkey}",
+                    deletion_authority::DEVICE_RECORD_COLLECTION
+                ),
+            )?;
+            let (_, rev_rev) =
+                catbird_mls::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
+                    &revocation_car,
+                    sender_did,
+                    deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                    rkey,
+                    Some(rev_cid),
+                    val,
+                    &atproto_key,
+                )
+                .map_err(|_| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
+            self.observe_pds_repo_rev_floor_wasm(
+                sender_did,
+                &rev_rev,
+                &format!(
+                    "at://{sender_did}/{}/{rkey}",
+                    deletion_authority::DEVICE_REVOCATION_COLLECTION
+                ),
+            )?;
+            let _ = deletion_authority::verify_foreign_self_deletion_from_cars(
                 &device_car,
                 &revocation_car,
                 sender_did,
                 rkey,
                 &doc_bytes,
-            ) else {
-                return Err(MLSError::InvalidState(
-                    "ArchiveDeletionUnverified".into(),
-                ));
-            };
-            if verified_deletion
-                .as_ref()
-                .is_none_or(|prev| applied.signed_at_ms > prev.signed_at_ms)
-            {
-                verified_deletion = Some(applied);
-            }
+            )
+            .ok_or_else(|| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
+            return Err(MLSError::InvalidState(
+                "ArchiveDeletionUnverified".into(),
+            ));
         }
-        if let Some(applied) = verified_deletion {
-            let key = deletion_authority::pds_deletion_marker_key(conversation_id, sender_did);
-            let raw = serde_json::to_vec(&applied)?;
-            self.require_db_mls()?
-                .write_tx(|tx| tx.put_labyrinth_state(&key, &raw, now_ms()))?;
-        }
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) async fn verify_and_reindex_history_impl(
@@ -2097,7 +2368,9 @@ impl WasmMlsClient {
         conversation_id: &str,
     ) -> Result<u32, MLSError> {
         self.pin_wasm_conversation(conversation_id)?;
-        let deps = self.wasm_archive_deps()?;
+        let (prefetched_state, preverified_deletions) =
+            self.preverify_wasm_conversation_deletions(conversation_id).await?;
+        let deps = self.wasm_archive_deps_preverified(preverified_deletions)?;
         let mut session = deps
             .open()
             .await
@@ -2113,10 +2386,11 @@ impl WasmMlsClient {
             ));
         }
         let mut history = page.messages;
-        self.quarantine_listed_account_deletions(conversation_id, &history)
+        let tombstoned_dids = self
+            .quarantine_listed_account_deletions(conversation_id, &history, prefetched_state)
             .await?;
         let db = self.require_db_mls()?;
-        hide_deleted_accounts_wasm(db, conversation_id, &mut history)?;
+        hide_deleted_accounts_wasm(db, conversation_id, &tombstoned_dids, &mut history)?;
         let copies = wasm_restore_copies(conversation_id, &self.account_did, history)?;
         let ts = now_ms();
         db.write_tx(|tx| {
@@ -2756,7 +3030,8 @@ impl WasmMlsClient {
         #[serde(rename_all = "camelCase")]
         struct DeleteAccountRetryState {
             operation_id: String,
-            signed_at_ms: i64,
+            #[serde(alias = "signedAtMs")]
+            created_at_ms: i64,
         }
         const RETRY_META_KEY: &str = "delete_account_retry_state";
 
@@ -2776,38 +3051,94 @@ impl WasmMlsClient {
             .and_then(|state| {
                 let op_vec = hex::decode(&state.operation_id).ok()?;
                 let op_id: [u8; 16] = op_vec.try_into().ok()?;
-                let signed_at = chrono::DateTime::from_timestamp_millis(state.signed_at_ms)?;
-                Some((op_id, state.operation_id, state.signed_at_ms, signed_at))
+                let _ = chrono::DateTime::from_timestamp_millis(state.created_at_ms)?;
+                Some((op_id, state.operation_id, state.created_at_ms))
             });
-        let (operation_id, op_hex, signed_at_ms, signed_at) = match existing_retry {
+        let (operation_id, op_hex, created_at_ms) = match existing_retry {
             Some(loaded) => loaded,
             None => {
+                // Probe PDS for an existing deviceRevocation record (e.g. sibling revocation)
+                // before persisting local retry state so `RETRY_META_KEY` is never poisoned.
+                let probe_url = format!(
+                    "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
+                    self.pds_base(),
+                    chat_wire::urlencode_form_component(&self.account_did),
+                    chat_wire::urlencode_form_component(
+                        deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                    ),
+                    chat_wire::urlencode_form_component(&own_device_id),
+                );
+                if let Ok(probe_resp) = self
+                    .http
+                    .get(&probe_url)
+                    .bearer_auth(&session_token)
+                    .send()
+                    .await
+                {
+                    if probe_resp.status().as_u16() == 200 {
+                        if let Ok(bytes) = probe_resp.bytes().await {
+                            if serde_json::from_slice::<Value>(&bytes)
+                                .ok()
+                                .and_then(|v| v.get("value").cloned())
+                                .is_some()
+                            {
+                                return Err(MLSError::InvalidState(format!(
+                                    "EnrollmentPdsRecordConflict:{}/{own_device_id}",
+                                    deletion_authority::DEVICE_REVOCATION_COLLECTION
+                                )));
+                            }
+                        }
+                    }
+                }
                 let mut op_id = [0u8; 16];
                 getrandom::getrandom(&mut op_id)
                     .map_err(|e| MLSError::Internal(format!("getrandom: {e}")))?;
-                let signed_at_ms = now_ms().max(0);
-                let signed_at = chrono::DateTime::from_timestamp_millis(signed_at_ms)
+                let created_at_ms = now_ms().max(0);
+                let _ = chrono::DateTime::from_timestamp_millis(created_at_ms)
                     .ok_or_else(|| MLSError::Cryptography("invalid archive deletion clock".into()))?;
                 let op_hex = hex::encode(op_id);
                 let serialized = serde_json::to_string(&DeleteAccountRetryState {
                     operation_id: op_hex.clone(),
-                    signed_at_ms,
+                    created_at_ms,
                 })
                 .map_err(|e| MLSError::Internal(format!("serialize delete_account_retry_state: {e}")))?;
                 db.write_tx(|tx| tx.put_account_meta(RETRY_META_KEY, &serialized, now_ms()))?;
-                (op_id, op_hex, signed_at_ms, signed_at)
+                (op_id, op_hex, created_at_ms)
             }
         };
 
-        self.publish_self_deletion_revocation_wasm(
-            &session_token,
-            &own_device_id,
-            &op_hex,
-            signed_at,
-            &signer,
-            &signer_pk,
-        )
-        .await?;
+        let current_ms = now_ms().max(created_at_ms);
+        let write_signed_at_ms = if current_ms.saturating_sub(created_at_ms) > 120_000 {
+            current_ms
+        } else {
+            created_at_ms
+        };
+        let created_at = chrono::DateTime::from_timestamp_millis(created_at_ms)
+            .ok_or_else(|| MLSError::Cryptography("invalid archive deletion creation clock".into()))?;
+        let write_signed_at = chrono::DateTime::from_timestamp_millis(write_signed_at_ms)
+            .ok_or_else(|| MLSError::Cryptography("invalid archive deletion clock".into()))?;
+
+        if let Err(error) = self
+            .publish_self_deletion_revocation_wasm(
+                &session_token,
+                &own_device_id,
+                &op_hex,
+                created_at,
+                write_signed_at,
+                &signer,
+                &signer_pk,
+            )
+            .await
+        {
+            if matches!(
+                &error,
+                MLSError::InvalidState(code)
+                    if code.starts_with("EnrollmentPdsRecordConflict:")
+            ) {
+                let _ = db.write_tx(|tx| tx.delete_account_meta(RETRY_META_KEY));
+            }
+            return Err(error);
+        }
 
         let doc_bytes = self
             .resolve_did_document(&session_token, &self.account_did)
@@ -2834,13 +3165,14 @@ impl WasmMlsClient {
                 &self.account_did,
                 deletion_authority::DEVICE_RECORD_COLLECTION,
                 &own_device_id,
+                deletion_authority::MAX_REVOCATION_PROOF_BYTES,
             )
             .await?;
         let proved_key = deletion_authority::device_key_from_key_proof(
             &key_proof,
             &self.account_did,
             &own_device_id,
-            signed_at_ms,
+            write_signed_at_ms,
             &doc_bytes,
         );
         if proved_key.as_deref() != Some(signer_pk.as_slice()) {
@@ -2854,6 +3186,7 @@ impl WasmMlsClient {
                 &self.account_did,
                 deletion_authority::DEVICE_REVOCATION_COLLECTION,
                 &own_device_id,
+                deletion_authority::MAX_REVOCATION_PROOF_BYTES,
             )
             .await?;
         if let Err(reason) = deletion_authority::verify_self_deletion_revocation_car_at(
@@ -2861,7 +3194,7 @@ impl WasmMlsClient {
             &self.account_did,
             &own_device_id,
             &op_hex,
-            signed_at,
+            write_signed_at,
             &signer_pk,
             &doc_bytes,
         ) {
@@ -2871,7 +3204,7 @@ impl WasmMlsClient {
         }
         let prepared = PreparedAccountDeletion {
             operation_id,
-            signed_at,
+            signed_at: write_signed_at,
             key_proof,
             revocation_proof,
         };

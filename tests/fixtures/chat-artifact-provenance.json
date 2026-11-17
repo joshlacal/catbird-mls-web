@@ -1,5 +1,5 @@
 {
-  "coreRevision": "2feb5347d724a2ffa77a7116662b8ea3c620bbc7",
+  "coreRevision": "cceee6f752dc5759e2b1e23cf36be48d7818c479",
   "artifacts": [
     {
       "target": "src/generated/blue.catbird.chat.defs.json",
@@ -9,27 +9,27 @@
     {
       "target": "tests/fixtures/mls_chat_signing_domain_vectors.json",
       "source": "src/orchestrator/generated/mls_chat_signing_domain_vectors.json",
-      "sha256": "3ad1347525bedf017642221b3d05151815f136a0690a0b6f0c0e87ac3dbbab81"
+      "sha256": "f0c75f3009ba068c9d5f37cd91dcad5ffe9ab24e14f12f7ee29c1ce1b8e50887"
     },
     {
       "target": "tests/fixtures/mls_chat_contract_vectors.json",
       "source": "src/orchestrator/generated/mls_chat_contract_vectors.json",
-      "sha256": "49f00976f4e7f896ddd295ad4523a05ca45d798681622dc1a869b0a054bb1880"
+      "sha256": "8f2875e41db1809a528baa1016c3cdeec04d4eb2ccd7daf75079506f0614230a"
     },
     {
       "target": "tests/fixtures/mls_chat_control_fingerprint_source.json",
       "source": "src/orchestrator/generated/mls_chat_control_fingerprint_source.json",
-      "sha256": "ef3e17f75ce8257af1e0d7f2f80909cc08ff9b6c80f53c98b44b8aea9301ac22"
+      "sha256": "5d3b37e0a77b577351d0aad033f4ab562dd25357486600c007835d7cc3b4d369"
     }
   ],
   "wasmPackage": {
-    "coreRevision": "2feb5347d724a2ffa77a7116662b8ea3c620bbc7",
+    "coreRevision": "cceee6f752dc5759e2b1e23cf36be48d7818c479",
     "labyrinthRevision": "182e76d00d66f7a1b72bbc4248438bd68e25a2fa",
     "catbirdAtprotoRevision": "2b42978527ccf3f7b0382e4b6f2448c4c3590aad",
     "build": "./build.sh (wasm-pack 0.14.0 --target web --release with its bundled wasm-opt; rustc 1.99.1 per rust-toolchain.toml; build.sh's extra wasm-opt -Oz pass skipped because no wasm-opt is on PATH)",
     "files": {
-      "catbird_mls_web_bg.wasm": "22ce5f7e7200e8836b157631c6a423a7bcdc27d5b4248716bba799a6e7bec228",
-      "catbird_mls_web.js": "f23d53807e865a7dbe7f989c0f4a9dfda72dd0e648ce2587d694533a063d5df1",
+      "catbird_mls_web_bg.wasm": "05722c379bff5edb504ef3af70a4e27764bdfa41bdb5c4bf08a45d57a083f5bb",
+      "catbird_mls_web.js": "68d79e2b0762fd05274ed29d9b02d19ee5d96cfc3e1d41d7e0af10aab199cb56",
       "catbird_mls_web.d.ts": "c6c74ad7ec41aeff3f154bedb6282322a4bf8ced31f41c767f60701426fb8011",
       "catbird_mls_web_bg.wasm.d.ts": "05571b40185faf14c7c956b8e50849977b83eaec8b44e3d74908fcff7617f992"
     }

@@ -63,6 +63,8 @@ use crate::wasm_client::{now_ms, WasmMlsClient};
 
 const APPLY_WRITES: &str = "/xrpc/com.atproto.space.applyWrites";
 const MAILBOX_KEYS_RELAY: &str = "blue.catbird.labyrinth.getMailboxKeysRecord";
+const PENDING_ARCHIVE_ACTIVATION_REFRESH: &str =
+    "labyrinth_pending_device_activation_refresh";
 
 /// The enrolled chat device key: Labyrinth transport key and request signer (`[CB-3]`).
 pub(crate) struct WebArchiveSigner {
@@ -1134,14 +1136,15 @@ impl WasmMlsClient {
         })
     }
 
-    fn save_wasm_archive_status(
+    async fn save_wasm_archive_status(
         &self,
         session: &LabyrinthSession,
         recovery_code: bool,
+        activate_if_anchored: bool,
     ) -> Result<LabyrinthBackupStatus, MLSError> {
         let ts = now_ms();
         let db = self.require_db_mls()?;
-        db.write_tx(|tx| {
+        let (status, retry_activation_refresh) = db.write_tx(|tx| {
             let mut status = match tx.get_labyrinth_state("status_json")? {
                 Some(raw) => serde_json::from_slice::<LabyrinthBackupStatus>(&raw)
                     .map_err(|e| MLSError::Internal(e.to_string()))?,
@@ -1163,6 +1166,7 @@ impl WasmMlsClient {
                     directory_publication_error: None,
                 },
             };
+            let had_pending_publication = status.pending_directory_epoch.is_some();
             status.epoch_seq = session.latest_epoch();
             status.recovery_method_stale |= session.recovery_method_stale();
             status.has_recovery_code |= recovery_code;
@@ -1183,13 +1187,25 @@ impl WasmMlsClient {
                     .rotation_exclusions
                     .retain(|exclusion| exclusion.recovery_method.as_deref() != Some("code"));
             }
+            if status.pending_directory_epoch.is_none()
+                && (had_pending_publication || activate_if_anchored)
+            {
+                tx.put_account_meta(PENDING_ARCHIVE_ACTIVATION_REFRESH, "1", ts)?;
+            }
+            let retry_activation_refresh = status.pending_directory_epoch.is_none()
+                && tx
+                    .get_account_meta(PENDING_ARCHIVE_ACTIVATION_REFRESH)?
+                    .is_some();
             tx.put_labyrinth_state(
                 "status_json",
                 &serde_json::to_vec(&status).map_err(|e| MLSError::Internal(e.to_string()))?,
                 ts,
             )?;
-            Ok(status)
-        })
+            Ok((status, retry_activation_refresh))
+        })?;
+        self.finish_pending_approval_after_archive_promotion(retry_activation_refresh)
+            .await;
+        Ok(status)
     }
     fn set_recovery_needs_attention(
         &self,
@@ -1217,26 +1233,96 @@ impl WasmMlsClient {
         self.set_recovery_needs_attention(false)
     }
 
-
+    /// Refresh a pending chat enrollment only after Labyrinth proved its head anchored. A durable
+    /// intent survives a transient mls-ds refresh failure; the next ordinary archive status save
+    /// retries once. Only `enroll_device_live` may clear local pending state after reading the
+    /// authoritative mls-ds device as active; that path also publishes its deferred keys.
     async fn finish_pending_approval_after_archive_promotion(&self, promoted: bool) {
-        if !promoted || !self.is_device_pending_approval_impl().unwrap_or(false) {
+        if !promoted {
             return;
         }
-        if let (Some((session_token, canonical_dev_id)), Ok((signer, _))) = (
+        let Ok(db) = self.require_db_mls() else {
+            return;
+        };
+        if let Err(error) = db.write_tx(|tx| {
+            tx.put_account_meta(PENDING_ARCHIVE_ACTIVATION_REFRESH, "1", now_ms())
+        }) {
+            tracing::warn!(%error, "could not persist pending archive activation refresh");
+            return;
+        }
+        match self.is_device_pending_approval_impl() {
+            Ok(false) => {
+                let _ = db.write_tx(|tx| {
+                    tx.delete_account_meta(PENDING_ARCHIVE_ACTIVATION_REFRESH)
+                });
+                return;
+            }
+            Ok(true) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not inspect pending archive device activation");
+                return;
+            }
+        }
+        let (Some((session_token, canonical_dev_id)), Ok((signer, _))) = (
             self.live_session(),
             self.load_enrolled_signer_and_auth_gen(),
-        ) {
-            if self
-                .enroll_device_live(&session_token, &canonical_dev_id, &signer)
-                .await
-                .is_err()
-            {
-                if let Ok(db) = self.require_db_mls() {
-                    let _ = db.write_tx(|tx| tx.delete_account_meta("enrollment_status"));
-                }
+        ) else {
+            return;
+        };
+        match self
+            .enroll_device_live(&session_token, &canonical_dev_id, &signer)
+            .await
+        {
+            Ok(()) => {
+                let _ = db.write_tx(|tx| {
+                    tx.delete_account_meta(PENDING_ARCHIVE_ACTIVATION_REFRESH)
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "directory publication completed but device activation refresh failed"
+                );
             }
         }
     }
+
+    /// Retry only a durably pending archive publication or device activation during ordinary
+    /// sync. The local checks keep the common path network-free; a missing archive is never
+    /// replaced with a newly enabled, single-source session.
+    pub(crate) async fn retry_pending_wasm_archive_on_sync(&self) -> Result<(), MLSError> {
+        let db = self.require_db_mls()?;
+        let pending = match db.backend().get_labyrinth_state("status_json")? {
+            Some(raw) => {
+                serde_json::from_slice::<LabyrinthBackupStatus>(&raw)
+                    .map_err(|error| MLSError::Internal(error.to_string()))?
+                    .pending_directory_epoch
+                    .is_some()
+            }
+            None => false,
+        } || db
+            .backend()
+            .get_account_meta(PENDING_ARCHIVE_ACTIVATION_REFRESH)?
+            .is_some();
+        if !pending {
+            return Ok(());
+        }
+
+        let session = self
+            .wasm_archive_deps()?
+            .open()
+            .await
+            .map_err(wasm_archive_error)?
+            .ok_or_else(|| {
+                MLSError::InvalidState(
+                    "pending archive lifecycle has no verified archive session".into(),
+                )
+            })?;
+        self.save_wasm_archive_status(&session, false, false)
+            .await?;
+        Ok(())
+    }
+
 
     pub(crate) async fn enable_labyrinth_live_impl(
         &self,
@@ -1246,7 +1332,8 @@ impl WasmMlsClient {
             .enable()
             .await
             .map_err(wasm_archive_error)?;
-        self.save_wasm_archive_status(&session, false)
+        self.save_wasm_archive_status(&session, false, false)
+            .await
     }
 
     pub(crate) async fn create_recovery_code_live_impl(&self) -> Result<String, MLSError> {
@@ -1260,7 +1347,10 @@ impl WasmMlsClient {
             .create_recovery_code()
             .await
             .map_err(wasm_archive_error)?;
-        if let Err(error) = self.save_wasm_archive_status(&session, true) {
+        if let Err(error) = self
+            .save_wasm_archive_status(&session, true, false)
+            .await
+        {
             tracing::warn!(%error, "recovery code created but archive status refresh failed");
         }
         Ok(code)
@@ -1282,12 +1372,7 @@ impl WasmMlsClient {
             .restore_with_recovery_code(code)
             .await
             .map_err(wasm_archive_error)?;
-        let status = self.save_wasm_archive_status(&session, true)?;
-        self.finish_pending_approval_after_archive_promotion(
-            status.pending_directory_epoch.is_none(),
-        )
-        .await;
-        Ok(status)
+        self.save_wasm_archive_status(&session, true, true).await
     }
 
     pub(crate) async fn register_passkey_prf_live_impl(
@@ -1310,7 +1395,9 @@ impl WasmMlsClient {
             .create_passkey_recovery(&prf_zeroizing, credential_id)
             .await
             .map_err(wasm_archive_error)?;
-        let status = self.save_wasm_archive_status(&session, false)?;
+        let status = self
+            .save_wasm_archive_status(&session, false, false)
+            .await?;
         let ts = now_ms();
         self.require_db_mls()?.write_tx(|tx| {
             let mut st = status.clone();
@@ -1351,7 +1438,9 @@ impl WasmMlsClient {
             .restore_with_passkey_prf(credential_id, &prf_zeroizing)
             .await
             .map_err(wasm_archive_error)?;
-        let status = self.save_wasm_archive_status(&session, false)?;
+        let status = self
+            .save_wasm_archive_status(&session, false, true)
+            .await?;
         let updated = self.require_db_mls()?.write_tx(|tx| {
             let mut status = status.clone();
             status.has_passkey_prf = true;
@@ -1366,11 +1455,42 @@ impl WasmMlsClient {
             )?;
             Ok(status)
         })?;
-        self.finish_pending_approval_after_archive_promotion(
-            updated.pending_directory_epoch.is_none(),
-        )
-        .await;
         Ok(updated)
+    }
+
+    /// Reconcile and durably expose the enrolled device's archive state before offering an OTC
+    /// code. `SessionDeps::open` adopts a strictly verified newer dual-source head before it may
+    /// retry any held local publication. A suppressed publication failure remains visible on the
+    /// returned session, so an offer is forbidden until both the error and pending epoch clear.
+    /// A client without an enrolled signer is the existing stateless new-device path.
+    pub(crate) async fn ensure_wasm_archive_ready_for_otc_offer(&self) -> Result<(), MLSError> {
+        if self
+            .require_db_mls()?
+            .backend()
+            .get_labyrinth_state("device_signer_json")?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let deps = self.wasm_archive_deps()?;
+        let session = match deps.clone().open().await.map_err(wasm_archive_error)? {
+            Some(session) => session,
+            None => deps.enable().await.map_err(wasm_archive_error)?,
+        };
+        let status = self
+            .save_wasm_archive_status(&session, false, false)
+            .await?;
+        if let Some(error) = status.directory_publication_error.as_deref() {
+            return Err(MLSError::InvalidState(format!(
+                "archive directory is not ready for an OTC offer: {error}"
+            )));
+        }
+        if let Some(epoch) = status.pending_directory_epoch {
+            return Err(MLSError::InvalidState(format!(
+                "archive epoch {epoch} is still pending directory publication"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) async fn start_otc_pairing_impl(
@@ -1499,7 +1619,8 @@ impl WasmMlsClient {
             .respond_otc_session(&mailbox, session_id_hex, digits.as_str(), ts.max(0) as u64)
             .await
             .map_err(wasm_archive_error)?;
-        self.save_wasm_archive_status(&session, false)?;
+        self.save_wasm_archive_status(&session, false, false)
+            .await?;
         let _ = db.write_tx(|tx| {
             let _ = tx.delete_labyrinth_state_key("pending_otc_offer");
             let _ = tx.delete_labyrinth_state_key("pending_otc_digits");
@@ -1539,7 +1660,9 @@ impl WasmMlsClient {
             .complete_otc_session(initiator, &session_id_hex, now_u64)
             .await
             .map_err(wasm_archive_error)?;
-        let status = self.save_wasm_archive_status(&session, false)?;
+        let status = self
+            .save_wasm_archive_status(&session, false, true)
+            .await?;
         let new_epoch_seq = status.epoch_seq.max(new_epoch);
         let ts = now_ms();
         self.require_db_mls()?.write_tx(|tx| {
@@ -1567,10 +1690,6 @@ impl WasmMlsClient {
                 ts,
             )
         })?;
-        self.finish_pending_approval_after_archive_promotion(
-            status.pending_directory_epoch.is_none(),
-        )
-        .await;
         Ok(OtcPairingCompletion {
             session_id,
             initiator_mlkem768_ek_len: ek_len,
@@ -1593,7 +1712,8 @@ impl WasmMlsClient {
             .rearchive_before_leave(conversation_id)
             .await
             .map_err(wasm_archive_error)?;
-        self.save_wasm_archive_status(&session, false)?;
+        self.save_wasm_archive_status(&session, false, false)
+            .await?;
         Ok(u32::try_from(archived).unwrap_or(u32::MAX))
     }
 
@@ -2051,10 +2171,16 @@ impl WasmMlsClient {
                 .revoke_chat_device(chat_pubkey)
                 .await
                 .map_err(wasm_archive_error)?;
-            if let Err(error) = self.save_wasm_archive_status(
-                &session,
-                reports.iter().any(|report| report.rekeyed_recovery_code.is_some()),
-            ) {
+            if let Err(error) = self
+                .save_wasm_archive_status(
+                    &session,
+                    reports
+                        .iter()
+                        .any(|report| report.rekeyed_recovery_code.is_some()),
+                    false,
+                )
+                .await
+            {
                 tracing::warn!(%error, "chat device revocation committed but archive status refresh failed");
             }
             for report in reports {
@@ -2182,8 +2308,13 @@ impl WasmMlsClient {
             .revoke_device(target)
             .await
             .map_err(wasm_archive_error)?;
-        if let Err(error) =
-            self.save_wasm_archive_status(&session, report.rekeyed_recovery_code.is_some())
+        if let Err(error) = self
+            .save_wasm_archive_status(
+                &session,
+                report.rekeyed_recovery_code.is_some(),
+                false,
+            )
+            .await
         {
             tracing::warn!(%error, "archive revocation committed but status refresh failed");
         }

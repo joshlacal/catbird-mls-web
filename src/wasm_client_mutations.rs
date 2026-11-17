@@ -2114,7 +2114,7 @@ impl WasmMlsClient {
                                 member_id: target_did.to_string(),
                             });
                         } else {
-                            let (prior_metadata_snapshot, prior_metadata_plaintext) =
+                            let prior_metadata =
                                 wasm_archive_policy::metadata_snapshot_plaintext_for_carry_forward(
                                     backend,
                                     conversation_id,
@@ -2160,21 +2160,11 @@ impl WasmMlsClient {
                             let next_epoch = group.epoch().as_u64();
                             let (next_gch, next_ctag) =
                                 chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                            let meta_key = derive_metadata_key_from_group(
-                                &mut group,
-                                provider.crypto(),
-                                provider.storage(),
-                                &convo.group_id,
-                                next_epoch,
-                            )
-                            .map_err(|e| {
-                                MLSError::Cryptography(format!("derive metadata key: {e}"))
-                            })?;
                             let carried_snap =
                                 wasm_archive_policy::reencrypt_metadata_snapshot_for_epoch(
-                                    prior_metadata_snapshot,
-                                    &prior_metadata_plaintext,
-                                    &meta_key,
+                                    prior_metadata,
+                                    &mut group,
+                                    &provider,
                                     &convo.group_id,
                                     &convo_uuid,
                                     prior_gen,
@@ -3200,7 +3190,7 @@ impl WasmMlsClient {
                 if target_leaves.is_empty() {
                     return Ok(0);
                 }
-                let (prior_metadata_snapshot, prior_metadata_plaintext) =
+                let prior_metadata =
                     wasm_archive_policy::metadata_snapshot_plaintext_for_carry_forward(
                         backend,
                         &canonical_cid,
@@ -3239,19 +3229,11 @@ impl WasmMlsClient {
                 let next_epoch = group.epoch().as_u64();
                 let (next_gch, next_ctag) =
                     chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                let meta_key = derive_metadata_key_from_group(
-                    &mut group,
-                    provider.crypto(),
-                    provider.storage(),
-                    &convo.group_id,
-                    next_epoch,
-                )
-                .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
                 let carried_snap =
                     wasm_archive_policy::reencrypt_metadata_snapshot_for_epoch(
-                        prior_metadata_snapshot,
-                        &prior_metadata_plaintext,
-                        &meta_key,
+                        prior_metadata,
+                        &mut group,
+                        &provider,
                         &convo.group_id,
                         &convo_uuid,
                         prior_gen,
@@ -3410,7 +3392,7 @@ impl WasmMlsClient {
                     if target_leaves.is_empty() {
                         None
                     } else {
-                        let (prior_metadata_snapshot, prior_metadata_plaintext) =
+                        let prior_metadata =
                             wasm_archive_policy::metadata_snapshot_plaintext_for_carry_forward(
                                 backend,
                                 cid,
@@ -3451,19 +3433,11 @@ impl WasmMlsClient {
                         let next_epoch = group.epoch().as_u64();
                         let (next_gch, next_ctag) =
                             chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                        let meta_key = derive_metadata_key_from_group(
-                            &mut group,
-                            provider.crypto(),
-                            provider.storage(),
-                            &convo.group_id,
-                            next_epoch,
-                        )
-                        .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
                         let carried_snap =
                             wasm_archive_policy::reencrypt_metadata_snapshot_for_epoch(
-                                prior_metadata_snapshot,
-                                &prior_metadata_plaintext,
-                                &meta_key,
+                                prior_metadata,
+                                &mut group,
+                                &provider,
                                 &convo.group_id,
                                 &convo_uuid,
                                 prior_gen,

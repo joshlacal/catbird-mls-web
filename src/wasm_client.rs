@@ -1049,7 +1049,10 @@ impl WasmMlsClient {
     }
 
     #[wasm_bindgen(js_name = initiateOtcPairing)]
-    pub fn initiate_otc_pairing(&self) -> Result<JsValue, JsValue> {
+    pub async fn initiate_otc_pairing(&self) -> Result<JsValue, JsValue> {
+        self.ensure_wasm_archive_ready_for_otc_offer()
+            .await
+            .map_err(mls_to_js_err)?;
         let offer = generate_otc_offer().map_err(mls_to_js_err)?;
         let ts = now_ms();
         let mut salt = [0u8; 16];

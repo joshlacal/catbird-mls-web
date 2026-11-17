@@ -554,6 +554,19 @@ impl WasmMlsClient {
             signer.public(),
         )
         .map_err(|e| MLSError::Cryptography(format!("C33 signed publication: {e}")))?;
+        let metadata_snapshot_json = serde_json::to_string(
+            verified_publication
+                .body()
+                .pointer("/artifacts/metadataSnapshot")
+                .ok_or_else(|| {
+                    MLSError::Cryptography(
+                        "C33 signed publication missing metadata snapshot".into(),
+                    )
+                })?,
+        )
+        .map_err(|error| {
+            MLSError::Internal(format!("serialize C33 metadata snapshot: {error}"))
+        })?;
         let published_http = self
             .ds_post_raw(
                 session_token,
@@ -699,6 +712,11 @@ impl WasmMlsClient {
             tx.put_account_meta(
                 &format!("conversation_coords:{conversation_id}"),
                 &coords_json,
+                ts,
+            )?;
+            tx.put_account_meta(
+                &format!("metadata_snapshot_json:{conversation_id}"),
+                &metadata_snapshot_json,
                 ts,
             )?;
             tx.upsert_request(&RequestRow {

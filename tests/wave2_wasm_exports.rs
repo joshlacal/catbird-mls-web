@@ -161,6 +161,8 @@ struct Wave2World {
     repo_proof_fault: Option<(String, String, &'static str)>,
     did_doc_fault: Option<(String, &'static str)>,
     space_apply_fault: bool,
+    epoch_publish_not_authorized_once: bool,
+    get_own_devices_fault_once: bool,
     delete_account_fault: bool,
     deleted_accounts: BTreeSet<String>,
     sequence: u64,
@@ -1307,6 +1309,19 @@ fn dispatch_fetch_inner(
             let head: EpochPublicDef = serde_json::from_value(b["epoch"].clone()).unwrap();
             let parsed_pub = head.to_public().expect("valid EpochPublic");
             let attestor_pk = parsed_pub.attestation.transport_public_key;
+            let not_authorized_once = WORLD.with(|cell| {
+                let mut w = cell.borrow_mut();
+                std::mem::take(&mut w.epoch_publish_not_authorized_once)
+            });
+            if not_authorized_once {
+                return WireResponse::json(
+                    403,
+                    json!({
+                        "error": "NotAuthorized",
+                        "message": "injected pending epoch publication"
+                    }),
+                );
+            }
             WORLD.with(|cell| {
                 let mut w = cell.borrow_mut();
                 let had_prior = w
@@ -1456,6 +1471,19 @@ fn dispatch_fetch_inner(
         "blue.catbird.chat.getOwnDevices" => {
             let account = account_opt.expect("getOwnDevices bearer");
             let caller_dev = params.get("actorDeviceId").cloned().unwrap_or_default();
+            let fault_once = WORLD.with(|cell| {
+                let mut w = cell.borrow_mut();
+                std::mem::take(&mut w.get_own_devices_fault_once)
+            });
+            if fault_once {
+                return WireResponse::json(
+                    503,
+                    json!({
+                        "error": "ServiceUnavailable",
+                        "message": "injected activation refresh failure"
+                    }),
+                );
+            }
             WORLD.with(|cell| {
                 let w = cell.borrow();
                 let items: Vec<_> = w
@@ -1940,6 +1968,9 @@ fn dispatch_fetch_inner(
                 }),
             )
         }
+        "blue.catbird.chat.getConversations" | "blue.catbird.chat.getPendingWelcomes" => {
+            WireResponse::json(200, json!({ "items": [], "hasMore": false }))
+        }
         other => panic!("unexpected XRPC in Wave-2 WASM test fixture: {method} {other} ({url})"),
     }
 }
@@ -2231,8 +2262,8 @@ async fn pending_approval_second_device_car_v1_approval_and_device_revocation() 
     let _ = SqliteConn::delete_opfs_database(&db_path_for(&did, dev2_id));
 }
 
-/// Live Recovery Code + Passkey PRF enrollment/restore, including automatic self-approval and
-/// promotion of a `pending_approval` 2nd/3rd browser device (`#89`).
+/// Live Recovery Code + Passkey PRF enrollment/restore. Ordinary sync must retry a held epoch even
+/// with an empty archive queue, and retain a durable activation retry across reopen.
 #[wasm_bindgen_test]
 async fn recovery_code_and_passkey_prf_live_restore_promote_pending_approval_device() {
     let _fx = install_fixture();
@@ -2261,11 +2292,17 @@ async fn recovery_code_and_passkey_prf_live_restore_promote_pending_approval_dev
     let share_capabilities_before =
         call_count("blue.catbird.labyrinth.getRecoveryShareCapabilities");
 
-    // 2. `dev2` enrolls as `pending_approval` and restores via `restoreWithRecoveryCodeLive` ->
-    //    automatically self-approves on `mls-ds`, publishes DR keys + KPs, and promotes to active!
+    // 2. `dev2` restores while epoch publication is held. A later ordinary sync publishes the
+    //    held head despite an empty archive queue, but its first authoritative mls-ds activation
+    //    read fails. Pending local enrollment and the durable refresh intent must survive.
     let dev2 = open_client(&did, dev2_id).await;
     let _ = enroll(&dev2).await;
     assert!(dev2.is_device_pending_approval().unwrap());
+    WORLD.with(|cell| {
+        let mut world = cell.borrow_mut();
+        world.epoch_publish_not_authorized_once = true;
+        world.get_own_devices_fault_once = true;
+    });
     let restored2: LabyrinthBackupStatus = serde_wasm_bindgen::from_value(
         dev2.restore_with_recovery_code_live(recovery_code)
             .await
@@ -2274,8 +2311,74 @@ async fn recovery_code_and_passkey_prf_live_restore_promote_pending_approval_dev
     .unwrap();
     assert!(restored2.epoch_seq >= 1);
     assert!(
+        restored2.pending_directory_epoch.is_some(),
+        "NotAuthorized publication must leave a verified held epoch"
+    );
+    assert!(dev2.is_device_pending_approval().unwrap());
+    assert_eq!(
+        device_call_count("blue.catbird.chat.publishDirectRequestKeys", dev2_id),
+        0
+    );
+    assert_eq!(
+        device_call_count("blue.catbird.chat.replenishKeyPackages", dev2_id),
+        0
+    );
+
+    assert_eq!(
+        dev2.flush_labyrinth_queue().await.unwrap(),
+        0,
+        "the lifecycle retry must not depend on queued archive work"
+    );
+    dev2.sync().await.unwrap();
+    let published2: LabyrinthBackupStatus =
+        serde_wasm_bindgen::from_value(dev2.labyrinth_status().unwrap()).unwrap();
+    assert!(
+        published2.pending_directory_epoch.is_none(),
+        "ordinary sync must publish the held epoch"
+    );
+    let directory_status = WORLD.with(|cell| {
+        cell.borrow()
+            .ds_devices
+            .get(&did)
+            .and_then(|devices| {
+                devices
+                    .iter()
+                    .find(|device| device.device_id == dev2_id)
+            })
+            .map(|device| device.status.clone())
+    });
+    assert_eq!(directory_status.as_deref(), Some("active"));
+    assert!(
+        dev2.is_device_pending_approval().unwrap(),
+        "failed authoritative activation refresh must retain local pending state"
+    );
+    assert_eq!(
+        device_call_count("blue.catbird.chat.publishDirectRequestKeys", dev2_id),
+        0
+    );
+    assert_eq!(
+        device_call_count("blue.catbird.chat.replenishKeyPackages", dev2_id),
+        0
+    );
+
+    drop(dev2);
+    let dev2 = open_client(&did, dev2_id).await;
+    assert!(
+        dev2.is_device_pending_approval().unwrap(),
+        "local pending state must survive reopen"
+    );
+    assert_eq!(
+        dev2.flush_labyrinth_queue().await.unwrap(),
+        0,
+        "the durable activation retry must not depend on queued archive work"
+    );
+    dev2.sync().await.unwrap();
+    let retried2: LabyrinthBackupStatus =
+        serde_wasm_bindgen::from_value(dev2.labyrinth_status().unwrap()).unwrap();
+    assert!(retried2.pending_directory_epoch.is_none());
+    assert!(
         !dev2.is_device_pending_approval().unwrap(),
-        "recovery-code restore must promote pending_approval device"
+        "durable intent must retry and clear pending only after mls-ds confirms active"
     );
     assert_eq!(
         device_call_count("blue.catbird.chat.publishDirectRequestKeys", dev2_id),
@@ -2438,6 +2541,73 @@ async fn labyrinth_only_revoke_returns_replacement_code_and_durable_attention() 
     let _ = SqliteConn::delete_opfs_database(&db_path_for(&did, dev2_id));
 }
 
+/// An enrolled OTC responder must persist and inspect the reconciled archive status before it
+/// exposes a code. `SessionDeps::open` may return a session after a held head retry failed; that
+/// suppressed error and pending epoch still forbid the offer. The stateless new-device path does
+/// not have an enrolled archive to reconcile.
+#[wasm_bindgen_test]
+async fn otc_offer_requires_reconciled_persisted_directory_status() {
+    let _fx = install_fixture();
+    let stateless_did = make_did("wave2otcstateless");
+    let stateless_id = "00000000-0000-4000-8000-000000000311";
+    let stateless = open_client(&stateless_did, stateless_id).await;
+    let stateless_offer: OtcPairingOffer =
+        serde_wasm_bindgen::from_value(stateless.initiate_otc_pairing().await.unwrap()).unwrap();
+    assert_eq!(stateless_offer.six_digit_code.len(), 6);
+    drop(stateless);
+
+    let did = make_did("wave2otcreadiness");
+    let dev1_id = "00000000-0000-4000-8000-000000000312";
+    let dev2_id = "00000000-0000-4000-8000-000000000313";
+    let dev1 = open_client(&did, dev1_id).await;
+    let _ = enroll(&dev1).await;
+    let _ = dev1.enable_labyrinth_live().await.unwrap();
+    let recovery_code = dev1.create_recovery_code_live().await.unwrap();
+
+    let dev2 = open_client(&did, dev2_id).await;
+    let _ = enroll(&dev2).await;
+    WORLD.with(|cell| cell.borrow_mut().epoch_publish_not_authorized_once = true);
+    let held: LabyrinthBackupStatus = serde_wasm_bindgen::from_value(
+        dev2.restore_with_recovery_code_live(recovery_code)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(held.pending_directory_epoch.is_some());
+
+    WORLD.with(|cell| cell.borrow_mut().epoch_publish_not_authorized_once = true);
+    let error = dev2
+        .initiate_otc_pairing()
+        .await
+        .expect_err("a suppressed directory publication failure must forbid an OTC offer")
+        .as_string()
+        .unwrap();
+    assert!(
+        error.contains("archive directory is not ready")
+            || error.contains("pending directory publication"),
+        "{error}"
+    );
+    let persisted: LabyrinthBackupStatus =
+        serde_wasm_bindgen::from_value(dev2.labyrinth_status().unwrap()).unwrap();
+    assert!(persisted.pending_directory_epoch.is_some());
+    assert!(persisted.directory_publication_error.is_some());
+    assert!(persisted.directory_publication_stalled);
+
+    let offer: OtcPairingOffer =
+        serde_wasm_bindgen::from_value(dev2.initiate_otc_pairing().await.unwrap()).unwrap();
+    assert_eq!(offer.six_digit_code.len(), 6);
+    let reconciled: LabyrinthBackupStatus =
+        serde_wasm_bindgen::from_value(dev2.labyrinth_status().unwrap()).unwrap();
+    assert!(reconciled.pending_directory_epoch.is_none());
+    assert!(reconciled.directory_publication_error.is_none());
+
+    drop(dev1);
+    drop(dev2);
+    let _ = SqliteConn::delete_opfs_database(&db_path_for(&stateless_did, stateless_id));
+    let _ = SqliteConn::delete_opfs_database(&db_path_for(&did, dev1_id));
+    let _ = SqliteConn::delete_opfs_database(&db_path_for(&did, dev2_id));
+}
+
 /// Live `D-4` 2-device CPace + ML-KEM-768 OTC pairing (`startOtcPairing`, `initiateOtcPairing`,
 /// `respondOtcPairing`, `completeLiveOtcPairing`) + monotonic `readState` (`MAX`) + `circleOwnerState`.
 #[wasm_bindgen_test]
@@ -2534,9 +2704,9 @@ async fn live_d4_otc_pairing_and_read_and_circle_owner_state() {
         serde_wasm_bindgen::from_value(dev1.list_circle_owner_states().await.unwrap()).unwrap();
     assert_eq!(all_circles.len(), 1);
 
-    // 2. `dev1` prepares an OTC offer via `initiateOtcPairing`.
+    // 2. `dev1` reconciles its archive, then prepares an OTC offer via `initiateOtcPairing`.
     let offer: OtcPairingOffer =
-        serde_wasm_bindgen::from_value(dev1.initiate_otc_pairing().unwrap()).unwrap();
+        serde_wasm_bindgen::from_value(dev1.initiate_otc_pairing().await.unwrap()).unwrap();
     let code = offer.six_digit_code;
 
     // 3. `dev2` enrolls (`pending_approval`), calls `startOtcPairing(code)` writing `OtcSession` to

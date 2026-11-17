@@ -35,7 +35,6 @@ use catbird_mls::messaging::receive::{
     extract_plaintext_body_and_verify_aad, verify_application_aad_archive_evidence,
     OriginalSenderArchiveAttestationEnvelope, PrivateMessagePlaintextEnvelope,
 };
-use catbird_mls::metadata::derive_metadata_key_from_group;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend};
 use catbird_mls::storage::{
     ConversationRow, KvWriteOverlay, MessageRow, OpenMlsKvProvider, OpenMlsKvStorage, RequestRow,
@@ -2047,6 +2046,12 @@ impl WasmMlsClient {
         let Some((session_token, canonical_dev_id)) = self.live_session() else {
             return Ok(0);
         };
+        if let Err(error) = self.retry_pending_wasm_archive_on_sync().await {
+            tracing::warn!(
+                %error,
+                "ordinary sync could not refresh a durably pending archive lifecycle"
+            );
+        }
         let mut applied = self
             .complete_pending_group_creations(&session_token)
             .await?;
@@ -2863,6 +2868,10 @@ impl WasmMlsClient {
         let coords_canon = chat_wire::canonicalize_wire_coordinate(&vp["next"], Some(cid))?;
         let coords_str =
             serde_json::to_string(&coords_canon).map_err(|e| MLSError::Internal(e.to_string()))?;
+        let metadata_snapshot_str =
+            serde_json::to_string(&artifact["metadataSnapshot"]).map_err(|error| {
+                MLSError::Internal(format!("serialize C33 metadata snapshot: {error}"))
+            })?;
 
         let db = self.require_db_mls()?;
         db.write_tx(|tx| {
@@ -2928,6 +2937,11 @@ impl WasmMlsClient {
             })?;
             tx.put_account_meta(&format!("conversation_coords:{cid}"), &coords_str, ts)?;
             tx.put_account_meta(&format!("c33_publication_json:{cid}"), &pub_norm_str, ts)?;
+            tx.put_account_meta(
+                &format!("metadata_snapshot_json:{cid}"),
+                &metadata_snapshot_str,
+                ts,
+            )?;
             tx.upsert_request(&RequestRow {
                 request_id: request_id.to_string(),
                 conversation_id: cid.to_string(),
@@ -3830,7 +3844,7 @@ impl WasmMlsClient {
                 "the requester device already holds a leaf"
             }));
         }
-        let (prior_metadata_snapshot, prior_metadata_plaintext) =
+        let prior_metadata =
             wasm_archive_policy::metadata_snapshot_plaintext_for_carry_forward(
                 db.backend(),
                 cid,
@@ -3888,18 +3902,10 @@ impl WasmMlsClient {
         let next_epoch = group.epoch().as_u64();
         let (next_gch, next_ctag) =
             chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-        let meta_key = derive_metadata_key_from_group(
-            &mut group,
-            provider.crypto(),
-            provider.storage(),
-            &convo.group_id,
-            next_epoch,
-        )
-        .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
         let carried_snap = wasm_archive_policy::reencrypt_metadata_snapshot_for_epoch(
-            prior_metadata_snapshot,
-            &prior_metadata_plaintext,
-            &meta_key,
+            prior_metadata,
+            &mut group,
+            &provider,
             &convo.group_id,
             &convo_uuid,
             prior_gen,
@@ -5354,18 +5360,19 @@ impl WasmMlsClient {
                     ));
                 }
                 if !kicked {
-                    let (prior_snapshot, prior_plaintext) = prior_metadata?;
+                    let prior_metadata = prior_metadata?;
                     let snapshot = &body["metadataSnapshot"];
                     let decrypted =
                         wasm_archive_policy::decrypt_metadata_snapshot_for_current_group(
+                            tx,
                             cid,
                             snapshot,
                             &mut group,
                             &provider,
                         )?;
                     if !wasm_archive_policy::is_exact_metadata_epoch_carry(
-                        &prior_snapshot,
-                        &prior_plaintext,
+                        prior_metadata.snapshot(),
+                        prior_metadata.plaintext(),
                         snapshot,
                         &decrypted.plaintext,
                     ) {

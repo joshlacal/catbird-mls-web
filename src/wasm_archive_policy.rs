@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use catbird_mls::client::chat_wire;
 use catbird_mls::client::QueuedLabyrinthArchivePayload;
+use catbird_mls::direct_request_bootstrap;
 use catbird_mls::groups::metadata_v1::validate_metadata_snapshot_size;
 use catbird_mls::metadata::{
     decrypt_metadata_snapshot_plaintext, derive_metadata_key_from_group,
@@ -78,17 +79,115 @@ pub(crate) fn current_enabled(
         .is_none_or(row_enabled))
 }
 
+enum MetadataCarryScheme {
+    Legacy,
+    Canonical { origin_transition_id: String },
+}
+
+/// Authenticated prior metadata held only across one Commit build.
+pub(crate) struct MetadataCarryForward {
+    snapshot: Value,
+    plaintext: Vec<u8>,
+    nonce: [u8; 12],
+    ciphertext_len: usize,
+    scheme: MetadataCarryScheme,
+}
+
+impl MetadataCarryForward {
+    pub(crate) fn snapshot(&self) -> &Value {
+        &self.snapshot
+    }
+
+    pub(crate) fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+}
+
 pub(crate) struct DecryptedMetadataSnapshot {
     pub(crate) epoch: u64,
     pub(crate) metadata_version: u64,
     pub(crate) metadata: GroupMetadataV1,
     pub(crate) plaintext: Vec<u8>,
+    nonce: [u8; 12],
+    ciphertext_len: usize,
+    scheme: MetadataCarryScheme,
+}
+
+fn canonical_metadata_coordinates_from_wire(coordinate: &Value) -> Result<Value, MLSError> {
+    let refused =
+        |what: &str| MLSError::Cryptography(format!("metadata carry-forward: {what}"));
+    let conversation_id = uuid::Uuid::from_slice(&chat_wire::json_bytes(
+        coordinate
+            .get("conversationId")
+            .ok_or_else(|| refused("missing conversation id"))?,
+    )?)
+    .map_err(|_| refused("invalid conversation id"))?;
+    let group_id = chat_wire::json_bytes(
+        coordinate
+            .get("groupId")
+            .ok_or_else(|| refused("missing group id"))?,
+    )?;
+    let generation = coordinate
+        .get("generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| refused("missing generation"))?;
+    let epoch = coordinate
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| refused("missing epoch"))?;
+    let group_context_hash = chat_wire::json_bytes(
+        coordinate
+            .get("groupContextHash")
+            .ok_or_else(|| refused("missing group context hash"))?,
+    )?;
+    let confirmation_tag = chat_wire::json_bytes(
+        coordinate
+            .get("confirmationTag")
+            .ok_or_else(|| refused("missing confirmation tag"))?,
+    )?;
+    Ok(direct_request_bootstrap::canonical_metadata_coordinates(
+        &conversation_id.to_string(),
+        &group_id,
+        generation,
+        epoch,
+        &group_context_hash,
+        &confirmation_tag,
+    ))
+}
+
+fn metadata_carry_scheme(
+    tx: &impl WasmSqlBackend,
+    conversation_id: &str,
+    snapshot: &Value,
+    metadata_version: u64,
+) -> Result<MetadataCarryScheme, MLSError> {
+    let refused = |what: &str| MLSError::Cryptography(format!("metadata snapshot: {what}"));
+    let origin_transition_id = snapshot
+        .get("originTransitionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| refused("missing authenticated origin"))?
+        .to_owned();
+    if !snapshot.get("authorProof").is_some_and(Value::is_object) {
+        return Err(refused("missing authenticated origin"));
+    }
+    match tx.get_request(&origin_transition_id)? {
+        Some(request) if request.conversation_id == conversation_id => {
+            if metadata_version != 1 {
+                return Err(refused("canonical metadata version is not 1"));
+            }
+            Ok(MetadataCarryScheme::Canonical {
+                origin_transition_id,
+            })
+        }
+        _ => Ok(MetadataCarryScheme::Legacy),
+    }
 }
 
 /// Decrypt a snapshot against the group's current epoch without normalizing its plaintext.
 /// Callers can therefore distinguish a byte-identical epoch carry from an authored metadata
 /// transition.
 pub(crate) fn decrypt_metadata_snapshot_for_current_group<P: OpenMlsProvider>(
+    tx: &impl WasmSqlBackend,
     conversation_id: &str,
     snapshot: &Value,
     group: &mut MlsGroup,
@@ -144,14 +243,7 @@ pub(crate) fn decrypt_metadata_snapshot_for_current_group<P: OpenMlsProvider>(
         .get("metadataVersion")
         .and_then(Value::as_u64)
         .ok_or_else(|| refused("missing metadata version"))?;
-    if snapshot
-        .get("originTransitionId")
-        .and_then(Value::as_str)
-        .is_none()
-        || !snapshot.get("authorProof").is_some_and(Value::is_object)
-    {
-        return Err(refused("missing authenticated origin"));
-    }
+    let scheme = metadata_carry_scheme(tx, conversation_id, snapshot, metadata_version)?;
     let nonce_vec = chat_wire::json_bytes(
         snapshot
             .get("nonce")
@@ -180,31 +272,62 @@ pub(crate) fn decrypt_metadata_snapshot_for_current_group<P: OpenMlsProvider>(
     {
         return Err(refused("ciphertext binding mismatch"));
     }
-    let metadata_key = derive_metadata_key_from_group(
-        group,
-        provider.crypto(),
-        provider.storage(),
-        &group_id,
-        epoch,
-    )
-    .map_err(|error| refused(&format!("derive metadata key: {error}")))?;
-    let plaintext = decrypt_metadata_snapshot_plaintext(
-        &metadata_key,
-        &group_id,
-        epoch,
-        metadata_version,
-        &nonce,
-        &ciphertext,
-    )
-    .map_err(|error| refused(&format!("decrypt snapshot: {error}")))?;
+    let plaintext = match &scheme {
+        MetadataCarryScheme::Legacy => {
+            let metadata_key = derive_metadata_key_from_group(
+                group,
+                provider.crypto(),
+                provider.storage(),
+                &group_id,
+                epoch,
+            )
+            .map_err(|error| refused(&format!("derive metadata key: {error}")))?;
+            decrypt_metadata_snapshot_plaintext(
+                &metadata_key,
+                &group_id,
+                epoch,
+                metadata_version,
+                &nonce,
+                &ciphertext,
+            )
+            .map_err(|error| refused(&format!("decrypt snapshot: {error}")))?
+        }
+        MetadataCarryScheme::Canonical {
+            origin_transition_id,
+        } => {
+            let coordinates = canonical_metadata_coordinates_from_wire(&snapshot["coordinate"])?;
+            let metadata_key =
+                direct_request_bootstrap::request_metadata_key(group, provider, &coordinates)
+                    .map_err(|error| {
+                        refused(&format!("derive canonical metadata key: {error}"))
+                    })?;
+            direct_request_bootstrap::open_request_metadata(
+                &metadata_key,
+                &coordinates,
+                origin_transition_id,
+                &nonce,
+                &ciphertext,
+            )
+            .map_err(|error| refused(&format!("decrypt canonical snapshot: {error}")))?
+        }
+    };
     validate_metadata_snapshot_size(&plaintext)?;
-    let metadata = serde_json::from_slice::<GroupMetadataV1>(&plaintext)
-        .map_err(|_| refused("invalid metadata plaintext"))?;
+    let metadata = match &scheme {
+        MetadataCarryScheme::Legacy => serde_json::from_slice(&plaintext)
+            .map_err(|_| refused("invalid metadata plaintext"))?,
+        MetadataCarryScheme::Canonical { .. } => {
+            direct_request_bootstrap::decode_request_metadata(&plaintext)
+                .map_err(|_| refused("invalid canonical metadata plaintext"))?
+        }
+    };
     Ok(DecryptedMetadataSnapshot {
         epoch,
         metadata_version,
         metadata,
         plaintext,
+        nonce,
+        ciphertext_len: ciphertext.len(),
+        scheme,
     })
 }
 
@@ -286,25 +409,37 @@ pub(crate) fn metadata_snapshot_plaintext_for_carry_forward<P: OpenMlsProvider>(
     conversation_id: &str,
     group: &mut MlsGroup,
     provider: &P,
-) -> Result<(Value, Vec<u8>), MLSError> {
+) -> Result<MetadataCarryForward, MLSError> {
     let encoded = tx
         .get_account_meta(&format!("metadata_snapshot_json:{conversation_id}"))?
         .ok_or_else(|| MLSError::InvalidState("MetadataSnapshotUnavailable".into()))?;
-    let snapshot: Value = serde_json::from_str(&encoded)
-        .map_err(|_| MLSError::Cryptography("metadata carry-forward: invalid cached snapshot".into()))?;
-    let decrypted =
-        decrypt_metadata_snapshot_for_current_group(conversation_id, &snapshot, group, provider)?;
-    Ok((snapshot, decrypted.plaintext))
+    let snapshot: Value = serde_json::from_str(&encoded).map_err(|_| {
+        MLSError::Cryptography("metadata carry-forward: invalid cached snapshot".into())
+    })?;
+    let decrypted = decrypt_metadata_snapshot_for_current_group(
+        tx,
+        conversation_id,
+        &snapshot,
+        group,
+        provider,
+    )?;
+    Ok(MetadataCarryForward {
+        snapshot,
+        plaintext: decrypted.plaintext,
+        nonce: decrypted.nonce,
+        ciphertext_len: decrypted.ciphertext_len,
+        scheme: decrypted.scheme,
+    })
 }
 
-/// Re-encrypt exact prior metadata plaintext for the next epoch. Only its AEAD and coordinate
-/// bindings change; version, origin, author proof, avatar, unknown fields and plaintext bytes do
-/// not.
+/// Re-encrypt exact prior metadata plaintext for the next epoch under its original scheme. Only
+/// its AEAD and coordinate bindings change; version, origin, author proof, avatar, unknown fields
+/// and plaintext bytes do not.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn reencrypt_metadata_snapshot_for_epoch(
-    mut snapshot: Value,
-    plaintext: &[u8],
-    metadata_key: &[u8; 32],
+pub(crate) fn reencrypt_metadata_snapshot_for_epoch<P: OpenMlsProvider>(
+    carry: MetadataCarryForward,
+    group: &mut MlsGroup,
+    provider: &P,
     group_id: &[u8],
     convo_uuid: &uuid::Uuid,
     generation: i64,
@@ -314,34 +449,72 @@ pub(crate) fn reencrypt_metadata_snapshot_for_epoch(
 ) -> Result<Value, MLSError> {
     let refused =
         |what: &str| MLSError::Cryptography(format!("metadata carry-forward: {what}"));
+    let MetadataCarryForward {
+        mut snapshot,
+        plaintext,
+        nonce: previous_nonce,
+        ciphertext_len: previous_len,
+        scheme,
+    } = carry;
     let metadata_version = snapshot
         .get("metadataVersion")
         .and_then(Value::as_u64)
         .ok_or_else(|| refused("missing metadata version"))?;
-    let previous_nonce = chat_wire::json_bytes(
-        snapshot
-            .get("nonce")
-            .ok_or_else(|| refused("missing nonce"))?,
-    )?;
-    let previous_len = chat_wire::json_bytes(
-        snapshot
-            .get("ciphertext")
-            .ok_or_else(|| refused("missing ciphertext"))?,
-    )?
-    .len();
     let nonce = metadata_nonce()?;
-    if previous_nonce.as_slice() == nonce.as_slice() {
+    if previous_nonce == nonce {
         return Err(refused("nonce repeated across epochs"));
     }
-    let ciphertext = encrypt_metadata_snapshot_plaintext_with_nonce(
-        metadata_key,
-        group_id,
-        target_epoch,
-        metadata_version,
-        &nonce,
-        plaintext,
-    )
-    .map_err(|error| refused(&format!("encrypt next snapshot: {error}")))?;
+    let ciphertext = match scheme {
+        MetadataCarryScheme::Legacy => {
+            let metadata_key = derive_metadata_key_from_group(
+                group,
+                provider.crypto(),
+                provider.storage(),
+                group_id,
+                target_epoch,
+            )
+            .map_err(|error| refused(&format!("derive next metadata key: {error}")))?;
+            encrypt_metadata_snapshot_plaintext_with_nonce(
+                &metadata_key,
+                group_id,
+                target_epoch,
+                metadata_version,
+                &nonce,
+                &plaintext,
+            )
+            .map_err(|error| refused(&format!("encrypt next snapshot: {error}")))?
+        }
+        MetadataCarryScheme::Canonical {
+            origin_transition_id,
+        } => {
+            if metadata_version != 1 {
+                return Err(refused("canonical metadata version is not 1"));
+            }
+            let generation = u64::try_from(generation)
+                .map_err(|_| refused("negative canonical generation"))?;
+            let coordinates = direct_request_bootstrap::canonical_metadata_coordinates(
+                &convo_uuid.to_string(),
+                group_id,
+                generation,
+                target_epoch,
+                next_gch,
+                next_ctag,
+            );
+            let metadata_key =
+                direct_request_bootstrap::request_metadata_key(group, provider, &coordinates)
+                    .map_err(|error| {
+                        refused(&format!("derive next canonical metadata key: {error}"))
+                    })?;
+            direct_request_bootstrap::seal_request_metadata(
+                &metadata_key,
+                &coordinates,
+                &origin_transition_id,
+                &nonce,
+                &plaintext,
+            )
+            .map_err(|error| refused(&format!("encrypt next canonical snapshot: {error}")))?
+        }
+    };
     if ciphertext.len() != previous_len {
         return Err(refused("plaintext length changed"));
     }

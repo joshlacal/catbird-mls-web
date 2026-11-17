@@ -22,9 +22,12 @@ use catbird_mls::chat_v2::transcript::{
     decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
 };
 use catbird_mls::client::chat_wire::{self, StoredArchivedReceipt};
+use catbird_mls::direct_request_bootstrap;
 use catbird_mls::client::{QueuedLabyrinthArchivePayload, REQUIRED_LABYRINTH_OAUTH_SCOPES};
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
-use catbird_mls::storage::{ConversationRow, MessageRow, RequestRow};
+use catbird_mls::storage::{
+    ConversationRow, MessageRow, OpenMlsKvProvider, OpenMlsKvStorage, RequestRow,
+};
 use catbird_mls_web::{SqliteConn, WasmMlsClient};
 use labyrinth_protocol::receipt::{
     expected_receipt_key_id, sign_sequencer_receipt, SequencerReceiptPayload,
@@ -739,6 +742,70 @@ fn account_db(did: &str) -> WasmAccountDb<Rc<SqliteConn>> {
     WasmAccountDb::new(Rc::new(SqliteConn::open(&path, &"ab".repeat(32)).unwrap()))
 }
 
+fn cached_metadata_snapshot(account: &str, cid: &str) -> Value {
+    serde_json::from_str(
+        &account_db(account)
+            .backend()
+            .get_account_meta(&format!("metadata_snapshot_json:{cid}"))
+            .unwrap()
+            .expect("cached metadata snapshot"),
+    )
+    .unwrap()
+}
+
+fn canonical_metadata_plaintext(account: &str, cid: &str, snapshot: &Value) -> Vec<u8> {
+    let db = account_db(account);
+    let row = db.backend().get_conversation(cid).unwrap().unwrap();
+    db.write_tx(|tx| {
+        let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
+        let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&row.group_id))
+            .map_err(|error| catbird_mls::MLSError::Internal(format!("load group: {error:?}")))?
+            .expect("stored C33 group");
+        let coordinate = &snapshot["coordinate"];
+        let conversation_id = uuid::Uuid::from_slice(&chat_wire::json_bytes(
+            &coordinate["conversationId"],
+        )?)
+        .unwrap();
+        assert_eq!(conversation_id.to_string(), cid);
+        let group_id = chat_wire::json_bytes(&coordinate["groupId"])?;
+        assert_eq!(group_id, row.group_id);
+        let generation = coordinate["generation"].as_u64().unwrap();
+        let epoch = coordinate["epoch"].as_u64().unwrap();
+        assert_eq!(group.epoch().as_u64(), epoch);
+        let group_context_hash = chat_wire::json_bytes(&coordinate["groupContextHash"])?;
+        let confirmation_tag = chat_wire::json_bytes(&coordinate["confirmationTag"])?;
+        let coordinates = direct_request_bootstrap::canonical_metadata_coordinates(
+            cid,
+            &row.group_id,
+            generation,
+            epoch,
+            &group_context_hash,
+            &confirmation_tag,
+        );
+        let nonce: [u8; 12] = chat_wire::json_bytes(&snapshot["nonce"])?
+            .try_into()
+            .unwrap();
+        let ciphertext = chat_wire::json_bytes(&snapshot["ciphertext"])?;
+        assert_eq!(
+            snapshot["ciphertextSize"].as_u64(),
+            Some(ciphertext.len() as u64)
+        );
+        assert_eq!(
+            chat_wire::json_bytes(&snapshot["ciphertextSha256"])?,
+            Sha256::digest(&ciphertext).as_slice()
+        );
+        let key = direct_request_bootstrap::request_metadata_key(&group, &provider, &coordinates)?;
+        direct_request_bootstrap::open_request_metadata(
+            &key,
+            &coordinates,
+            snapshot["originTransitionId"].as_str().unwrap(),
+            &nonce,
+            &ciphertext,
+        )
+    })
+    .unwrap()
+}
+
 /// `account`'s outgoing creation journal for `peer`, from its closed database.
 fn creation_journal(account: &str, peer: &str) -> Option<Value> {
     account_db(account)
@@ -1107,6 +1174,13 @@ async fn a_direct_request_welcome_joins_only_through_the_checked_import() {
     assert_eq!(conversation(&bob_client, cid).last_seq, 1);
     assert_eq!(request(&bob_client, cid).consent, "incomingPending");
     assert_eq!(messages(&bob_client, cid).len(), 1);
+    drop(bob_client);
+    let publication = signed_body(&raws[0]);
+    assert_eq!(
+        cached_metadata_snapshot(&bob, cid),
+        publication["artifacts"]["metadataSnapshot"],
+        "checked incoming C33 import must cache its exact canonical metadata envelope"
+    );
 }
 
 /// A pruned opening's participants come from its signed evidence alone: the coordinator's
@@ -1674,7 +1748,16 @@ async fn an_own_commit_answer_counts_only_as_its_signed_request() {
     let _restore = install_ds();
     let (alice, bob) = (did("ownansweralice"), did("ownanswerbob"));
     let cid = "00000000-0000-4000-8000-0000000c3313";
-    drop(published(&alice, &bob, &[cid]).await);
+    let (bob_client, publications) = published(&alice, &bob, &[cid]).await;
+    drop(bob_client);
+    let publication = signed_body(&publications[0]);
+    let prior_snapshot = publication["artifacts"]["metadataSnapshot"].clone();
+    assert_eq!(
+        cached_metadata_snapshot(&alice, cid),
+        prior_snapshot,
+        "published C33 bootstrap must cache its exact canonical metadata envelope"
+    );
+    let prior_plaintext = canonical_metadata_plaintext(&alice, cid, &prior_snapshot);
     let coordinates = stored_coords(&alice, cid);
     let alice_client = open(&alice, ALICE_DEVICE).await;
     for answer in ["foreignEntry", "foreignCoordinates"] {
@@ -1698,6 +1781,35 @@ async fn an_own_commit_answer_counts_only_as_its_signed_request() {
     let signed = signed_body(sent(dsTransitions()).last().unwrap());
     let next = chat_wire::canonicalize_wire_coordinate(&signed["next"], Some(cid)).unwrap();
     assert_eq!(stored_coords(&alice, cid), next);
+    let carried_snapshot = signed["metadataSnapshot"].clone();
+    let carried_plaintext = canonical_metadata_plaintext(&alice, cid, &carried_snapshot);
+    assert_eq!(
+        carried_plaintext, prior_plaintext,
+        "C33 Commit must carry the exact canonical AES-GCM metadata plaintext"
+    );
+    let mut preserved_envelope = carried_snapshot.clone();
+    for field in [
+        "nonce",
+        "ciphertext",
+        "ciphertextSha256",
+        "ciphertextSize",
+        "coordinate",
+    ] {
+        preserved_envelope[field] = prior_snapshot[field].clone();
+    }
+    assert_eq!(
+        preserved_envelope, prior_snapshot,
+        "C33 Commit changed metadata origin, author proof or envelope"
+    );
+    assert_ne!(carried_snapshot["nonce"], prior_snapshot["nonce"]);
+    assert_eq!(
+        chat_wire::json_bytes(&carried_snapshot["ciphertext"])
+            .unwrap()
+            .len(),
+        chat_wire::json_bytes(&prior_snapshot["ciphertext"])
+            .unwrap()
+            .len()
+    );
 }
 
 /// `account`'s `account_meta` value at `key`, from its closed database.

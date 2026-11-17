@@ -10,6 +10,7 @@ use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as Tl
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -20,8 +21,11 @@ use catbird_mls::chat_v2::ids::BareDid;
 use catbird_mls::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
 use catbird_mls::chat_v2::transcript::SignedMutationKind;
 use catbird_mls::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND;
-use catbird_mls::client::chat_wire;
-use catbird_mls::client::QueuedLabyrinthArchivePayload;
+use catbird_mls::client::deletion_authority::{
+    self as deletion_authority, DeletionActorWrite, UnverifiedAccountDeletion,
+    UnverifiedDeletionReason,
+};
+use catbird_mls::client::{chat_wire, QueuedLabyrinthArchivePayload};
 use catbird_mls::direct_request_bootstrap::{
     DirectRequestBootstrap, DirectRequestIntroductionResult, DirectRequestWelcomeInput,
     C33_OPENING_UNAVAILABLE,
@@ -47,6 +51,116 @@ use crate::wasm_client_mutations::{
     prune_commit_transitions, remove_group_creation_journal,
 };
 
+const MAX_DID_DOCUMENT_BYTES: usize = 64 * 1024;
+const DID_DOC_CACHE_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const DID_DOC_CACHE_SOURCE: &str = "strict-v1";
+const DECLARATION_COLLECTION: &str = "blue.catbird.chat.declaration";
+const DECLARATION_RKEY: &str = "self";
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmDidDocCacheMeta {
+    source: String,
+    fetched_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    atproto_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmProvenDeclaration {
+    delivery_service: Option<String>,
+    rev: String,
+    proven_at_ms: i64,
+}
+
+#[derive(Deserialize)]
+struct WasmDeclarationRecord {
+    #[serde(rename = "$type")]
+    record_type: Option<String>,
+    #[serde(rename = "deliveryService")]
+    delivery_service: Option<String>,
+    #[serde(rename = "allowIncoming")]
+    allow_incoming: Option<String>,
+    #[serde(rename = "protocolVersion")]
+    protocol_version: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
+}
+
+enum DeclarationReadError {
+    Unreachable(MLSError),
+    Invalid(MLSError),
+}
+
+fn did_doc_cache_key(did: &str) -> String {
+    format!("did_doc:{did}")
+}
+
+fn did_doc_meta_key(did: &str) -> String {
+    format!("did_doc_meta:{did}")
+}
+
+fn did_identity_changed_key(did: &str) -> String {
+    format!("did_identity_changed:{did}")
+}
+
+fn atproto_key_multibase(doc: &Value, did: &str) -> Option<String> {
+    let full_id = format!("{did}#atproto");
+    doc.get("verificationMethod")?
+        .as_array()?
+        .iter()
+        .find(|method| {
+            matches!(
+                method.get("id").and_then(Value::as_str),
+                Some(id) if id == "#atproto" || id == full_id
+            )
+        })?
+        .get("publicKeyMultibase")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn declared_delivery_service(record_dagcbor: &[u8]) -> Result<String, MLSError> {
+    let record: WasmDeclarationRecord = serde_ipld_dagcbor::from_slice(record_dagcbor)
+        .map_err(|e| MLSError::Cryptography(format!("chat.declaration record: {e}")))?;
+    if record.record_type.as_deref() != Some(DECLARATION_COLLECTION) {
+        return Err(MLSError::Cryptography(
+            "chat.declaration record has the wrong $type".into(),
+        ));
+    }
+    if !matches!(
+        record.allow_incoming.as_deref(),
+        Some("all" | "none" | "following")
+    ) || !matches!(record.protocol_version.as_deref(), Some("1" | "2"))
+        || !record
+            .created_at
+            .as_deref()
+            .is_some_and(|at| chrono::DateTime::parse_from_rfc3339(at).is_ok())
+    {
+        return Err(MLSError::Cryptography(
+            "chat.declaration lacks required policy, protocol version or timestamp".into(),
+        ));
+    }
+    let declared = record
+        .delivery_service
+        .map(|did| did.trim().to_owned())
+        .filter(|did| !did.is_empty())
+        .ok_or_else(|| {
+            MLSError::Cryptography("chat.declaration names no delivery service".into())
+        })?;
+    catbird_mls::client::did_url::did_document_url(&declared).map_err(|e| {
+        MLSError::Cryptography(format!(
+            "chat.declaration delivery service is not a valid DID: {e}"
+        ))
+    })?;
+    if declared.contains('#') {
+        return Err(MLSError::Cryptography(
+            "chat.declaration delivery service must be a bare DID".into(),
+        ));
+    }
+    Ok(declared)
+}
 fn build_join_config() -> MlsGroupJoinConfig {
     MlsGroupJoinConfig::builder()
         .use_ratchet_tree_extension(true)
@@ -723,114 +837,156 @@ impl WasmMlsClient {
 
     pub(crate) async fn resolve_did_document(
         &self,
-        session_token: &str,
+        _session_token: &str,
         did: &str,
     ) -> Result<Option<Vec<u8>>, MLSError> {
-        let clean_did = did.split('#').next().unwrap_or(did).trim();
-        let verify_target = |doc_bytes: Vec<u8>| -> Result<Vec<u8>, MLSError> {
-            let parsed: Value = serde_json::from_slice(&doc_bytes).map_err(|e| {
-                MLSError::Cryptography(format!(
-                    "DID document JSON parse failed for `{clean_did}`: {e}"
-                ))
-            })?;
-            if parsed.get("id").and_then(Value::as_str) != Some(clean_did) {
+        let clean_did = catbird_mls::client::did_url::bare_did(did);
+        let url = catbird_mls::client::did_url::did_document_url(clean_did)
+            .map_err(MLSError::invalid_input)?;
+        let failure = match self.http.get(&url).send().await {
+            Ok(resp) if resp.url().as_str() != url => {
                 return Err(MLSError::Cryptography(format!(
-                    "DID document id mismatch for `{clean_did}`"
+                    "DID document fetch for `{clean_did}` was redirected; redirects are refused"
                 )));
             }
-            Ok(doc_bytes)
+            Ok(resp) if resp.status().as_u16() == 200 => {
+                if resp
+                    .content_length()
+                    .is_some_and(|size| size > MAX_DID_DOCUMENT_BYTES as u64)
+                {
+                    return Err(MLSError::Cryptography(format!(
+                        "DID document for `{clean_did}` exceeds {MAX_DID_DOCUMENT_BYTES} bytes"
+                    )));
+                }
+                match resp.bytes().await {
+                    Err(error) => MLSError::Internal(format!(
+                        "read DID document body for `{clean_did}`: {error}"
+                    )),
+                    Ok(body) => {
+                        if body.len() > MAX_DID_DOCUMENT_BYTES {
+                            return Err(MLSError::Cryptography(format!(
+                                "DID document for `{clean_did}` exceeds {MAX_DID_DOCUMENT_BYTES} bytes"
+                            )));
+                        }
+                        let doc_bytes =
+                            chat_wire::extract_did_doc_from_resolve_response(&body)?;
+                        let doc: Value = serde_json::from_slice(&doc_bytes).map_err(|e| {
+                            MLSError::Cryptography(format!(
+                                "invalid DID document JSON for `{clean_did}`: {e}"
+                            ))
+                        })?;
+                        if doc.get("id").and_then(Value::as_str) != Some(clean_did) {
+                            return Err(MLSError::Cryptography(format!(
+                                "resolved DID document id {:?} does not match expected `{clean_did}`",
+                                doc.get("id")
+                            )));
+                        }
+                        let doc_text = std::str::from_utf8(&doc_bytes).map_err(|_| {
+                            MLSError::Cryptography("DID document is not UTF-8".into())
+                        })?;
+                        let current_atproto_key = atproto_key_multibase(&doc, clean_did);
+                        let meta = WasmDidDocCacheMeta {
+                            source: DID_DOC_CACHE_SOURCE.to_owned(),
+                            fetched_at_ms: now_ms(),
+                            atproto_key: current_atproto_key.clone(),
+                        };
+                        let meta_json = serde_json::to_string(&meta).map_err(|e| {
+                            MLSError::Internal(format!("serialize DID document cache meta: {e}"))
+                        })?;
+                        self.require_db_mls()?.write_tx(|tx| {
+                            let previous = tx
+                                .get_account_meta(&did_doc_meta_key(clean_did))?
+                                .and_then(|raw| {
+                                    serde_json::from_str::<WasmDidDocCacheMeta>(&raw).ok()
+                                })
+                                .filter(|meta| meta.source == DID_DOC_CACHE_SOURCE)
+                                .and_then(|meta| meta.atproto_key);
+                            if previous.is_some() && previous != current_atproto_key {
+                                tx.put_account_meta(
+                                    &did_identity_changed_key(clean_did),
+                                    "1",
+                                    now_ms(),
+                                )?;
+                            }
+                            tx.put_account_meta(
+                                &did_doc_cache_key(clean_did),
+                                doc_text,
+                                now_ms(),
+                            )?;
+                            tx.put_account_meta(
+                                &did_doc_meta_key(clean_did),
+                                &meta_json,
+                                now_ms(),
+                            )
+                        })?;
+                        return Ok(Some(doc_bytes));
+                    }
+                }
+            }
+            Ok(resp) if (300..400).contains(&resp.status().as_u16()) => {
+                return Err(MLSError::Cryptography(format!(
+                    "DID document fetch for `{clean_did}` was redirected (HTTP {}); redirects are refused",
+                    resp.status().as_u16()
+                )));
+            }
+            Ok(resp) => MLSError::Internal(format!(
+                "DID document fetch for `{clean_did}` failed with HTTP {}",
+                resp.status().as_u16()
+            )),
+            Err(error) => MLSError::Internal(format!(
+                "DID document fetch for `{clean_did}` failed: {error}"
+            )),
         };
 
-        // `did:plc:*` MUST resolve from the authoritative PLC directory rather than trusting own PDS.
-        if clean_did.starts_with("did:plc:") {
-            if !atproto_spaces::is_valid_did(clean_did) {
-                return Err(MLSError::invalid_input(format!(
-                    "invalid PLC DID `{clean_did}`"
-                )));
-            }
-            let plc_url = format!("https://plc.directory/{clean_did}");
-            match self.http.get(&plc_url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let bytes = resp.bytes().await.map_err(|e| {
-                        MLSError::Internal(format!("read PLC directory body({clean_did}): {e}"))
-                    })?;
-                    let doc = chat_wire::extract_did_doc_from_resolve_response(&bytes)?;
-                    return Ok(Some(verify_target(doc)?));
-                }
-                Ok(resp) if resp.status().as_u16() == 404 => return Ok(None),
-                Ok(resp) => {
-                    return Err(MLSError::Internal(format!(
-                        "PLC directory resolve({clean_did}) failed with HTTP {}",
-                        resp.status().as_u16()
-                    )));
-                }
-                Err(e) => {
-                    return Err(MLSError::Internal(format!(
-                        "PLC directory resolve({clean_did}) failed: {e}"
-                    )));
+        let backend = self.require_db_mls()?.backend();
+        let cached = backend.get_account_meta(&did_doc_cache_key(clean_did))?;
+        let meta = backend.get_account_meta(&did_doc_meta_key(clean_did))?;
+        if let (Some(cached), Some(meta)) = (cached, meta) {
+            if let Ok(meta) = serde_json::from_str::<WasmDidDocCacheMeta>(&meta) {
+                let age = now_ms().saturating_sub(meta.fetched_at_ms);
+                if meta.source == DID_DOC_CACHE_SOURCE
+                    && (0..=DID_DOC_CACHE_TTL_MS).contains(&age)
+                {
+                    return Ok(Some(cached.into_bytes()));
                 }
             }
         }
+        Err(failure)
+    }
 
-        let pds_url = format!(
-            "{}/xrpc/com.atproto.identity.resolveDid?did={}",
-            self.pds_base(),
-            chat_wire::urlencode_form_component(clean_did)
-        );
-        if let Ok(resp) = self
-            .http
-            .get(&pds_url)
-            .bearer_auth(session_token)
-            .send()
-            .await
-        {
-            if resp.status().is_success() {
-                if let Ok(bytes) = resp.bytes().await {
-                    if !bytes.is_empty() {
-                        if let Ok(doc) = chat_wire::extract_did_doc_from_resolve_response(&bytes) {
-                            if let Ok(verified) = verify_target(doc) {
-                                return Ok(Some(verified));
-                            }
-                        }
-                    }
-                }
-            }
+    pub(crate) fn observe_pds_repo_rev_floor_wasm(
+        &self,
+        did: &str,
+        commit_rev: &str,
+        context: &str,
+    ) -> Result<(), MLSError> {
+        if !catbird_mls::labyrinth::repo_proof::is_valid_tid(commit_rev) {
+            return Err(MLSError::Cryptography(format!(
+                "invalid ATProto commit rev TID `{commit_rev}` for `{context}`"
+            )));
         }
-        if let Some(rest) = clean_did.strip_prefix("did:web:") {
-            let decoded = rest.replace("%3A", ":").replace("%3a", ":");
-            let wk_url = if clean_did == self.home_ds_did.split('#').next().unwrap_or("") {
-                format!("{}/.well-known/did.json", self.ds_base())
+        let db = self.require_db_mls()?;
+        let meta_key = format!("pds_repo_rev_floor:{did}");
+        db.write_tx(|tx| {
+            if let Some(existing) = tx.get_account_meta(&meta_key)? {
+                if !catbird_mls::labyrinth::repo_proof::is_valid_tid(&existing) {
+                    return Err(MLSError::Cryptography(format!(
+                        "corrupt pinned repository commit rev floor for `{did}`"
+                    )));
+                }
+                if commit_rev < existing.as_str() {
+                    return Err(MLSError::Cryptography(format!(
+                        "PDS repo rev rollback for `{context}`: `{commit_rev}` < `{existing}`"
+                    )));
+                }
+                if commit_rev > existing.as_str() {
+                    tx.put_account_meta(&meta_key, commit_rev, now_ms())?;
+                }
             } else {
-                let host_part = decoded.split('/').next().unwrap_or("");
-                let bare_host = if let Some(bracketed) = host_part.strip_prefix('[') {
-                    bracketed.split(']').next().unwrap_or("")
-                } else {
-                    host_part.split(':').next().unwrap_or("")
-                };
-                let scheme = if matches!(bare_host, "localhost" | "127.0.0.1" | "::1") {
-                    "http"
-                } else {
-                    "https"
-                };
-                format!("{scheme}://{decoded}/.well-known/did.json")
-            };
-            if let Ok(resp) = self.http.get(&wk_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if !bytes.is_empty() {
-                            if let Ok(doc) =
-                                chat_wire::extract_did_doc_from_resolve_response(&bytes)
-                            {
-                                if let Ok(verified) = verify_target(doc) {
-                                    return Ok(Some(verified));
-                                }
-                            }
-                        }
-                    }
-                }
+                tx.put_account_meta(&meta_key, commit_rev, now_ms())?;
             }
-        }
-        Ok(None)
+            Ok(())
+        })
     }
 
     async fn verify_pds_record_car_proof_wasm(
@@ -900,35 +1056,7 @@ impl WasmMlsClient {
                     "I4 CARv1 repo proof failed for `{expected_uri}`: {e}"
                 ))
             })?;
-        if !catbird_mls::labyrinth::repo_proof::is_valid_tid(&commit_rev) {
-            return Err(MLSError::Cryptography(format!(
-                "I4 invalid ATProto commit rev TID `{commit_rev}` for `{expected_uri}`"
-            )));
-        }
-        if let Ok(db) = self.require_db_mls() {
-            let meta_key = format!("pds_repo_rev_floor:{did}");
-            let ts = now_ms();
-            db.write_tx(|tx| {
-                if let Some(existing) = tx.get_account_meta(&meta_key)? {
-                    if !catbird_mls::labyrinth::repo_proof::is_valid_tid(&existing) {
-                        return Err(MLSError::Cryptography(format!(
-                            "I4 corrupt pinned repository commit rev floor for `{did}`"
-                        )));
-                    }
-                    if commit_rev.as_str() < existing.as_str() {
-                        return Err(MLSError::Cryptography(format!(
-                            "I4 PDS repo rev rollback for `{expected_uri}`: `{commit_rev}` < `{existing}`"
-                        )));
-                    }
-                    if commit_rev.as_str() > existing.as_str() {
-                        tx.put_account_meta(&meta_key, &commit_rev, ts)?;
-                    }
-                } else {
-                    tx.put_account_meta(&meta_key, &commit_rev, ts)?;
-                }
-                Ok(())
-            })?;
-        }
+        self.observe_pds_repo_rev_floor_wasm(did, &commit_rev, &expected_uri)?;
         Ok(())
     }
 
@@ -1020,15 +1148,25 @@ impl WasmMlsClient {
         persist: bool,
     ) -> Result<Vec<(String, Vec<u8>)>, MLSError> {
         let require_repo_proof = did != self.account_did;
-        let resolved_doc = self.resolve_did_document(session_token, did).await?;
-        let atproto_key = resolved_doc
-            .as_deref()
-            .and_then(|doc| atproto_spaces::did_resolver::DidDocument::parse_json(did, doc).ok())
-            .and_then(|doc| doc.atproto_key);
-        let pds_endpoint = resolved_doc
-            .as_deref()
-            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(doc, did))
-            .unwrap_or_else(|| self.pds_base());
+        let resolved_doc = self
+            .resolve_did_document(session_token, did)
+            .await?
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!("I4 missing DID document for `{did}`"))
+            })?;
+        let parsed_doc = atproto_spaces::did_resolver::DidDocument::parse_json(did, &resolved_doc)
+            .map_err(|e| {
+                MLSError::Cryptography(format!("I4 malformed DID document for `{did}`: {e}"))
+            })?;
+        let pds_endpoint = parsed_doc
+            .pds_endpoint()
+            .map_err(|e| {
+                MLSError::Cryptography(format!(
+                    "I4 missing PDS service in DID document for `{did}`: {e}"
+                ))
+            })?
+            .to_owned();
+        let atproto_key = parsed_doc.atproto_key;
         let raw_device_records = self
             .paginate_pds_collection_wasm(&pds_endpoint, did, "blue.catbird.chat.device", false)
             .await?;
@@ -1086,7 +1224,8 @@ impl WasmMlsClient {
                     "I4 missing value on `{uri}`"
                 )));
             };
-            if require_repo_proof || atproto_key.is_some() {
+            let repo_proven = require_repo_proof || atproto_key.is_some();
+            if repo_proven {
                 let Some(ref key) = atproto_key else {
                     return Err(MLSError::Cryptography(format!(
                         "I4 missing #atproto key for `{did}`"
@@ -1108,6 +1247,26 @@ impl WasmMlsClient {
                 record_val,
                 &enrolled_map,
             )?;
+            if repo_proven {
+                let revoked_at_ms = record_val["createdAt"]
+                    .as_str()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.timestamp_millis())
+                    .ok_or_else(|| {
+                        MLSError::Cryptography(
+                            "I4 verified revocation has invalid createdAt".into(),
+                        )
+                    })?;
+                let key =
+                    deletion_authority::verified_device_revocation_key(did, &target_id);
+                self.require_db_mls()?.write_tx(|tx| {
+                    let earliest = tx
+                        .get_account_meta(&key)?
+                        .and_then(|raw| raw.parse::<i64>().ok())
+                        .map_or(revoked_at_ms, |old| old.min(revoked_at_ms));
+                    tx.put_account_meta(&key, &earliest.to_string(), now_ms())
+                })?;
+            }
             revoked_device_ids.insert(target_id);
         }
         let pairs: Vec<(String, Vec<u8>)> = entries
@@ -1154,36 +1313,142 @@ impl WasmMlsClient {
             .await
     }
 
+    async fn read_proven_declaration(
+        &self,
+        session_token: &str,
+        did: &str,
+    ) -> Result<(Option<String>, String), DeclarationReadError> {
+        let doc_bytes = self
+            .resolve_did_document(session_token, did)
+            .await
+            .map_err(DeclarationReadError::Invalid)?
+            .ok_or_else(|| {
+                DeclarationReadError::Invalid(MLSError::Cryptography(format!(
+                    "no DID document for `{did}`"
+                )))
+            })?;
+        let doc = atproto_spaces::did_resolver::DidDocument::parse_json(did, &doc_bytes)
+            .map_err(|e| {
+                DeclarationReadError::Invalid(MLSError::Cryptography(format!(
+                    "malformed DID document for `{did}`: {e}"
+                )))
+            })?;
+        let pds = doc
+            .pds_endpoint()
+            .map_err(|e| {
+                DeclarationReadError::Invalid(MLSError::Cryptography(format!(
+                    "no PDS service in the DID document of `{did}`: {e}"
+                )))
+            })?
+            .to_owned();
+        let atproto_key = doc.atproto_key.ok_or_else(|| {
+            DeclarationReadError::Invalid(MLSError::Cryptography(format!(
+                "no #atproto repository signing key in the DID document of `{did}`"
+            )))
+        })?;
+        let url = format!(
+            "{}/xrpc/com.atproto.sync.getRecord?did={}&collection={DECLARATION_COLLECTION}&rkey={DECLARATION_RKEY}",
+            pds.trim_end_matches('/'),
+            chat_wire::urlencode_form_component(did),
+        );
+        // Public proof read on the account's independently resolved PDS: never attach a bearer.
+        let response = self.http.get(&url).send().await.map_err(|e| {
+            DeclarationReadError::Unreachable(MLSError::Internal(format!(
+                "chat.declaration sync.getRecord for `{did}` failed: {e}"
+            )))
+        })?;
+        let status = response.status().as_u16();
+        if status >= 500 || matches!(status, 408 | 429) {
+            return Err(DeclarationReadError::Unreachable(MLSError::Internal(
+                format!(
+                    "chat.declaration sync.getRecord for `{did}` failed with HTTP {status}"
+                ),
+            )));
+        }
+        if status != 200 {
+            return Err(DeclarationReadError::Invalid(MLSError::Cryptography(
+                format!(
+                    "chat.declaration sync.getRecord for `{did}` returned HTTP {status} without a proof"
+                ),
+            )));
+        }
+        let body = response.bytes().await.map_err(|e| {
+            DeclarationReadError::Unreachable(MLSError::Internal(format!(
+                "read chat.declaration proof for `{did}`: {e}"
+            )))
+        })?;
+        let (proved, rev) =
+            catbird_mls::labyrinth::repo_proof::verify_car_record_proof_with_rev(
+                &body,
+                did,
+                DECLARATION_COLLECTION,
+                DECLARATION_RKEY,
+                &atproto_key,
+            )
+            .map_err(|e| {
+                DeclarationReadError::Invalid(MLSError::Cryptography(format!(
+                    "chat.declaration proof for `{did}`: {e}"
+                )))
+            })?;
+        self.observe_pds_repo_rev_floor_wasm(
+            did,
+            &rev,
+            &format!("chat.declaration for `{did}`"),
+        )
+        .map_err(DeclarationReadError::Invalid)?;
+        let declared = proved
+            .map(|(_, record)| declared_delivery_service(&record))
+            .transpose()
+            .map_err(DeclarationReadError::Invalid)?;
+        Ok((declared, rev))
+    }
+
     pub(crate) async fn resolve_peer_home_ds_did(
         &self,
         session_token: &str,
         did: &str,
-    ) -> Option<String> {
-        let pds_endpoint = self
-            .resolve_did_document(session_token, did)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(&doc, did))
-            .unwrap_or_else(|| self.pds_base());
-        let get_url = format!(
-            "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.declaration&rkey=self",
-            pds_endpoint.trim_end_matches('/'),
-            chat_wire::urlencode_form_component(did),
-        );
-        // Public record read on a peer-controlled PDS: never with this session's bearer token.
-        let resp = self.http.get(&get_url).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
+    ) -> Result<Option<String>, MLSError> {
+        let did = catbird_mls::client::did_url::bare_did(did);
+        let cache_key = format!("declaration_proven:{did}");
+        match self.read_proven_declaration(session_token, did).await {
+            Ok((delivery_service, rev)) => {
+                let proven = WasmProvenDeclaration {
+                    delivery_service: delivery_service.clone(),
+                    rev,
+                    proven_at_ms: now_ms(),
+                };
+                let encoded = serde_json::to_string(&proven).map_err(|e| {
+                    MLSError::Internal(format!("encode proven declaration: {e}"))
+                })?;
+                self.require_db_mls()?.write_tx(|tx| {
+                    tx.put_account_meta(&cache_key, &encoded, proven.proven_at_ms)
+                })?;
+                Ok(delivery_service)
+            }
+            Err(DeclarationReadError::Invalid(error)) => Err(error),
+            Err(DeclarationReadError::Unreachable(error)) => {
+                let backend = self.require_db_mls()?.backend();
+                let cached = backend.get_account_meta(&cache_key)?;
+                let changed =
+                    backend.get_account_meta(&did_identity_changed_key(did))?;
+                if changed.is_some() {
+                    return Err(MLSError::Cryptography(format!(
+                        "chat.declaration last-proven answer predates the repository identity change for `{did}`"
+                    )));
+                }
+                let Some(proven) = cached
+                    .and_then(|raw| serde_json::from_str::<WasmProvenDeclaration>(&raw).ok())
+                else {
+                    return Err(error);
+                };
+                self.observe_pds_repo_rev_floor_wasm(
+                    did,
+                    &proven.rev,
+                    &format!("cached chat.declaration for `{did}`"),
+                )?;
+                Ok(proven.delivery_service)
+            }
         }
-        let body = resp.bytes().await.ok()?;
-        let val: Value = serde_json::from_slice(&body).ok()?;
-        val.pointer("/value/deliveryService")
-            .or_else(|| val.pointer("/value/homeDsDid"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
     }
 
     async fn resolve_direct_request_coordinator(
@@ -1199,11 +1464,11 @@ impl WasmMlsClient {
         }
         let actor_home = self
             .resolve_peer_home_ds_did(session_token, actor_did)
-            .await
+            .await?
             .ok_or_else(|| MLSError::Cryptography("C33 actor home DS unavailable".into()))?;
         let recipient_home = self
             .resolve_peer_home_ds_did(session_token, recipient_did)
-            .await
+            .await?
             .ok_or_else(|| MLSError::Cryptography("C33 recipient home DS unavailable".into()))?;
         dr_transcript::derive_deterministic_coordinator(&actor_home, &recipient_home)
             .map_err(|e| MLSError::Cryptography(format!("C33 coordinator: {e}")))
@@ -4116,6 +4381,222 @@ impl WasmMlsClient {
         })
     }
 
+    fn deletion_local_device_keys(
+        &self,
+        cid: &str,
+        did: &str,
+        device_id: &str,
+    ) -> Vec<Vec<u8>> {
+        let mut conversation_ids = vec![cid.to_owned()];
+        if let Ok(db) = self.require_db_mls() {
+            if let Ok(conversations) = db.backend().list_conversations(None, 500) {
+                conversation_ids.extend(
+                    conversations
+                        .into_iter()
+                        .map(|conversation| conversation.conversation_id)
+                        .filter(|other| other != cid),
+                );
+            }
+        }
+        let mut keys = Vec::new();
+        for conversation_id in conversation_ids {
+            let Ok(group) = self.control_group(&conversation_id) else {
+                continue;
+            };
+            for member in group.members() {
+                if chat_wire::parse_scoped_credential_did_device(
+                    member.credential.serialized_content(),
+                )
+                .is_ok_and(|(leaf_did, leaf_device)| {
+                    leaf_did == did && leaf_device == device_id
+                }) {
+                    let key = member.signature_key.as_slice().to_vec();
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    fn store_unverified_account_deletion(
+        &self,
+        cid: &str,
+        entry: &Value,
+        deleted_did: &str,
+        seq: i64,
+        reason: UnverifiedDeletionReason,
+        write: Option<&DeletionActorWrite>,
+    ) -> Result<(), MLSError> {
+        let recorded_at_ms = now_ms();
+        let evidence = UnverifiedAccountDeletion {
+            conversation_id: cid.to_owned(),
+            deleted_did: deleted_did.to_owned(),
+            seq,
+            entry_id: entry["entryId"].as_str().unwrap_or_default().to_owned(),
+            reason,
+            operation_id: write.map(|actor| actor.operation_id.clone()),
+            actor_device_id: write.map(|actor| actor.actor_device_id.clone()),
+            entry: entry.clone(),
+            recorded_at_ms,
+        };
+        let encoded = serde_json::to_vec(&evidence)
+            .map_err(|error| MLSError::Internal(format!("encode deletion evidence: {error}")))?;
+        self.require_db_mls()?.write_tx(|tx| {
+            tx.put_labyrinth_state(
+                &deletion_authority::unverified_deletion_key(cid, deleted_did, seq),
+                &encoded,
+                recorded_at_ms,
+            )
+        })
+    }
+
+    pub(crate) async fn quarantine_account_deletion_impl(
+        &self,
+        session_token: &str,
+        cid: &str,
+        sequencer_did: &str,
+        entry: &Value,
+        entry_seq: i64,
+    ) -> Result<UnverifiedDeletionReason, MLSError> {
+        let current = if let Some(key_id) =
+            chat_wire::account_deleted_entry_key_id(cid, sequencer_did, entry)
+        {
+            let key = self
+                .fetch_sequencer_receipt_key_sec1(session_token, sequencer_did, key_id)
+                .await?;
+            chat_wire::verify_account_deleted_entry_signature(cid, sequencer_did, entry, &key)
+        } else {
+            None
+        };
+        let Some((deleted_did, seq)) = current else {
+            let named = entry["conversationId"].as_str().unwrap_or_default();
+            let elsewhere = if !named.is_empty() && named != cid {
+                if let Some(key_id) =
+                    chat_wire::account_deleted_entry_key_id(named, sequencer_did, entry)
+                {
+                    let key = self
+                        .fetch_sequencer_receipt_key_sec1(
+                            session_token,
+                            sequencer_did,
+                            key_id,
+                        )
+                        .await?;
+                    chat_wire::verify_account_deleted_entry_signature(
+                        named,
+                        sequencer_did,
+                        entry,
+                        &key,
+                    )
+                    .is_some()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let reason = if elsewhere {
+                UnverifiedDeletionReason::OtherConversation
+            } else {
+                UnverifiedDeletionReason::SequencerUnverified
+            };
+            let deleted_did = entry["deletedDid"].as_str().unwrap_or_default();
+            let seq = entry["seq"].as_i64().unwrap_or(entry_seq);
+            let write = deletion_authority::parse_actor_write(entry).ok();
+            self.store_unverified_account_deletion(
+                cid,
+                entry,
+                deleted_did,
+                seq,
+                reason,
+                write.as_ref(),
+            )?;
+            return Ok(reason);
+        };
+
+        let write = match deletion_authority::parse_actor_write(entry) {
+            Ok(write) => write,
+            Err(reason) => {
+                self.store_unverified_account_deletion(
+                    cid,
+                    entry,
+                    &deleted_did,
+                    seq,
+                    reason,
+                    None,
+                )?;
+                return Ok(reason);
+            }
+        };
+        let reason = if !deletion_authority::sequenced_at_ms(entry).is_some_and(|sequenced_at| {
+            deletion_authority::signed_before_sequenced(&write, sequenced_at)
+        }) {
+            UnverifiedDeletionReason::SignedAfterSequenced
+        } else {
+            let mut keys =
+                self.deletion_local_device_keys(cid, &deleted_did, &write.actor_device_id);
+            let mut signature_valid = keys.iter().any(|key| {
+                deletion_authority::actor_write_signature_valid(&write, key)
+            });
+            if !signature_valid {
+                if let Some(proof) = deletion_authority::key_proof_bytes(entry) {
+                    if let Some(document) = self
+                        .resolve_did_document(session_token, &deleted_did)
+                        .await?
+                    {
+                        if let Some(key) = deletion_authority::device_key_from_key_proof(
+                            &proof,
+                            &deleted_did,
+                            &write.actor_device_id,
+                            write.signed_at_ms,
+                            &document,
+                        ) {
+                            signature_valid =
+                                deletion_authority::actor_write_signature_valid(&write, &key);
+                            keys.push(key);
+                        }
+                    }
+                }
+            }
+            if !signature_valid {
+                if keys.is_empty() {
+                    UnverifiedDeletionReason::DeviceKeyUnavailable
+                } else {
+                    UnverifiedDeletionReason::BadSignature
+                }
+            } else {
+                let revoked_at = self
+                    .require_db_mls()?
+                    .backend()
+                    .get_account_meta(&deletion_authority::verified_device_revocation_key(
+                        &deleted_did,
+                        &write.actor_device_id,
+                    ))?
+                    .and_then(|raw| raw.parse::<i64>().ok());
+                if deletion_authority::revoked_at_signed_instant(
+                    revoked_at,
+                    write.signed_at_ms,
+                ) {
+                    UnverifiedDeletionReason::DeviceRevokedAtSignedAt
+                } else {
+                    // No current format proves historical non-revocation or inventory
+                    // completeness.
+                    UnverifiedDeletionReason::RevocationStatusUnproven
+                }
+            }
+        };
+        self.store_unverified_account_deletion(
+            cid,
+            entry,
+            &deleted_did,
+            seq,
+            reason,
+            Some(&write),
+        )?;
+        Ok(reason)
+    }
+
     /// Effects of a verified account deletion: its local messages and queued archive duty go,
     /// and the recorded deletion keeps its purged mailbox out of archive rosters.
     fn apply_verified_account_deletion(
@@ -4131,8 +4612,8 @@ impl WasmMlsClient {
                 seq.to_string().as_bytes(),
                 ts,
             )?;
-            tx.purge_messages_from_sender(None, deleted_did)?;
-            tx.purge_labyrinth_queue_from_sender(deleted_did)
+            tx.purge_messages_from_sender_before_seq(cid, deleted_did, seq)?;
+            tx.purge_labyrinth_queue_from_sender(cid, deleted_did, seq)
         })
     }
 
@@ -5011,8 +5492,14 @@ impl WasmMlsClient {
 
         let db = self.require_db_mls()?;
         let mut candidate_dids = BTreeMap::new();
+        let mut deleting_dids = BTreeSet::new();
         for entry in &sorted_entries {
             chat_wire::collect_dids_from_json(entry, &mut candidate_dids);
+            if entry.get("$type").and_then(Value::as_str) == Some(ACCOUNT_DELETED_ENTRY_KIND) {
+                if let Some(did) = entry["deletedDid"].as_str() {
+                    deleting_dids.insert(did.to_owned());
+                }
+            }
         }
         if let Ok(provider) = db.openmls_provider() {
             if let Ok(Some(group)) =
@@ -5029,10 +5516,19 @@ impl WasmMlsClient {
         }
         let mut peer_map: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();
         for did in candidate_dids.keys() {
-            let pairs = self
+            match self
                 .fetch_peer_device_keys_via_pds(session_token, did, false)
-                .await?;
-            peer_map.insert(did.clone(), pairs);
+                .await
+            {
+                Ok(pairs) => {
+                    peer_map.insert(did.clone(), pairs);
+                }
+                Err(error) if deleting_dids.contains(did) => {
+                    tracing::warn!(%did, %error, "deleted account PDS keys unavailable; retaining deletion evidence");
+                    peer_map.insert(did.clone(), Vec::new());
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let sync_pass = SyncPass {
@@ -5079,34 +5575,29 @@ impl WasmMlsClient {
             }
 
             if entry_type == ACCOUNT_DELETED_ENTRY_KIND {
-                // An entry whose sequencer authority does not verify stops this pass here: it is
-                // never skipped and passed by later entries.
-                let key_id =
-                    chat_wire::account_deleted_entry_key_id(cid, &convo.sequencer_did, entry)
-                        .ok_or_else(|| {
-                            MLSError::Cryptography(
-                                "account deletion is not bound to this conversation's sequencer"
-                                    .into(),
-                            )
-                        })?;
-                let key = self
-                    .fetch_sequencer_receipt_key_sec1(session_token, &convo.sequencer_did, key_id)
-                    .await?;
-                let (deleted_did, seq) = chat_wire::verify_account_deleted_entry_signature(
-                    cid,
-                    &convo.sequencer_did,
-                    entry,
-                    &key,
-                )
-                .ok_or_else(|| {
-                    MLSError::Cryptography(
-                        "account deletion sequencer authority does not verify".into(),
+                let reason = self
+                    .quarantine_account_deletion_impl(
+                        session_token,
+                        cid,
+                        &convo.sequencer_did,
+                        entry,
+                        entry_seq,
                     )
-                })?;
-                self.apply_verified_account_deletion(cid, &deleted_did, seq, ts)?;
-                pass.applied = pass.applied.saturating_add(1);
-                pass.max_seq = pass.max_seq.max(entry_seq);
-                continue;
+                    .await?;
+                if reason == UnverifiedDeletionReason::SequencerUnverified {
+                    return Err(MLSError::Cryptography(
+                        "I13: account deletion authority does not verify".into(),
+                    ));
+                }
+                tracing::warn!(
+                    cid,
+                    entry_seq,
+                    ?reason,
+                    "account deletion remains quarantined; sync will retry at this entry"
+                );
+                return Err(MLSError::InvalidState(
+                    "AccountDeletionUnverified".into(),
+                ));
             }
 
             if entry_type.ends_with("directRequestAcceptanceEntry")

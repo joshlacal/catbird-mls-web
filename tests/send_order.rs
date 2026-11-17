@@ -15,6 +15,9 @@ use catbird_mls::canonical_transport::{derive_key_id, CanonicalOperation};
 use catbird_mls::chat_v2::transcript::{
     decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
 };
+use catbird_mls::client::deletion_authority::{
+    self as deletion_authority, UnverifiedAccountDeletion, UnverifiedDeletionReason,
+};
 use catbird_mls::client::{
     chat_wire, QueuedLabyrinthArchivePayload, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
@@ -1798,16 +1801,14 @@ async fn an_entry_without_its_mls_group_is_never_acknowledged() {
     assert_eq!(conversation_row(&alice_client, cid).last_seq, 1);
 }
 
-/// An `accountDeletedEntry` purges only under its v2 sequencer authority, verified under the
-/// exact receipt method it names, and one that does not verify stops sync there: no later
-/// entry passes it. A verified one purges the account's messages and records the deletion for
-/// archive rosters. Fail-before: an unsigned deletion was skipped, so Carol's later message
-/// moved the cursor past it.
+/// Sequencer authority alone never authorizes deletion: missing or forged actor authority and
+/// cross-conversation evidence remain quarantined, purge nothing, and hold the cursor.
 #[wasm_bindgen_test]
-async fn only_a_verified_account_deletion_purges_messages() {
+async fn account_deletions_remain_quarantined_without_historical_nonrevocation() {
     let _restore = install_ds();
     let (alice, bob, carol) = (did("deletealice"), did("deletebob"), did("deletecarol"));
     let cid = "00000000-0000-4000-8000-0000000c000a";
+    let other_cid = "00000000-0000-4000-8000-0000000c000f";
     let members = [
         (alice.as_str(), ALICE_DEVICE),
         (bob.as_str(), BOB_DEVICE),
@@ -1832,27 +1833,86 @@ async fn only_a_verified_account_deletion_purges_messages() {
     alice_client
         .sync()
         .await
-        .expect_err("an unverifiable deletion stops sync");
+        .expect_err("malformed sequencer authority must stop sync");
     assert_eq!(
         timeline(&alice_client, cid),
-        timeline_of(&[(2, "from a living account")]),
-        "an unsigned deletion purges nothing and no later entry passes it"
+        timeline_of(&[(2, "from a living account")])
     );
     assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
 
-    setEntry(cid, &account_deletion_entry(cid, &bob, 3, true).to_string());
-    alice_client.sync().await.unwrap();
-    assert_eq!(
-        timeline(&alice_client, cid),
-        timeline_of(&[(4, "after the deletion")]),
-        "verified deletion"
-    );
+    let signed = account_deletion_entry(cid, &bob, 3, true);
+    setEntry(cid, &signed.to_string());
+    alice_client
+        .sync()
+        .await
+        .expect_err("a sequencer signature without actor authority remains quarantined");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
     drop(alice_client);
-    let recorded = account_db(&alice)
+    let db = account_db(&alice);
+    let evidence_key = deletion_authority::unverified_deletion_key(cid, &bob, 3);
+    let evidence: UnverifiedAccountDeletion = serde_json::from_slice(
+        &db.backend()
+            .get_labyrinth_state(&evidence_key)
+            .unwrap()
+            .expect("unverified deletion evidence"),
+    )
+    .unwrap();
+    assert_eq!(evidence.reason, UnverifiedDeletionReason::NoActorWrite);
+    assert!(db
         .backend()
         .get_labyrinth_state(&chat_wire::account_deletion_key(cid, &bob))
-        .unwrap();
-    assert_eq!(recorded.as_deref(), Some(b"3".as_slice()));
+        .unwrap()
+        .is_none());
+    drop(db);
+    let alice_client = open(&alice, ALICE_DEVICE).await;
+
+    let mut forged = account_deletion_entry(cid, &bob, 3, true);
+    let write_body = serde_json::to_vec(&json!({
+        "operationId": "0123456789abcdef0123456789abcdef",
+        "actorDeviceId": BOB_DEVICE,
+        "endpointNsid": "blue.catbird.labyrinth.deleteAccountData",
+        "payloadSha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "signedAt": "2026-11-07T11:59:00.000Z",
+    }))
+    .unwrap();
+    forged["actorWrite"] = json!({
+        "writeBody": STANDARD.encode(write_body),
+        "payloadBytes": STANDARD.encode(b"{}"),
+        "signature": STANDARD.encode([0x55; 64]),
+    });
+    forged["keyProof"] = json!(STANDARD.encode([0x44; 32]));
+    setEntry(cid, &forged.to_string());
+    alice_client
+        .sync()
+        .await
+        .expect_err("forged actor authority must remain quarantined");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+    assert_eq!(
+        timeline(&alice_client, cid),
+        timeline_of(&[(2, "from a living account")])
+    );
+
+    let elsewhere = account_deletion_entry(other_cid, &bob, 3, true);
+    setEntry(cid, &elsewhere.to_string());
+    alice_client
+        .sync()
+        .await
+        .expect_err("cross-conversation deletion evidence must not advance this cursor");
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+    assert_eq!(
+        timeline(&alice_client, cid),
+        timeline_of(&[(2, "from a living account")])
+    );
+    drop(alice_client);
+    let db = account_db(&alice);
+    let evidence: UnverifiedAccountDeletion = serde_json::from_slice(
+        &db.backend()
+            .get_labyrinth_state(&evidence_key)
+            .unwrap()
+            .expect("cross-conversation evidence"),
+    )
+    .unwrap();
+    assert_eq!(evidence.reason, UnverifiedDeletionReason::OtherConversation);
 }
 
 /// Own-echo Commit labels are only a routing hint: the body must verify under this device's

@@ -1655,3 +1655,47 @@ impl Serialize for CanonicalValue {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn account_deletion_entry() -> serde_json::Value {
+        serde_json::json!({
+            "$type": "blue.catbird.chat.defs#accountDeletedEntry",
+            "entryId": "00000000-0000-4000-8000-000000000003",
+            "conversationId": "00000000-0000-4000-8000-000000000001",
+            "seq": 3,
+            "deletedDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            "sequencerDid": "did:web:chat.catbird.blue",
+            "sequencerAuthority": {
+                "sequencerDid": "did:web:chat.catbird.blue",
+                "keyId": "did:web:chat.catbird.blue#mls-receipt-1",
+                "signature": STANDARD.encode([0_u8; 64]),
+            },
+            "actorWrite": {
+                "writeBody": STANDARD.encode(b"{}"),
+                "payloadBytes": STANDARD.encode(b"{}"),
+                "signature": STANDARD.encode([1_u8; 64]),
+            },
+            "keyProof": STANDARD.encode([2_u8]),
+            "receivedAt": "2026-11-07T12:00:00.000Z",
+        })
+    }
+
+    #[wasm_bindgen_test]
+    fn account_deletion_a1_fields_decode_but_unknown_fields_stay_closed() {
+        let valid = serde_json::to_vec(&account_deletion_entry()).unwrap();
+        validate_read_shape("conversationEntry", &valid).unwrap();
+
+        let mut unknown = account_deletion_entry();
+        unknown["proofThatDoesNotExist"] = serde_json::json!(true);
+        let error =
+            validate_read_shape("conversationEntry", &serde_json::to_vec(&unknown).unwrap())
+                .unwrap_err();
+        assert!(error.to_string().contains("unknown closed clean-chat field"));
+    }
+}

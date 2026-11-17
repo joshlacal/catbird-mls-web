@@ -19,10 +19,12 @@ use zeroize::Zeroizing;
 use catbird_mls::canonical_transport::{
     derive_key_id, CanonicalOperation, GatewayResponse, PreparedRequest,
 };
+use catbird_mls::client::deletion_authority::UnverifiedDeletionReason;
 use catbird_mls::client::{
     chat_wire, CircleOwnerStateDto, DeviceRevocationReport, LabyrinthBackupStatus,
-    LabyrinthRotationExclusion, MailboxReadStateRecord, OtcInitiatedSession, OtcPairingCompletion,
-    QueuedLabyrinthArchivePayload, RegisteredDeviceInfo, UploadedConversationAttachment,
+    LabyrinthRevocationOutcome, LabyrinthRotationExclusion, MailboxReadStateRecord,
+    OtcInitiatedSession, OtcPairingCompletion, QueuedLabyrinthArchivePayload,
+    RegisteredDeviceInfo, UploadedConversationAttachment,
 };
 use catbird_mls::labyrinth::session::{AuthorityResult, OrchestratorError};
 use catbird_mls::labyrinth::session::{
@@ -189,28 +191,25 @@ impl WebArchiveGateway {
         Self::send(request).await
     }
 
-    async fn verify_peer_mailbox_keys_car_proof_if_atproto_key_present(
+    async fn verify_peer_mailbox_keys_car_proof(
         &self,
         did: &str,
         rkey: &str,
         response: &Value,
         expected_cid: &str,
     ) -> labyrinth::Result<()> {
-        let doc_bytes = match self
+        let doc_bytes = self
             .client
             .resolve_did_document(&self.session_token, did)
             .await
-        {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(()),
-            Err(err) => return Err(labyrinth::Error::Backend(err.to_string())),
-        };
-        let Ok(doc) = DidDocument::parse_json(did, &doc_bytes) else {
-            return Ok(());
-        };
-        let Some(ref atproto_key) = doc.atproto_key else {
-            return Ok(());
-        };
+            .map_err(|error| labyrinth::Error::Backend(error.to_string()))?
+            .ok_or_else(|| labyrinth::Error::Malformed("mailboxKeys DID document missing"))?;
+        let doc = DidDocument::parse_json(did, &doc_bytes)
+            .map_err(|_| labyrinth::Error::Malformed("mailboxKeys DID document"))?;
+        let atproto_key = doc
+            .atproto_key
+            .as_ref()
+            .ok_or(labyrinth::Error::Malformed("mailboxKeys #atproto key missing"))?;
         let inline_proof = response.get("proof").and_then(|p| {
             p.as_str()
                 .or_else(|| p.get("$bytes").and_then(Value::as_str))
@@ -233,7 +232,7 @@ impl WebArchiveGateway {
             let resp = Self::send(self.client.http.get(url))
                 .await
                 .map_err(labyrinth::Error::Backend)?;
-            if resp.status >= 400 {
+            if resp.status != 200 {
                 return Err(labyrinth::Error::BadSignature);
             }
             resp.body
@@ -241,17 +240,24 @@ impl WebArchiveGateway {
         let record_val = response
             .get("value")
             .ok_or(labyrinth::Error::Malformed("getRecord missing value"))?;
-        catbird_mls::labyrinth::repo_proof::verify_car_record_json_match(
-            &car_bytes,
-            did,
-            nsid::MAILBOX_KEYS,
-            rkey,
-            Some(expected_cid),
-            record_val,
-            atproto_key,
-        )
-        .map(|_| ())
-        .map_err(|_| labyrinth::Error::BadSignature)
+        let (_, rev) =
+            catbird_mls::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
+                &car_bytes,
+                did,
+                nsid::MAILBOX_KEYS,
+                rkey,
+                Some(expected_cid),
+                record_val,
+                atproto_key,
+            )
+            .map_err(|_| labyrinth::Error::BadSignature)?;
+        self.client
+            .observe_pds_repo_rev_floor_wasm(
+                did,
+                &rev,
+                &format!("mailboxKeys `{did}/{rkey}`"),
+            )
+            .map_err(|error| labyrinth::Error::Backend(error.to_string()))
     }
 }
 
@@ -325,6 +331,10 @@ impl LabyrinthSpaceGateway for WebArchiveGateway {
     ) -> Result<LabyrinthSpaceResponse, String> {
         self.execute_authenticated_space(request).await
     }
+    fn authenticates_responses(&self) -> bool {
+        true
+    }
+
 }
 
 #[async_trait::async_trait(?Send)]
@@ -447,7 +457,7 @@ impl PublicRepoBackend for WebArchiveGateway {
         else {
             return Ok(None);
         };
-        self.verify_peer_mailbox_keys_car_proof_if_atproto_key_present(did, rkey, &raw_json, &cid)
+        self.verify_peer_mailbox_keys_car_proof(did, rkey, &raw_json, &cid)
             .await?;
         Ok(Some((bytes, cid)))
     }
@@ -970,6 +980,7 @@ impl WasmMlsClient {
                 self.account_did.clone(),
                 device_id,
             )
+            .with_home_ds_did(self.home_ds_did.clone())
             .with_clock(Arc::new(WasmArchiveClock)),
         );
         let deps = SessionDeps {
@@ -996,6 +1007,36 @@ impl WasmMlsClient {
         };
         Ok((deps, gateway))
     }
+
+    async fn ensure_recovery_share_home_service_pin(&self) -> Result<(), MLSError> {
+        let (session_token, _) = self.require_live_session()?;
+        let proven = self
+            .resolve_peer_home_ds_did(&session_token, &self.account_did)
+            .await?
+            .ok_or_else(|| {
+                MLSError::InvalidState(
+                    "account home delivery-service declaration is unproven".into(),
+                )
+            })?;
+        if proven != self.home_ds_did {
+            return Err(MLSError::InvalidState(
+                "account home delivery service differs from the configured service".into(),
+            ));
+        }
+        let placements = WasmArchiveVault {
+            db: WasmAccountDb::new(self.require_db_mls()?.backend().clone()),
+            namespace: "wasm.placements",
+        };
+        catbird_mls::labyrinth::recovery_shares::pin_proven_home_service(
+            &placements,
+            &self.account_did,
+            &proven,
+        )
+        .map_err(|error| {
+            MLSError::Cryptography(format!("Labyrinth recovery-share service pin: {error}"))
+        })
+    }
+
 
     fn wasm_archive_deps(&self) -> Result<SessionDeps, MLSError> {
         self.wasm_archive_deps_with_gateway().map(|(deps, _)| deps)
@@ -1150,6 +1191,32 @@ impl WasmMlsClient {
             Ok(status)
         })
     }
+    fn set_recovery_needs_attention(
+        &self,
+        needs_attention: bool,
+    ) -> Result<LabyrinthBackupStatus, MLSError> {
+        self.require_db_mls()?.write_tx(|tx| {
+            let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                MLSError::InvalidState("Labyrinth status not initialized".into())
+            })?;
+            let mut status: LabyrinthBackupStatus =
+                serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+            status.recovery_needs_attention = needs_attention;
+            tx.put_labyrinth_state(
+                "status_json",
+                &serde_json::to_vec(&status).map_err(|e| MLSError::Internal(e.to_string()))?,
+                now_ms(),
+            )?;
+            Ok(status)
+        })
+    }
+
+    pub(crate) fn acknowledge_recovery_attention_impl(
+        &self,
+    ) -> Result<LabyrinthBackupStatus, MLSError> {
+        self.set_recovery_needs_attention(false)
+    }
+
 
     async fn finish_pending_approval_after_archive_promotion(&self, promoted: bool) {
         if !promoted || !self.is_device_pending_approval_impl().unwrap_or(false) {
@@ -1188,11 +1255,14 @@ impl WasmMlsClient {
             .enable()
             .await
             .map_err(wasm_archive_error)?;
+        self.set_recovery_needs_attention(true)?;
         let code = session
             .create_recovery_code()
             .await
             .map_err(wasm_archive_error)?;
-        self.save_wasm_archive_status(&session, true)?;
+        if let Err(error) = self.save_wasm_archive_status(&session, true) {
+            tracing::warn!(%error, "recovery code created but archive status refresh failed");
+        }
         Ok(code)
     }
 
@@ -1200,10 +1270,15 @@ impl WasmMlsClient {
         &self,
         code: &str,
     ) -> Result<LabyrinthBackupStatus, MLSError> {
-        labyrinth::recovery_code::RecoveryCode::candidates(code)
-            .map_err(|_| MLSError::invalid_input("invalid 40-character Labyrinth recovery code"))?;
-        let session = self
-            .wasm_archive_deps()?
+        let deps = self.wasm_archive_deps()?;
+        if deps
+            .recovery_code_requires_share(code)
+            .await
+            .map_err(wasm_archive_error)?
+        {
+            self.ensure_recovery_share_home_service_pin().await?;
+        }
+        let session = deps
             .restore_with_recovery_code(code)
             .await
             .map_err(wasm_archive_error)?;
@@ -1262,89 +1337,40 @@ impl WasmMlsClient {
                 "passkey PRF restore requires non-empty credential_id and 32-byte PRF output",
             ));
         }
+        let _ = self.require_live_session()?;
         let prf_zeroizing = Zeroizing::new(prf_output_32.to_vec());
-        if self.live_session().is_some() {
-            let session = self
-                .wasm_archive_deps()?
-                .restore_with_passkey_prf(credential_id, &prf_zeroizing)
-                .await
-                .map_err(wasm_archive_error)?;
-            let status = self.save_wasm_archive_status(&session, false)?;
-            let ts = now_ms();
-            let updated = self.require_db_mls()?.write_tx(|tx| {
-                let mut st = status.clone();
-                st.has_passkey_prf = true;
-                st.rotation_exclusions
-                    .retain(|e| e.recovery_method.as_deref() != Some("passkey"));
-                tx.put_labyrinth_state("passkey_credential_id", credential_id, ts)?;
-                tx.put_labyrinth_state(
-                    "status_json",
-                    &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
-                    ts,
-                )?;
-                Ok(st)
-            })?;
-            self.finish_pending_approval_after_archive_promotion(
-                updated.pending_directory_epoch.is_none(),
-            )
-            .await;
-            return Ok(updated);
+        let deps = self.wasm_archive_deps()?;
+        if deps
+            .passkey_recovery_requires_share(credential_id, &prf_zeroizing)
+            .await
+            .map_err(wasm_archive_error)?
+        {
+            self.ensure_recovery_share_home_service_pin().await?;
         }
-
-        // Offline Worker mode (no bearer session token): verify against local passkey binding if present.
-        let mut expected_digest_hasher = Sha256::new();
-        expected_digest_hasher.update(b"catbird.wasm.passkey_prf.v1\0");
-        expected_digest_hasher.update(self.account_did.as_bytes());
-        expected_digest_hasher.update([0u8]);
-        expected_digest_hasher.update(credential_id);
-        expected_digest_hasher.update([0u8]);
-        expected_digest_hasher.update(&prf_zeroizing);
-        let candidate_digest: [u8; 32] = expected_digest_hasher.finalize().into();
-
-        let ts = now_ms();
-        self.require_db_mls()?.write_tx(|tx| {
-            if let Some(expected_cred) = tx.get_labyrinth_state("passkey_credential_id")? {
-                if expected_cred != credential_id {
-                    return Err(MLSError::insufficient_permissions(
-                        "passkey credential_id does not match registered recovery passkey",
-                    ));
-                }
-            }
-            if let Some(expected_digest) = tx.get_labyrinth_state("passkey_prf_digest")? {
-                if expected_digest.as_slice() != candidate_digest.as_slice() {
-                    return Err(MLSError::insufficient_permissions(
-                        "passkey PRF output does not match registered recovery passkey",
-                    ));
-                }
-            }
-            tx.put_labyrinth_state("passkey_credential_id", credential_id, ts)?;
-            tx.put_labyrinth_state("passkey_prf_digest", &candidate_digest, ts)?;
-            let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
-                MLSError::InvalidState("Labyrinth status not initialized".to_string())
-            })?;
-            let mut st: LabyrinthBackupStatus =
-                serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
-            st.epoch_seq = st.epoch_seq.saturating_add(1);
-            st.has_passkey_prf = true;
-            if !st.active_device_ids.contains(&self.device_id) {
-                st.active_device_ids.push(self.device_id.clone());
-            }
-            tx.upsert_mutation_journal(&MutationJournalRow {
-                journal_id: format!("passkey-restore-epoch-{}", st.epoch_seq),
-                op_type: "epoch_rotation".to_string(),
-                epoch_seq: st.epoch_seq,
-                state_json: json!({ "trigger": "passkey_prf_restore" }).to_string(),
-                status: "done".to_string(),
-                created_at_ms: ts,
-                updated_at_ms: ts,
-            })?;
+        let session = deps
+            .restore_with_passkey_prf(credential_id, &prf_zeroizing)
+            .await
+            .map_err(wasm_archive_error)?;
+        let status = self.save_wasm_archive_status(&session, false)?;
+        let updated = self.require_db_mls()?.write_tx(|tx| {
+            let mut status = status.clone();
+            status.has_passkey_prf = true;
+            status
+                .rotation_exclusions
+                .retain(|e| e.recovery_method.as_deref() != Some("passkey"));
+            tx.put_labyrinth_state("passkey_credential_id", credential_id, now_ms())?;
             tx.put_labyrinth_state(
                 "status_json",
-                &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
-                ts,
+                &serde_json::to_vec(&status).map_err(|e| MLSError::Internal(e.to_string()))?,
+                now_ms(),
             )?;
-            Ok(st)
-        })
+            Ok(status)
+        })?;
+        self.finish_pending_approval_after_archive_promotion(
+            updated.pending_directory_epoch.is_none(),
+        )
+        .await;
+        Ok(updated)
     }
 
     pub(crate) async fn start_otc_pairing_impl(
@@ -1571,6 +1597,77 @@ impl WasmMlsClient {
         Ok(u32::try_from(archived).unwrap_or(u32::MAX))
     }
 
+    async fn quarantine_listed_account_deletions(
+        &self,
+        conversation_id: &str,
+        history: &[LoadedMessage],
+    ) -> Result<(), MLSError> {
+        if history.is_empty() {
+            return Ok(());
+        }
+        let pinned = self
+            .require_db_mls()?
+            .backend()
+            .get_conversation(conversation_id)?
+            .map(|conversation| conversation.sequencer_did)
+            .filter(|did| !did.is_empty());
+        let sequencer = pinned
+            .or_else(|| {
+                history
+                    .iter()
+                    .filter_map(|message| message.archived_receipt.as_ref())
+                    .max_by_key(|receipt| receipt.signed.payload.seq)
+                    .map(|receipt| receipt.signed.payload.sequencer_did.clone())
+            })
+            .ok_or_else(|| {
+                MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into())
+            })?;
+        let (session_token, device_id) = self.require_live_session()?;
+        let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
+        let state = self
+            .ds_signed_get(
+                &session_token,
+                &device_id,
+                "blue.catbird.chat.getConversationState",
+                &[
+                    ("actorDeviceId", &device_id),
+                    ("conversationId", conversation_id),
+                ],
+                &signer,
+            )
+            .await?;
+        let deletions = state["accountDeletions"].as_array().ok_or_else(|| {
+            MLSError::Cryptography(
+                "getConversationState is missing accountDeletions".into(),
+            )
+        })?;
+        for entry in deletions {
+            let seq = entry["seq"].as_i64().filter(|seq| *seq >= 1).ok_or_else(|| {
+                MLSError::Cryptography("account deletion has no positive seq".into())
+            })?;
+            let reason = self
+                .quarantine_account_deletion_impl(
+                    &session_token,
+                    conversation_id,
+                    &sequencer,
+                    entry,
+                    seq,
+                )
+                .await?;
+            if reason != UnverifiedDeletionReason::OtherConversation {
+                tracing::warn!(
+                    conversation_id,
+                    ?reason,
+                    "archive restore blocked on unverified account deletion"
+                );
+                return Err(MLSError::InvalidState(
+                    "ArchiveDeletionUnverified".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn verify_and_reindex_history_impl(
         &self,
         conversation_id: &str,
@@ -1592,6 +1689,8 @@ impl WasmMlsClient {
             ));
         }
         let mut history = page.messages;
+        self.quarantine_listed_account_deletions(conversation_id, &history)
+            .await?;
         let db = self.require_db_mls()?;
         hide_deleted_accounts_wasm(db, conversation_id, &mut history)?;
         let copies = wasm_restore_copies(conversation_id, &self.account_did, history)?;
@@ -1845,6 +1944,7 @@ impl WasmMlsClient {
                 dormant_at: item["dormantAt"].as_str().map(str::to_owned),
                 labyrinth_device_key_hex,
                 is_current_device: is_current,
+                unrecognized: false,
             });
         }
         Ok(out)
@@ -1888,6 +1988,22 @@ impl WasmMlsClient {
         )
         .ok();
         let already_revoked = target_entry["status"].as_str() == Some("revoked");
+        let raw = self
+            .require_db_mls()?
+            .backend()
+            .get_labyrinth_state("status_json")?
+            .ok_or_else(|| MLSError::InvalidState("Labyrinth status not initialized".into()))?;
+        let prior_needs_attention =
+            serde_json::from_slice::<LabyrinthBackupStatus>(&raw)
+                .map_err(|e| MLSError::Internal(e.to_string()))?
+                .recovery_needs_attention;
+        if target_pubkey_opt.is_some() {
+            // No server or live-group mutation may start until v3 removal can reach the
+            // independently proven home service and the replacement-code reminder is durable.
+            self.ensure_recovery_share_home_service_pin().await?;
+            self.set_recovery_needs_attention(true)?;
+        }
+
 
         if !already_revoked {
             let revoke_body = json!({
@@ -1926,36 +2042,42 @@ impl WasmMlsClient {
         let mut collected_exclusions = Vec::new();
 
         if let Some(chat_pubkey) = target_pubkey_opt {
-            if let Ok(deps) = self.wasm_archive_deps() {
-                if let Ok(Some(mut session)) = deps.open().await {
-                    let reports = session
-                        .revoke_chat_device(chat_pubkey)
-                        .await
-                        .map_err(wasm_archive_error)?;
-                    self.save_wasm_archive_status(
-                        &session,
-                        reports.iter().any(|r| r.rekeyed_recovery_code.is_some()),
-                    )?;
-                    for rep in reports {
-                        labyrinth_rotated = true;
-                        new_epoch_seq = Some(rep.new_epoch);
-                        if rep.rekeyed_recovery_code.is_some() {
-                            rekeyed_recovery_code = rep.rekeyed_recovery_code;
-                        }
-                        for pk_id in rep.rekeyed_passkeys {
-                            rekeyed_passkey_ids.push(pk_id.to_vec());
-                        }
-                        for excluded in rep.exclusions {
-                            collected_exclusions.push(LabyrinthRotationExclusion {
-                                device_key_hex: excluded.device_key.map(hex::encode),
-                                reason: excluded.reason,
-                                recovery_method: excluded
-                                    .recovery_method
-                                    .map(|m| m.as_str().to_owned()),
-                            });
-                        }
-                    }
+            let mut session = self
+                .wasm_archive_deps()?
+                .enable()
+                .await
+                .map_err(wasm_archive_error)?;
+            let reports = session
+                .revoke_chat_device(chat_pubkey)
+                .await
+                .map_err(wasm_archive_error)?;
+            if let Err(error) = self.save_wasm_archive_status(
+                &session,
+                reports.iter().any(|report| report.rekeyed_recovery_code.is_some()),
+            ) {
+                tracing::warn!(%error, "chat device revocation committed but archive status refresh failed");
+            }
+            for report in reports {
+                labyrinth_rotated = true;
+                new_epoch_seq = Some(report.new_epoch);
+                if report.rekeyed_recovery_code.is_some() {
+                    rekeyed_recovery_code = report.rekeyed_recovery_code;
                 }
+                rekeyed_passkey_ids.extend(
+                    report
+                        .rekeyed_passkeys
+                        .into_iter()
+                        .map(|credential_id| credential_id.to_vec()),
+                );
+                collected_exclusions.extend(report.exclusions.into_iter().map(|excluded| {
+                    LabyrinthRotationExclusion {
+                        device_key_hex: excluded.device_key.map(hex::encode),
+                        reason: excluded.reason,
+                        recovery_method: excluded
+                            .recovery_method
+                            .map(|method| method.as_str().to_owned()),
+                    }
+                }));
             }
         }
 
@@ -1978,31 +2100,31 @@ impl WasmMlsClient {
         }
 
         let ts = now_ms();
-        self.require_db_mls()?.write_tx(|tx| {
+        let status_update = self.require_db_mls()?.write_tx(|tx| {
             let raw = tx
                 .get_labyrinth_state("status_json")?
                 .ok_or_else(|| MLSError::InvalidState("Labyrinth status not initialized".into()))?;
-            let mut st: LabyrinthBackupStatus =
+            let mut status: LabyrinthBackupStatus =
                 serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
-            st.active_device_ids.retain(|d| d != target_trimmed);
+            status.active_device_ids.retain(|did| did != target_trimmed);
             if let Some(seq) = new_epoch_seq {
-                st.epoch_seq = seq;
-            } else {
-                st.epoch_seq = st.epoch_seq.saturating_add(1);
+                status.epoch_seq = seq;
             }
             if !collected_exclusions.is_empty() {
-                st.rotation_exclusions = collected_exclusions;
+                status.rotation_exclusions = collected_exclusions;
             }
             if !rekeyed_passkey_ids.is_empty() {
-                st.has_passkey_prf = false;
+                status.has_passkey_prf = false;
             }
+            status.recovery_needs_attention =
+                prior_needs_attention || rekeyed_recovery_code.is_some();
             if rekeyed_recovery_code.is_some() {
-                st.has_recovery_code = true;
+                status.has_recovery_code = true;
             }
             tx.upsert_mutation_journal(&MutationJournalRow {
-                journal_id: format!("revoke-{target_trimmed}-{}", st.epoch_seq),
+                journal_id: format!("revoke-{target_trimmed}-{}", status.epoch_seq),
                 op_type: "device_revocation".to_string(),
-                epoch_seq: st.epoch_seq,
+                epoch_seq: status.epoch_seq,
                 state_json: json!({ "revokedDeviceId": target_trimmed }).to_string(),
                 status: "completed".to_string(),
                 created_at_ms: ts,
@@ -2010,11 +2132,13 @@ impl WasmMlsClient {
             })?;
             tx.put_labyrinth_state(
                 "status_json",
-                &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
+                &serde_json::to_vec(&status).map_err(|e| MLSError::Internal(e.to_string()))?,
                 ts,
-            )?;
-            Ok(())
-        })?;
+            )
+        });
+        if let Err(error) = status_update {
+            tracing::warn!(%error, "chat device revocation committed but UI status update failed");
+        }
 
         Ok(DeviceRevocationReport {
             target_device_id: target_trimmed.to_owned(),
@@ -2027,6 +2151,117 @@ impl WasmMlsClient {
             rekeyed_passkey_ids,
         })
     }
+    pub(crate) async fn revoke_labyrinth_device_impl(
+        &self,
+        target_device_id: &str,
+    ) -> Result<LabyrinthRevocationOutcome, MLSError> {
+        let target = hex::decode(target_device_id.trim())
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| {
+                MLSError::invalid_input(
+                    "target_device_id must be a 32-byte Labyrinth device key",
+                )
+            })?;
+        let raw = self
+            .require_db_mls()?
+            .backend()
+            .get_labyrinth_state("status_json")?
+            .ok_or_else(|| MLSError::InvalidState("Labyrinth status not initialized".into()))?;
+        let prior_status: LabyrinthBackupStatus =
+            serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+        self.ensure_recovery_share_home_service_pin().await?;
+        self.set_recovery_needs_attention(true)?;
+
+        let mut session = self
+            .wasm_archive_deps()?
+            .enable()
+            .await
+            .map_err(wasm_archive_error)?;
+        let report = session
+            .revoke_device(target)
+            .await
+            .map_err(wasm_archive_error)?;
+        if let Err(error) =
+            self.save_wasm_archive_status(&session, report.rekeyed_recovery_code.is_some())
+        {
+            tracing::warn!(%error, "archive revocation committed but status refresh failed");
+        }
+
+        let new_epoch = report.new_epoch;
+        let rekeyed_recovery_code = report.rekeyed_recovery_code;
+        let rekeyed_passkey_ids: Vec<Vec<u8>> = report
+            .rekeyed_passkeys
+            .into_iter()
+            .map(|credential_id| credential_id.to_vec())
+            .collect();
+        let exclusions: Vec<LabyrinthRotationExclusion> = report
+            .exclusions
+            .into_iter()
+            .map(|excluded| LabyrinthRotationExclusion {
+                device_key_hex: excluded.device_key.map(hex::encode),
+                reason: excluded.reason,
+                recovery_method: excluded
+                    .recovery_method
+                    .map(|method| method.as_str().to_owned()),
+            })
+            .collect();
+        let prior_needs_attention = prior_status.recovery_needs_attention;
+        let mut fallback_status = prior_status;
+        fallback_status.epoch_seq = new_epoch;
+        fallback_status.rotation_exclusions = exclusions.clone();
+        fallback_status.recovery_needs_attention =
+            prior_needs_attention || rekeyed_recovery_code.is_some();
+        fallback_status.has_recovery_code |= rekeyed_recovery_code.is_some();
+        if !rekeyed_passkey_ids.is_empty() {
+            fallback_status.has_passkey_prf = false;
+        }
+
+        let status = self.require_db_mls()?.write_tx(|tx| {
+            let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                MLSError::InvalidState("Labyrinth status not initialized".into())
+            })?;
+            let mut status: LabyrinthBackupStatus =
+                serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+            status.active_device_ids.retain(|id| id != target_device_id);
+            status.epoch_seq = new_epoch;
+            status.rotation_exclusions = exclusions;
+            status.recovery_needs_attention =
+                prior_needs_attention || rekeyed_recovery_code.is_some();
+            status.has_recovery_code |= rekeyed_recovery_code.is_some();
+            if !rekeyed_passkey_ids.is_empty() {
+                status.has_passkey_prf = false;
+            }
+            tx.upsert_mutation_journal(&MutationJournalRow {
+                journal_id: format!("revoke-{target_device_id}-{new_epoch}"),
+                op_type: "device_revocation".into(),
+                epoch_seq: new_epoch,
+                state_json: json!({ "revokedDeviceId": target_device_id }).to_string(),
+                status: "completed".into(),
+                created_at_ms: now_ms(),
+                updated_at_ms: now_ms(),
+            })?;
+            tx.put_labyrinth_state(
+                "status_json",
+                &serde_json::to_vec(&status).map_err(|e| MLSError::Internal(e.to_string()))?,
+                now_ms(),
+            )?;
+            Ok(status)
+        });
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(%error, "archive revocation committed but UI status update failed");
+                fallback_status
+            }
+        };
+        Ok(LabyrinthRevocationOutcome {
+            status,
+            rekeyed_recovery_code,
+            rekeyed_passkey_ids,
+        })
+    }
+
 
     pub(crate) async fn retire_current_device_pre_wipe(&self) -> Result<(), MLSError> {
         let _ = self.require_db_mls()?;
@@ -2565,7 +2800,7 @@ impl WasmMlsClient {
         Ok(flushed)
     }
 
-    /// This client's account, endpoints and HTTP client without its database.
+    /// This client's account, endpoints, HTTP client, and shared protected database.
     fn http_view(&self) -> WasmMlsClient {
         WasmMlsClient {
             account_did: self.account_did.clone(),
@@ -2576,7 +2811,10 @@ impl WasmMlsClient {
             pds_endpoint: self.pds_endpoint.clone(),
             auth_token: self.auth_token.clone(),
             http: self.http.clone(),
-            db: None,
+            db: self
+                .db
+                .as_ref()
+                .map(|db| WasmAccountDb::new(db.backend().clone())),
             pending_otc_initiator: RefCell::new(None),
             pending_otc_offer_digits: RefCell::new(None),
         }

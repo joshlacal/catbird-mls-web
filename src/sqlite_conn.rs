@@ -1456,15 +1456,37 @@ impl SqliteConn {
         Ok(rows.first().map(|row| message_row(row)))
     }
 
-    /// Drops every queued archive item `sender_did` sent (a verified account deletion).
+    /// Drops queued archive items by `sender_did` only in `conversation_id` and before the
+    /// verified deletion sequence. Other conversations and post-deletion sends are untouched.
     pub fn purge_labyrinth_queue_from_sender(
         &self,
+        conversation_id: &str,
         sender_did: &str,
+        before_seq: i64,
     ) -> Result<(), catbird_mls::MLSError> {
-        self.exec_with_text_params(
+        self.exec_with_mixed_params(
             "DELETE FROM labyrinth_queue \
-             WHERE json_extract(CAST(payload_bytes AS TEXT), '$.sender_did') = ?1",
-            &[(1, sender_did)],
+             WHERE conversation_id = ?1 \
+               AND json_extract(CAST(payload_bytes AS TEXT), '$.sender_did') = ?2 \
+               AND seq < ?3",
+            &[(1, conversation_id), (2, sender_did)],
+            &[(3, before_seq)],
+        )
+        .map_err(map_wasm_mls_err)
+    }
+
+    /// Drops display rows covered by one conversation-scoped deletion sequence.
+    pub fn purge_messages_from_sender_before_seq(
+        &self,
+        conversation_id: &str,
+        sender_did: &str,
+        before_seq: i64,
+    ) -> Result<(), catbird_mls::MLSError> {
+        self.exec_with_mixed_params(
+            "DELETE FROM messages \
+             WHERE conversation_id = ?1 AND sender_did = ?2 AND seq < ?3",
+            &[(1, conversation_id), (2, sender_did)],
+            &[(3, before_seq)],
         )
         .map_err(map_wasm_mls_err)
     }

@@ -647,20 +647,12 @@ impl WebArchiveGateway {
     }
 
     pub(crate) async fn space_document(&self, did: &str) -> Result<DidDocument, String> {
-        let path = format!("/xrpc/com.atproto.identity.resolveDid?did={}", encode(did));
-        let response = match self.pds_space_http("GET", &path, vec![], None).await {
-            Ok(resp) if (200..300).contains(&resp.status) => bounded(resp)?,
-            _ if did.starts_with("did:plc:") => {
-                let url = catbird_mls::labyrinth::transport::did_document_url(did)?;
-                let resp = Self::send_space(self.client.http.get(url)).await?;
-                bounded(resp)?
-            }
-            Ok(resp) => bounded(resp)?,
-            Err(err) => return Err(err),
-        };
-        require_success(&response, "resolveDid")?;
-        let bytes = chat_wire::extract_did_doc_from_resolve_response(&response.body)
-            .map_err(|e| format!("wasm_space_did_document: {e}"))?;
+        let bytes = self
+            .client
+            .resolve_did_document(&self.session_token, did)
+            .await
+            .map_err(|error| format!("wasm_space_did_document: {error}"))?
+            .ok_or_else(|| "wasm_space_did_document: missing document".to_owned())?;
         DidDocument::parse_json(did, &bytes).map_err(|e| format!("wasm_space_did_document: {e}"))
     }
 

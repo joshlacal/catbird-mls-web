@@ -280,7 +280,7 @@ impl WasmMlsClient {
         // both homes; the peer's comes from its public declaration (no bearer to its PDS).
         let peer_ds = self
             .resolve_peer_home_ds_did(session_token, peer_did)
-            .await
+            .await?
             .ok_or_else(|| {
                 MLSError::Cryptography("C33 peer home DS authority unavailable".into())
             })?;

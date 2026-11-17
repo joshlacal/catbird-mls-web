@@ -796,6 +796,14 @@ impl WasmMlsClient {
             .await
             .map_err(mls_to_js_err)
     }
+    #[wasm_bindgen(js_name = acknowledgeRecoveryAttention)]
+    pub fn acknowledge_recovery_attention(&self) -> Result<JsValue, JsValue> {
+        let status = self
+            .acknowledge_recovery_attention_impl()
+            .map_err(mls_to_js_err)?;
+        to_js_val(&status)
+    }
+
 
     #[wasm_bindgen(js_name = restoreWithRecoveryCodeLive)]
     pub async fn restore_with_recovery_code_live(&self, code: String) -> Result<JsValue, JsValue> {
@@ -1154,40 +1162,15 @@ impl WasmMlsClient {
     }
 
     #[wasm_bindgen(js_name = revokeLabyrinthDevice)]
-    pub fn revoke_labyrinth_device(&self, target_device_id: String) -> Result<JsValue, JsValue> {
-        if target_device_id.trim().is_empty() {
-            return Err(JsValue::from_str("target_device_id must not be empty"));
-        }
-        let ts = now_ms();
-        let status = self
-            .require_db()?
-            .write_tx(|tx| {
-                let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
-                    MLSError::InvalidState("Labyrinth status not initialized".to_string())
-                })?;
-                let mut st: LabyrinthBackupStatus =
-                    serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
-                st.active_device_ids.retain(|d| d != &target_device_id);
-                st.epoch_seq = st.epoch_seq.saturating_add(1);
-                tx.upsert_mutation_journal(&MutationJournalRow {
-                    journal_id: format!("revoke-{target_device_id}-{}", st.epoch_seq),
-                    op_type: "device_revocation".to_string(),
-                    epoch_seq: st.epoch_seq,
-                    state_json: serde_json::json!({ "revokedDeviceId": target_device_id })
-                        .to_string(),
-                    status: "done".to_string(),
-                    created_at_ms: ts,
-                    updated_at_ms: ts,
-                })?;
-                tx.put_labyrinth_state(
-                    "status_json",
-                    &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
-                    ts,
-                )?;
-                Ok(st)
-            })
+    pub async fn revoke_labyrinth_device(
+        &self,
+        target_device_id: String,
+    ) -> Result<JsValue, JsValue> {
+        let outcome = self
+            .revoke_labyrinth_device_impl(&target_device_id)
+            .await
             .map_err(mls_to_js_err)?;
-        to_js_val(&status)
+        to_js_val(&outcome)
     }
 
     #[wasm_bindgen]

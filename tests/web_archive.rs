@@ -7,11 +7,17 @@
 //! original sender attestation, stored as `finish_application_send` stores it.
 #![cfg(target_arch = "wasm32")]
 use std::rc::Rc;
+use atproto_spaces::{
+    kem::{encode_p256_did_key, P256SecretKey},
+    lthash::compute_dagcbor_cid,
+    tokens::SpaceSigningKey,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_mls::client::{
     chat_wire, QueuedLabyrinthArchivePayload, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
+use catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1;
 use catbird_mls::messaging::receive::{
     OriginalSenderArchiveAttestationEnvelope, PrivateMessageAadEnvelope,
 };
@@ -36,28 +42,43 @@ let originalFetch;
 let fx;
 export function installArchiveFixture() {
   originalFetch = globalThis.fetch;
-  fx = {records: {}, ownPds: {}, relay: {}, heads: {}, writes: []};
+  fx = {records: {}, cids: {}, docs: {}, proofs: {}, ownPds: {}, relay: {}, heads: {}, writes: [], calls: {}};
   globalThis.fetch = async (request) => {
     const reply = (body, status = 200) => {
       const r = new Response(JSON.stringify(body), {status, headers: {'content-type': 'application/json'}});
       Object.defineProperty(r, 'url', {value: request.url});
       return r;
     };
+    const replyBytes = (base64, status = 200) => {
+      const raw = atob(base64);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      const r = new Response(bytes, {status, headers: {'content-type': 'application/vnd.ipld.car'}});
+      Object.defineProperty(r, 'url', {value: request.url});
+      return r;
+    };
     const url = new URL(request.url);
+    if (url.hostname === 'plc.directory') {
+      const did = decodeURIComponent(url.pathname.slice(1));
+      return did in fx.docs ? reply(fx.docs[did]) : reply({error: 'NotFound'}, 404);
+    }
+    if (url.pathname === '/.well-known/did.json') {
+      const did = `did:web:${url.hostname}`;
+      return did in fx.docs ? reply(fx.docs[did]) : reply({error: 'NotFound'}, 404);
+    }
     const q = (name) => url.searchParams.get(name);
     const nsid = url.pathname.replace('/xrpc/', '');
+    fx.calls[nsid] = (fx.calls[nsid] || 0) + 1;
     const text = request.method === 'POST' ? await request.clone().text() : '';
     const b = text ? JSON.parse(text).signedRequest?.body : undefined;
     const auth = request.headers.get('authorization');
     const denied = () => reply({error: 'AuthRequired', message: nsid}, 401);
-    // The session bearer belongs to the account's own PDS; `mls-ds` reads take a service-auth
-    // token plus a device-signed Labyrinth read claim.
     const ownPds = auth === 'Bearer session';
     const ds = auth === 'Bearer service-auth' && request.headers.has('catbird-labyrinth-read');
     const mailboxKeys = (store, did, rkey) => {
-      const value = rkey === 'self' ? store[did] : undefined;
-      return value
-        ? reply({uri: `at://${did}/blue.catbird.labyrinth.mailboxKeys/self`, cid: 'bafymailboxkeys', value})
+      const stored = rkey === 'self' ? store[did] : undefined;
+      return stored
+        ? reply({uri: `at://${did}/blue.catbird.labyrinth.mailboxKeys/self`, cid: stored.cid, value: stored.value})
         : reply({error: 'RecordNotFound', message: `${did} ${rkey}`}, 400);
     };
     switch (nsid) {
@@ -65,13 +86,18 @@ export function installArchiveFixture() {
       case 'com.atproto.repo.createRecord':
       case 'com.atproto.repo.putRecord': {
         const r = JSON.parse(text);
-        fx.records[`at://${r.repo}/${r.collection}/${r.rkey}`] = r.record;
-        return reply({uri: 'at://fixture', cid: 'bafyfixture'});
+        const uri = `at://${r.repo}/${r.collection}/${r.rkey}`;
+        fx.records[uri] = r.record;
+        return reply({uri, cid: fx.cids[uri] || 'bafyfixture'});
       }
       case 'com.atproto.repo.listRecords': {
         const prefix = `at://${q('repo')}/${q('collection')}/`;
         return reply({records: Object.entries(fx.records).filter(([uri]) => uri.startsWith(prefix))
-          .map(([uri, value]) => ({uri, cid: 'bafyfixture', value}))});
+          .map(([uri, value]) => ({uri, cid: fx.cids[uri] || 'bafyfixture', value}))});
+      }
+      case 'com.atproto.sync.getRecord': {
+        const uri = `at://${q('did')}/${q('collection')}/${q('rkey')}`;
+        return uri in fx.proofs ? replyBytes(fx.proofs[uri]) : reply({error: 'RecordNotFound'}, 404);
       }
       case 'blue.catbird.chat.enrollDevice':
         return reply({device: {deviceId: b.deviceId, keyId: b.keyId, signaturePublicKey: b.signaturePublicKey,
@@ -99,18 +125,34 @@ export function installArchiveFixture() {
     }
   };
 }
-export function publishMailboxKeys(did, record, ownPds) {
-  (ownPds ? fx.ownPds : fx.relay)[did] = JSON.parse(record);
+export function publishDidDoc(did, doc) { fx.docs[did] = JSON.parse(doc); }
+export function faultDidDoc(did, fault) {
+  const doc = fx.docs[did];
+  if (fault === 'malformed') doc.id = `${did}-wrong`;
+  if (fault === 'missing_atproto') {
+    doc.verificationMethod = doc.verificationMethod.filter((method) => !method.id.endsWith('#atproto'));
+  }
+}
+export function publishRepoProof(uri, cid, proof) { fx.cids[uri] = cid; fx.proofs[uri] = proof; }
+export function recordJson(uri) { return JSON.stringify(fx.records[uri]); }
+export function publishMailboxKeys(did, record, cid, ownPds) {
+  (ownPds ? fx.ownPds : fx.relay)[did] = {value: JSON.parse(record), cid};
 }
 export function publishEpochHead(did, epoch) { fx.heads[did] = JSON.parse(epoch); }
 export function spaceWrites() { return JSON.stringify(fx.writes); }
+export function callCount(nsid) { return fx.calls[nsid] || 0; }
 export function restoreFetch() { globalThis.fetch = originalFetch; }
 "#)]
 extern "C" {
     fn installArchiveFixture();
-    fn publishMailboxKeys(did: &str, record: &str, own_pds: bool);
+    fn publishDidDoc(did: &str, doc: &str);
+    fn faultDidDoc(did: &str, fault: &str);
+    fn publishRepoProof(uri: &str, cid: &str, proof: &str);
+    fn recordJson(uri: &str) -> String;
+    fn publishMailboxKeys(did: &str, record: &str, cid: &str, own_pds: bool);
     fn publishEpochHead(did: &str, epoch: &str);
     fn spaceWrites() -> String;
+    fn callCount(nsid: &str) -> u32;
     fn restoreFetch();
 }
 struct RestoreFetch;
@@ -128,6 +170,83 @@ const TEXT: &str = r#"{"text":"archived from the web"}"#;
 fn did(name: &str) -> String {
     format!("did:plc:{name:a<24}")
 }
+fn p256_key(did: &str, purpose: &[u8]) -> P256SecretKey {
+    for attempt in 0u32..128 {
+        let mut hash = Sha256::new();
+        hash.update(b"catbird-web-archive-fixture\0");
+        hash.update(purpose);
+        hash.update(did.as_bytes());
+        hash.update(attempt.to_be_bytes());
+        if let Ok(secret) = P256SecretKey::from_slice(&hash.finalize()) {
+            return secret;
+        }
+    }
+    panic!("fixture P-256 key derivation exhausted");
+}
+
+fn publish_did_document(did: &str) {
+    let sign_multibase = encode_p256_did_key(&p256_key(did, b"sign").public_key());
+    let kem_multibase = encode_p256_did_key(&p256_key(did, b"kem").public_key());
+    let mut methods = vec![
+        json!({
+            "id": format!("{did}#atproto"),
+            "controller": did,
+            "type": "Multikey",
+            "publicKeyMultibase": sign_multibase.strip_prefix("did:key:").unwrap(),
+        }),
+        json!({
+            "id": format!("{did}#atproto_kem"),
+            "controller": did,
+            "type": "Multikey",
+            "publicKeyMultibase": kem_multibase.strip_prefix("did:key:").unwrap(),
+        }),
+    ];
+    if did == SEQUENCER {
+        let receipt =
+            encode_p256_did_key(&P256SecretKey::from_slice(&[19; 32]).unwrap().public_key());
+        methods.push(json!({
+            "id": format!("{did}#mls-receipt-1"),
+            "controller": did,
+            "type": "Multikey",
+            "publicKeyMultibase": receipt.strip_prefix("did:key:").unwrap(),
+        }));
+    }
+    let service_endpoint = if did == SEQUENCER {
+        "https://ds.catbird.test"
+    } else {
+        "https://pds.catbird.test"
+    };
+    let doc = json!({
+        "id": did,
+        "verificationMethod": methods,
+        "service": [{
+            "id": format!("{did}#atproto_pds"),
+            "type": "AtprotoPersonalDataServer",
+            "serviceEndpoint": service_endpoint,
+        }],
+    });
+    publishDidDoc(did, &serde_json::to_string(&doc).unwrap());
+}
+
+fn publish_record_proof(did: &str, collection: &str, rkey: &str, value: &Value) -> String {
+    let typed: catbird_atproto::types::value::Data =
+        serde_json::from_value(value.clone()).unwrap();
+    let dagcbor = serde_ipld_dagcbor::to_vec(&typed).unwrap();
+    let cid = compute_dagcbor_cid(&dagcbor).to_string();
+    let signing_key =
+        SpaceSigningKey::from_p256_secret(&p256_key(did, b"sign"), "#atproto");
+    let (_, car) = build_repo_proof_car_v1(
+        did,
+        "3lb2zzzzzzzzz",
+        &[(format!("{collection}/{rkey}"), dagcbor)],
+        &signing_key,
+    )
+    .unwrap();
+    let uri = format!("at://{did}/{collection}/{rkey}");
+    publishRepoProof(&uri, &cid, &STANDARD.encode(car));
+    cid
+}
+
 
 fn install() -> RestoreFetch {
     installArchiveFixture();
@@ -161,10 +280,20 @@ fn account_db(did: &str) -> WasmAccountDb<Rc<SqliteConn>> {
 /// Enroll both chat devices (their PDS device records land in the fixture) and return their
 /// MLS signing keys.
 async fn enroll(alice: &str, bob: &str) -> (SignatureKeyPair, SignatureKeyPair) {
+    publish_did_document(SEQUENCER);
     for (did, device_id) in [(alice, ALICE_DEVICE), (bob, BOB_DEVICE)] {
+        publish_did_document(did);
         let client = open(did, device_id).await;
         let scopes = serde_wasm_bindgen::to_value(&REQUIRED_LABYRINTH_OAUTH_SCOPES).unwrap();
         client.enroll_device(true, scopes).await.unwrap();
+        for (collection, rkey) in [
+            ("blue.catbird.chat.device", device_id),
+            ("blue.catbird.chat.declaration", "self"),
+        ] {
+            let uri = format!("at://{did}/{collection}/{rkey}");
+            let value: Value = serde_json::from_str(&recordJson(&uri)).unwrap();
+            publish_record_proof(did, collection, rkey, &value);
+        }
     }
     let signer = |did: &str| {
         let raw = account_db(did)
@@ -199,7 +328,19 @@ fn publish_epoch(
     let keys = MailboxKeys::derive(&[seed; 32], 0);
     let epoch = EpochPublic::sign(did, 0, &keys, [seed; 32], None, None, &Device(device)).unwrap();
     let record = MailboxKeysRecord::from_public(&epoch, None, "2026-11-07T00:00:00.000Z".into());
-    publishMailboxKeys(did, &serde_json::to_string(&record).unwrap(), own_pds);
+    let value = serde_json::to_value(&record).unwrap();
+    let cid = publish_record_proof(
+        did,
+        labyrinth::records::nsid::MAILBOX_KEYS,
+        "self",
+        &value,
+    );
+    publishMailboxKeys(
+        did,
+        &serde_json::to_string(&record).unwrap(),
+        &cid,
+        own_pds,
+    );
     if ds_head {
         let head = EpochPublicDef::from_public(&epoch);
         publishEpochHead(did, &serde_json::to_string(&head).unwrap());
@@ -369,6 +510,7 @@ async fn flush_drops_sender_veto_before_archive_write() {
 
     let client = open(&alice, ALICE_DEVICE).await;
     assert_eq!(client.flush_labyrinth_queue().await.unwrap(), 0);
+    drop(client);
     assert_eq!(queued_rows(&alice), 0);
     assert!(space_writes().is_empty());
 }
@@ -394,6 +536,7 @@ async fn flush_drops_queue_row_after_sequenced_policy_off() {
 
     let client = open(&alice, ALICE_DEVICE).await;
     assert_eq!(client.flush_labyrinth_queue().await.unwrap(), 0);
+    drop(client);
     assert_eq!(queued_rows(&alice), 0);
     assert!(space_writes().is_empty());
 }
@@ -439,6 +582,7 @@ async fn flush_observes_all_queued_opt_outs_before_selecting_rows() {
 
     let client = open(&alice, ALICE_DEVICE).await;
     assert_eq!(client.flush_labyrinth_queue().await.unwrap(), 0);
+    drop(client);
     assert_eq!(queued_rows(&alice), 0);
     assert!(space_writes().is_empty());
 }
@@ -466,6 +610,7 @@ async fn flush_stops_before_writing_when_policy_queue_row_is_malformed() {
 
     let client = open(&alice, ALICE_DEVICE).await;
     assert!(client.flush_labyrinth_queue().await.is_err());
+    drop(client);
     assert_eq!(queued_rows(&alice), 2);
     assert!(space_writes().is_empty());
 }
@@ -482,9 +627,31 @@ async fn flush_distributes_a_transport_mek_every_member_epoch_opens() {
     let (alice_epoch, _) = publish_epoch(&alice, &alice_signer, 1, true, true);
     let (bob_epoch, bob_keys) = publish_epoch(&bob, &bob_signer, 2, false, true);
     let queued = queue_own_send(&alice, &bob, &alice_signer, cid, mid);
+    let resolve_calls_before = callCount("com.atproto.identity.resolveDid");
 
-    let client = open(&alice, ALICE_DEVICE).await;
+    let mut client = open(&alice, ALICE_DEVICE).await;
+    for (fault_did, fault) in [
+        (&bob, "malformed"),
+        (&alice, "missing_atproto"),
+    ] {
+        publish_did_document(fault_did);
+        faultDidDoc(fault_did, fault);
+        assert!(
+            client.flush_labyrinth_queue().await.is_err(),
+            "a {fault} DID document must fail closed"
+        );
+        drop(client);
+        assert_eq!(queued_rows(&alice), 1);
+        assert!(space_writes().is_empty());
+        client = open(&alice, ALICE_DEVICE).await;
+    }
+    publish_did_document(&alice);
+    publish_did_document(&bob);
     assert_eq!(client.flush_labyrinth_queue().await.unwrap(), 1);
+    assert_eq!(
+        callCount("com.atproto.identity.resolveDid"),
+        resolve_calls_before
+    );
     drop(client);
 
     let writes = space_writes();

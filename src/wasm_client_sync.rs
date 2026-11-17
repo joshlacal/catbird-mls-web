@@ -181,7 +181,7 @@ fn state_view_sequencer_did(state: &Value) -> Option<&str> {
 }
 
 /// Stage the MLS Welcome message `welcome` against `provider`, with the bytes of its GroupInfo's
-/// roster attestation ([`chat_wire::ROSTER_ATTESTATION_EXTENSION_TYPE`]) if it carries one.
+/// recovery state attestation ([`chat_wire::ROSTER_ATTESTATION_EXTENSION_TYPE`]) if present.
 /// Staging verifies the GroupInfo signature over them under the Welcome sender's leaf
 /// (`StagedWelcome::welcome_sender`).
 fn stage_welcome<P: OpenMlsProvider>(
@@ -3344,11 +3344,11 @@ impl WasmMlsClient {
     /// `next` must name the group: it becomes the conversation's coordinates, with the cursor at
     /// `transition_seq`, and the fulfillment answered this device's own request.
     ///
-    /// The roster attestation in the Welcome's GroupInfo, whose signature staging verifies under
-    /// the Welcome sender's leaf, becomes this device's verified roster only when that sender is
-    /// exactly the fulfiller's leaf ([`chat_wire::attested_roster`]). Without a valid one this
-    /// device joins with no roster; a retired row drops the one it held, as it read none of the
-    /// transitions since. Returns `next`, for the acknowledgement.
+    /// The recovery attestation in the Welcome's GroupInfo, whose signature staging verifies
+    /// under the Welcome sender's leaf, grants this device its verified roster only when that
+    /// sender is exactly the fulfiller's leaf ([`chat_wire::attested_roster`]). Its history policy
+    /// is accepted only after the signed fulfillment, next coordinate and sequencer receipt
+    /// verify; an absent or malformed policy fails closed OFF. Returns `next`, for acknowledgement.
     #[allow(clippy::too_many_arguments)]
     async fn join_recovery_welcome(
         &self,
@@ -3456,11 +3456,20 @@ impl WasmMlsClient {
         if retired.is_some_and(|row| generation < row.generation) {
             return Err(refused("joins a generation before the retired one"));
         }
+        let history_backup = attestation
+            .as_deref()
+            .and_then(|attestation| {
+                chat_wire::attested_history_backup(attestation, cid, generation)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or(false);
         let roster = attestation
+            .as_deref()
             .ok_or_else(|| refused("no roster attestation from the verified fulfiller"))
             .and_then(|attestation| {
                 chat_wire::attested_roster(
-                    &attestation,
+                    attestation,
                     cid,
                     generation,
                     &self.account_did,
@@ -3510,12 +3519,18 @@ impl WasmMlsClient {
             chat_wire::require_coordinate_names_group(&next, &group, &provider)?;
             let snapshot = &body["metadataSnapshot"];
             let mut title = None;
+            wasm_archive_policy::accept_recovery_attestation(
+                tx,
+                cid,
+                transition_seq,
+                history_backup,
+                ts,
+            )?;
             if let Some((m_epoch, m_ver, meta)) =
                 chat_wire::try_decrypt_group_metadata_snapshot(&mut group, &provider, snapshot)
             {
                 let row = chat_wire::group_metadata_row_from_v1(cid, m_ver, m_epoch, &meta, ts)?;
                 title = row.title.clone();
-                wasm_archive_policy::accept_snapshot(tx, cid, transition_seq, &meta, false, ts)?;
                 tx.upsert_group_metadata(&row)?;
             }
             tx.put_account_meta(
@@ -3569,7 +3584,7 @@ impl WasmMlsClient {
     /// An `add` commits an Add of the KeyPackage; a `replace` removes the requester device's
     /// exact leaf and adds the KeyPackage in one Commit. When this device holds a verified
     /// roster, the Welcome's GroupInfo attests it to the joiner
-    /// ([`chat_wire::roster_attestation_extension`]). The Commit is journaled before HTTP
+    /// ([`chat_wire::recovery_attestation_extension`]). The Commit is journaled before HTTP
     /// ([`Self::submit_own_commit`]).
     ///
     /// Consume-once: a request is bound to exactly the coordinate it was signed (or accepted)
@@ -3751,17 +3766,19 @@ impl WasmMlsClient {
         let prior_gch = chat_wire::json_bytes(&prior_coords["groupContextHash"])?;
         let prior_ctag = chat_wire::json_bytes(&prior_coords["confirmationTag"])?;
         let replace = authorization["recoveryKind"] == "replace";
-        let attestation = roster
-            .as_ref()
-            .map(|roster| chat_wire::roster_attestation_extension(cid, prior_gen, roster))
-            .transpose()?;
+        let history_backup = wasm_archive_policy::current_enabled(db.backend(), cid)?;
+        let attestation = chat_wire::recovery_attestation_extension(
+            cid,
+            prior_gen,
+            roster.as_ref(),
+            history_backup,
+        )?;
         let transition_uuid = uuid::Uuid::new_v4();
         let transition_id = transition_uuid.to_string();
         let welcome_id = uuid::Uuid::new_v4().to_string();
 
         // Staged and merged over `KvWriteOverlay` before HTTP (`I6`), so a refusal or a lost
         // answer never forks the local OpenMLS epoch state.
-        let meta_row = db.backend().get_group_metadata(cid)?;
         let overlay = KvWriteOverlay::new(db.backend());
         let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
         let MlsMessageBodyIn::KeyPackage(kp_in) = MlsMessageIn::tls_deserialize_exact(&kp_bytes)
@@ -3813,6 +3830,13 @@ impl WasmMlsClient {
                 "the requester device already holds a leaf"
             }));
         }
+        let (prior_metadata_snapshot, prior_metadata_plaintext) =
+            wasm_archive_policy::metadata_snapshot_plaintext_for_carry_forward(
+                db.backend(),
+                cid,
+                &mut group,
+                &provider,
+            )?;
         let aad_prior = chat_wire::build_aad_prior_coordinate(
             &convo_uuid,
             &convo.group_id,
@@ -3839,11 +3863,9 @@ impl WasmMlsClient {
             .force_self_update(true)
             .load_psks(provider.storage())
             .map_err(|e| MLSError::Cryptography(format!("recovery commit: {e:?}")))?;
-        if let Some(attestation) = attestation {
-            builder = builder
-                .create_group_info_with_extensions([attestation])
-                .map_err(|e| MLSError::Cryptography(format!("roster attestation: {e:?}")))?;
-        }
+        builder = builder
+            .create_group_info_with_extensions([attestation])
+            .map_err(|e| MLSError::Cryptography(format!("recovery attestation: {e:?}")))?;
         let bundle = builder
             .build(provider.rand(), provider.crypto(), signer, |_| true)
             .map_err(|e| MLSError::Cryptography(format!("recovery commit: {e:?}")))?
@@ -3866,12 +3888,6 @@ impl WasmMlsClient {
         let next_epoch = group.epoch().as_u64();
         let (next_gch, next_ctag) =
             chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-        let meta_ver = meta_row
-            .as_ref()
-            .map(|m| m.metadata_version.max(1) as u64)
-            .unwrap_or(1);
-        let carried_meta =
-            wasm_archive_policy::carried_metadata(db.backend(), cid, meta_row.as_ref())?;
         let meta_key = derive_metadata_key_from_group(
             &mut group,
             provider.crypto(),
@@ -3880,7 +3896,9 @@ impl WasmMlsClient {
             next_epoch,
         )
         .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
-        let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
+        let carried_snap = wasm_archive_policy::reencrypt_metadata_snapshot_for_epoch(
+            prior_metadata_snapshot,
+            &prior_metadata_plaintext,
             &meta_key,
             &convo.group_id,
             &convo_uuid,
@@ -3888,15 +3906,6 @@ impl WasmMlsClient {
             next_epoch,
             &next_gch,
             &next_ctag,
-            &transition_id,
-            meta_ver,
-            1,
-            &self.account_did,
-            canonical_dev_id,
-            auth_gen,
-            signer.public(),
-            &carried_meta,
-            wasm_archive_policy::metadata_nonce()?,
         )?;
         drop(provider);
         let kv_batch = overlay.into_batch();
@@ -5287,6 +5296,16 @@ impl WasmMlsClient {
                     ts,
                 )?;
             } else {
+                // Every Commit snapshot is an epoch carry, never an authored metadata edit.
+                // Decrypt the authenticated prior while its exporter secret is still current;
+                // a non-removed recipient verifies the next snapshot against it after the merge.
+                let prior_metadata =
+                    wasm_archive_policy::metadata_snapshot_plaintext_for_carry_forward(
+                        tx,
+                        cid,
+                        &mut group,
+                        &provider,
+                    );
                 let message = MlsMessageIn::tls_deserialize_exact(&commit)
                     .map_err(|e| refused(&format!("deserialize: {e:?}")))?
                     .try_into_protocol_message()
@@ -5335,18 +5354,40 @@ impl WasmMlsClient {
                     ));
                 }
                 if !kicked {
+                    let (prior_snapshot, prior_plaintext) = prior_metadata?;
                     let snapshot = &body["metadataSnapshot"];
-                    if let Some((m_epoch, m_ver, meta)) =
-                        chat_wire::try_decrypt_group_metadata_snapshot(
-                            &mut group, &provider, snapshot,
-                        )
-                    {
-                        let row =
-                            chat_wire::group_metadata_row_from_v1(cid, m_ver, m_epoch, &meta, ts)?;
-                        c.title = row.title.clone();
-                        wasm_archive_policy::accept_snapshot(tx, cid, entry_seq, &meta, false, ts)?;
-                        tx.upsert_group_metadata(&row)?;
+                    let decrypted =
+                        wasm_archive_policy::decrypt_metadata_snapshot_for_current_group(
+                            cid,
+                            snapshot,
+                            &mut group,
+                            &provider,
+                        )?;
+                    if !wasm_archive_policy::is_exact_metadata_epoch_carry(
+                        &prior_snapshot,
+                        &prior_plaintext,
+                        snapshot,
+                        &decrypted.plaintext,
+                    ) {
+                        return Err(refused(
+                            "metadata snapshot is not an exact carry from the prior epoch",
+                        ));
                     }
+                    let row = chat_wire::group_metadata_row_from_v1(
+                        cid,
+                        decrypted
+                            .metadata_version
+                            .try_into()
+                            .map_err(|_| refused("metadata version overflows local storage"))?,
+                        decrypted
+                            .epoch
+                            .try_into()
+                            .map_err(|_| refused("metadata epoch overflows local storage"))?,
+                        &decrypted.metadata,
+                        ts,
+                    )?;
+                    c.title = row.title.clone();
+                    tx.upsert_group_metadata(&row)?;
                     tx.put_account_meta(
                         &format!("metadata_snapshot_json:{cid}"),
                         &snapshot.to_string(),

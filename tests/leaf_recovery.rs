@@ -23,7 +23,9 @@ use catbird_mls::chat_v2::transcript::{
 };
 use catbird_mls::client::{chat_wire, REQUIRED_LABYRINTH_OAUTH_SCOPES};
 use catbird_mls::messaging::receive::PrivateMessagePlaintextEnvelope;
-use catbird_mls::metadata::derive_metadata_key_from_group;
+use catbird_mls::metadata::{
+    decrypt_metadata_snapshot_plaintext, derive_metadata_key_from_group,
+};
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
 use catbird_mls::storage::{ConversationRow, MessageRow};
 use catbird_mls_web::{SqliteConn, WasmMlsClient};
@@ -638,6 +640,66 @@ fn coordinates(db: &Db, cid: &str) -> Option<Value> {
         .get_account_meta(&format!("conversation_coords:{cid}"))
         .unwrap()
         .map(|raw| canonical(&serde_json::from_str(&raw).unwrap(), cid))
+}
+
+fn metadata_snapshot(db: &Db, cid: &str) -> Value {
+    serde_json::from_str(
+        &db.backend()
+            .get_account_meta(&format!("metadata_snapshot_json:{cid}"))
+            .unwrap()
+            .expect("metadata snapshot"),
+    )
+    .unwrap()
+}
+
+fn current_metadata_plaintext(db: &Db, cid: &str, snapshot: &Value) -> Vec<u8> {
+    let row = db.backend().get_conversation(cid).unwrap().unwrap();
+    let provider = db.openmls_provider().unwrap();
+    let mut group =
+        MlsGroup::load(provider.storage(), &GroupId::from_slice(&row.group_id))
+            .unwrap()
+            .unwrap();
+    let epoch = snapshot["coordinate"]["epoch"].as_u64().unwrap();
+    assert_eq!(group.epoch().as_u64(), epoch);
+    let version = snapshot["metadataVersion"].as_u64().unwrap();
+    let nonce: [u8; 12] = chat_wire::json_bytes(&snapshot["nonce"])
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let ciphertext = chat_wire::json_bytes(&snapshot["ciphertext"]).unwrap();
+    assert_eq!(snapshot["ciphertextSize"].as_u64(), Some(ciphertext.len() as u64));
+    let declared_hash = chat_wire::json_bytes(&snapshot["ciphertextSha256"]).unwrap();
+    let computed_hash = Sha256::digest(&ciphertext);
+    assert_eq!(declared_hash.as_slice(), computed_hash.as_slice());
+    let key = derive_metadata_key_from_group(
+        &mut group,
+        provider.crypto(),
+        provider.storage(),
+        &row.group_id,
+        epoch,
+    )
+    .unwrap();
+    decrypt_metadata_snapshot_plaintext(
+        &key,
+        &row.group_id,
+        epoch,
+        version,
+        &nonce,
+        &ciphertext,
+    )
+    .unwrap()
+}
+
+fn latest_archive_policy(db: &Db, cid: &str) -> Option<bool> {
+    let raw = db
+        .backend()
+        .get_account_meta(&format!("archive.policy.flips:{cid}"))
+        .unwrap()?;
+    serde_json::from_str::<Value>(&raw)
+        .unwrap()
+        .as_array()
+        .and_then(|flips| flips.last())
+        .and_then(|flip| flip["enabled"].as_bool())
 }
 
 /// `(did#device, leaf encryption key)` of every leaf of `cid`'s MLS group in `db`, sorted; none
@@ -1470,12 +1532,12 @@ async fn malicious_ds_signed_recovery_views_never_add_a_device() {
     assert!(identities(&leaves).contains(&alice2.leaf()));
 }
 
-/// An existing member's new device joins from its own signed request, once. Bob, a joined member,
-/// has a second device (outside any client: this browser holds one database per account), which
-/// signs an add request. Alice's sync fulfills it with exactly one Add whose Welcome's GroupInfo,
-/// signed by her leaf, attests her verified roster; the new device joins from it, holding Alice's
-/// leaves, and Bob's client applies the Add. mls-ds then lists the consumed request again, as first
-/// listed and rebound to the current coordinate: Alice adds nothing.
+/// An existing member's new device joins from its own signed request, once. Before the membership
+/// Commit, Alice authors metadata while backup is OFF, then explicitly turns backup ON. Alice's
+/// recovery Commit carries the exact stale-OFF metadata bytes, while its Welcome attests the
+/// current ON policy. Bob applies the Add without allowing that byte-identical carry to override
+/// the later policy control. The new device joins from the Welcome, holding Alice's leaves, and
+/// mls-ds listing the consumed request again remains no work.
 ///
 /// Fail-before (web `7be78145`): setup fails, Bob never joins: `fulfill_leaf_recovery_inbox`
 /// (`wasm_client_sync.rs`) fulfilled only what `getLeafRecoveryInbox` listed (nothing here), never
@@ -1485,7 +1547,64 @@ async fn existing_members_new_device_is_added_from_its_signed_request() {
     let _restore = install_ds();
     let cid = "00000000-0000-4000-8000-00000000f002";
     let (mut alice, mut bob) = group_with(&did("newdevicealice"), &did("newdevicebob"), cid).await;
-    let alice_roster = alice.read(|db| roster(db, cid)).await.unwrap();
+    alice
+        .client
+        .set_history_backup_enabled(cid.into(), false)
+        .await
+        .expect("alice sequences archive opt-out");
+    alice
+        .client
+        .update_group_metadata(cid.into(), "Recovered".into(), String::new())
+        .await
+        .expect("alice authors metadata while archive policy is OFF");
+    bob.sync()
+        .await
+        .expect("bob receives the OFF control and authored metadata");
+    let (alice_roster, prior_snapshot, prior_plaintext) = alice
+        .read(|db| {
+            let snapshot = metadata_snapshot(db, cid);
+            (
+                roster(db, cid).unwrap(),
+                snapshot.clone(),
+                current_metadata_plaintext(db, cid, &snapshot),
+            )
+        })
+        .await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&prior_plaintext).unwrap()["historyBackup"],
+        false,
+        "the carried snapshot records the older OFF policy"
+    );
+    alice
+        .client
+        .set_history_backup_enabled(cid.into(), true)
+        .await
+        .expect("alice explicitly re-enables archive backup");
+    bob.sync().await.expect("bob receives the later ON control");
+    assert_eq!(
+        bob.read(|db| latest_archive_policy(db, cid)).await,
+        Some(true),
+        "the explicit ON control is effective before the membership Commit"
+    );
+    // Existing browsers may have persisted the permissive JSON bytes view before generated wire
+    // projection canonicalized it to a base64 string. It is still the identical author proof.
+    bob.read(|db| {
+        let mut snapshot = metadata_snapshot(db, cid);
+        let public_key = snapshot["authorProof"]["signaturePublicKey"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        snapshot["authorProof"]["signaturePublicKey"] = json!({ "$bytes": public_key });
+        db.write_tx(|tx| {
+            tx.put_account_meta(
+                &format!("metadata_snapshot_json:{cid}"),
+                &snapshot.to_string(),
+                1,
+            )
+        })
+        .unwrap();
+    })
+    .await;
     let bob2 = Device::new(&bob.did, BOB2_DEVICE);
     let request = bob2.request_recovery(cid, "add");
     assert_eq!(request["status"], "open", "{request}");
@@ -1494,7 +1613,7 @@ async fn existing_members_new_device_is_added_from_its_signed_request() {
     alice.sync().await.expect("alice adds bob's new device");
     let added = fulfillments(ALICE_DEVICE);
     assert_eq!(added.len(), earlier + 1, "exactly one fulfillment");
-    let added = added.last().unwrap();
+    let added = added.last().unwrap().clone();
     assert_eq!(added["recoveryRequestId"], request["recoveryRequestId"]);
     assert_eq!(
         added["manifest"]["leafChanges"],
@@ -1505,14 +1624,56 @@ async fn existing_members_new_device_is_added_from_its_signed_request() {
             "keyPackageRef": signed_bytes(&request["reservation"]["keyPackageRef"]),
         }])
     );
-    let alice_leaves = alice.read(|db| leaves(db, cid)).await;
+    let carried_snapshot = added["metadataSnapshot"].clone();
+    let (alice_leaves, carried_plaintext) = alice
+        .read(|db| {
+            (
+                leaves(db, cid),
+                current_metadata_plaintext(db, cid, &carried_snapshot),
+            )
+        })
+        .await;
+    assert_eq!(
+        carried_plaintext, prior_plaintext,
+        "recovery Commit must carry exact metadata plaintext"
+    );
+    let mut preserved_envelope = carried_snapshot.clone();
+    for field in [
+        "nonce",
+        "ciphertext",
+        "ciphertextSha256",
+        "ciphertextSize",
+        "coordinate",
+    ] {
+        preserved_envelope[field] = prior_snapshot[field].clone();
+    }
+    assert_eq!(
+        preserved_envelope, prior_snapshot,
+        "recovery Commit changed metadata origin, author proof or envelope"
+    );
+    assert_ne!(carried_snapshot["nonce"], prior_snapshot["nonce"]);
+    assert_eq!(
+        chat_wire::json_bytes(&carried_snapshot["ciphertext"])
+            .unwrap()
+            .len(),
+        chat_wire::json_bytes(&prior_snapshot["ciphertext"])
+            .unwrap()
+            .len(),
+        "exact plaintext carry must preserve ciphertext length"
+    );
     assert!(identities(&alice_leaves).contains(&bob2.leaf()));
 
     let (group, attestation, sender) = bob2.join(&last_welcome(BOB2_DEVICE));
     assert_eq!(sender, format!("{}#{ALICE_DEVICE}", alice.did).into_bytes());
+    let attestation = attestation.unwrap();
     let leaf_dids = [alice.did.clone(), bob.did.clone()];
     assert_eq!(
-        chat_wire::attested_roster(&attestation.unwrap(), cid, 0, &bob.did, &leaf_dids).unwrap(),
+        chat_wire::attested_history_backup(&attestation, cid, 0).unwrap(),
+        Some(true),
+        "recovery Welcome carries the current ON policy, not stale carried metadata"
+    );
+    assert_eq!(
+        chat_wire::attested_roster(&attestation, cid, 0, &bob.did, &leaf_dids).unwrap(),
         alice_roster,
         "the Welcome attests alice's roster"
     );
@@ -1523,7 +1684,15 @@ async fn existing_members_new_device_is_added_from_its_signed_request() {
     joined.sort();
     assert_eq!(joined, identities(&alice_leaves));
     bob.sync().await.expect("bob applies the add");
-    assert_eq!(bob.read(|db| leaves(db, cid)).await, alice_leaves);
+    let (bob_leaves, bob_policy) = bob
+        .read(|db| (leaves(db, cid), latest_archive_policy(db, cid)))
+        .await;
+    assert_eq!(bob_leaves, alice_leaves);
+    assert_eq!(
+        bob_policy,
+        Some(true),
+        "byte-identical stale-OFF carry must not override the later ON control"
+    );
 
     let epoch = alice.row(cid).unwrap().epoch;
     let mut rebound = request.clone();
@@ -1677,14 +1846,12 @@ async fn signed_replace_readds_the_exact_leaf() {
     );
 }
 
-/// A recovery joiner's verified roster comes only from the roster attestation in its Welcome's
-/// GroupInfo, signed by exactly its verified fulfiller's leaf. Fulfillments of fresh
-/// conversations built outside any client, each a Welcome Bob's client joins: with a valid
-/// attestation by its fulfiller Carol it grants Carol's roster (and the snapshot's title); one
-/// carrying none, one attesting a roster without the fulfiller's leaf, one attesting another
-/// generation, and one whose GroupInfo Eve signed although Carol signed the fulfillment, grant
-/// none, while the join still proceeds. No later sync, whatever participants mls-ds names in their
-/// states, creates one.
+/// A recovery joiner's verified roster and effective history policy come only from the recovery
+/// attestation in its Welcome's GroupInfo, signed by exactly its verified fulfiller's leaf.
+/// Fulfillments of fresh conversations built outside any client each deliver a Welcome Bob joins:
+/// a current attestation grants Carol's roster and policy; a legacy attestation grants its roster
+/// but fails policy closed OFF; no attestation, a wrong generation or another GroupInfo signer
+/// also fail policy closed without changing the existing roster-authentication behavior.
 ///
 /// Fail-before (web `7be78145`): `join_recovery_welcome` (`wasm_client_sync.rs`) joined every
 /// one of them and recorded no roster from any Welcome, so Carol's attestation granted none.
@@ -1693,6 +1860,7 @@ async fn recovery_welcome_attests_the_roster() {
     let _restore = install_ds();
     let (bob, carol, eve) = (did("attestbob"), did("attestcarol"), did("attesteve"));
     let mut bob = Member::enrolled(&bob, BOB_DEVICE).await;
+    bob.client.replenish_key_packages(4).await.unwrap();
     let carol = Device::new(&carol, CAROL_DEVICE);
     let eve = Device::new(&eve, EVE_DEVICE);
     let carols = roster_of(&[
@@ -1745,7 +1913,36 @@ async fn recovery_welcome_attests_the_roster() {
         cid
     };
     let valid = serve(&carol, &|cid| {
-        Some(chat_wire::roster_attestation_extension(cid, 0, &carols).unwrap())
+        Some(
+            chat_wire::recovery_attestation_extension(cid, 0, Some(&carols), true).unwrap(),
+        )
+    });
+    let legacy_no_policy = serve(&carol, &|cid| {
+        Some(Extension::Unknown(
+            chat_wire::ROSTER_ATTESTATION_EXTENSION_TYPE,
+            UnknownExtension(
+                serde_json::to_vec(&json!({
+                    "conversationId": cid,
+                    "generation": 0,
+                    "roster": carols.clone(),
+                }))
+                .unwrap(),
+            ),
+        ))
+    });
+    let malformed_policy = serve(&carol, &|cid| {
+        Some(Extension::Unknown(
+            chat_wire::ROSTER_ATTESTATION_EXTENSION_TYPE,
+            UnknownExtension(
+                serde_json::to_vec(&json!({
+                    "conversationId": cid,
+                    "generation": 0,
+                    "roster": carols.clone(),
+                    "historyBackup": "not-a-bool",
+                }))
+                .unwrap(),
+            ),
+        ))
     });
     let refused = [
         ("no attestation", serve(&carol, &|_| None)),
@@ -1753,38 +1950,91 @@ async fn recovery_welcome_attests_the_roster() {
             "a roster without the fulfiller's leaf",
             serve(&carol, &|cid| {
                 let bobs = roster_of(&[(&bob.did, "member", "active")]);
-                Some(chat_wire::roster_attestation_extension(cid, 0, &bobs).unwrap())
+                Some(
+                    chat_wire::recovery_attestation_extension(cid, 0, Some(&bobs), true).unwrap(),
+                )
             }),
         ),
         (
             "another generation",
             serve(&carol, &|cid| {
-                Some(chat_wire::roster_attestation_extension(cid, 1, &carols).unwrap())
+                Some(
+                    chat_wire::recovery_attestation_extension(cid, 1, Some(&carols), true).unwrap(),
+                )
             }),
         ),
         (
             "a GroupInfo another member signed",
             serve(&eve, &|cid| {
-                Some(chat_wire::roster_attestation_extension(cid, 0, &with_eve).unwrap())
+                Some(
+                    chat_wire::recovery_attestation_extension(
+                        cid,
+                        0,
+                        Some(&with_eve),
+                        true,
+                    )
+                    .unwrap(),
+                )
             }),
         ),
     ];
 
     bob.sync().await.expect("bob joins every verified Welcome");
     let cids: Vec<String> = std::iter::once(valid.clone())
+        .chain(std::iter::once(legacy_no_policy.clone()))
+        .chain(std::iter::once(malformed_policy.clone()))
         .chain(refused.iter().map(|(_, cid)| cid.clone()))
         .collect();
     assert_eq!(bob.row(&valid).unwrap().title.as_deref(), Some("Recovered"));
     for (case, cid) in &refused {
         assert!(bob.row(cid).is_some(), "{case}: the join still proceeds");
     }
-    let expected: Vec<Option<Value>> = std::iter::once(Some(carols.clone()))
-        .chain(refused.iter().map(|_| None))
-        .collect();
+    let expected: Vec<Option<Value>> = [
+        Some(carols.clone()),
+        Some(carols.clone()),
+        Some(carols.clone()),
+    ]
+    .into_iter()
+    .chain(refused.iter().map(|_| None))
+    .collect();
     assert_eq!(
         rosters(&mut bob, &cids).await,
         expected,
-        "only carol's attestation"
+        "only authenticated, well-formed rosters are accepted"
+    );
+    let (policies, legacy_metadata) = bob
+        .read(|db| {
+            (
+                cids.iter()
+                    .map(|cid| latest_archive_policy(db, cid))
+                    .collect::<Vec<_>>(),
+                db.backend()
+                    .get_group_metadata(&legacy_no_policy)
+                    .unwrap()
+                    .unwrap()
+                    .metadata_json,
+            )
+        })
+        .await;
+    assert_eq!(
+        policies,
+        vec![
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(false),
+        ],
+        "missing, malformed or unauthenticated policy fails closed; valid policy is independent of roster"
+    );
+    assert!(
+        serde_json::from_str::<Value>(&legacy_metadata)
+            .unwrap()
+            .get("historyBackup")
+            .is_none(),
+        "legacy carried metadata remains stale/default ON; the attested-policy fallback must win"
     );
 
     bob.sync().await.expect("bob syncs his conversations");
@@ -1996,7 +2246,15 @@ async fn reset_retired_device_requests_and_rejoins_from_its_verified_welcome() {
         generation,
         0,
         vec![validated(reserved, &activator.provider)],
-        Some(chat_wire::roster_attestation_extension(cid, generation, &manifest_roster).unwrap()),
+        Some(
+            chat_wire::recovery_attestation_extension(
+                cid,
+                generation,
+                Some(&manifest_roster),
+                true,
+            )
+            .unwrap(),
+        ),
         view["recoveryRequestId"].as_str().unwrap(),
         (&bob.did, BOB_DEVICE),
         reserved,

@@ -2085,7 +2085,6 @@ impl WasmMlsClient {
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(1)
                     .max(1);
-                let meta_row = backend.get_group_metadata(conversation_id)?;
                 let overlay = KvWriteOverlay::new(backend);
                 let staged_opt = {
                     let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
@@ -2115,6 +2114,13 @@ impl WasmMlsClient {
                                 member_id: target_did.to_string(),
                             });
                         } else {
+                            let (prior_metadata_snapshot, prior_metadata_plaintext) =
+                                wasm_archive_policy::metadata_snapshot_plaintext_for_carry_forward(
+                                    backend,
+                                    conversation_id,
+                                    &mut group,
+                                    &provider,
+                                )?;
                             let aad_prior = chat_wire::build_aad_prior_coordinate(
                                 &convo_uuid,
                                 &convo.group_id,
@@ -2154,15 +2160,6 @@ impl WasmMlsClient {
                             let next_epoch = group.epoch().as_u64();
                             let (next_gch, next_ctag) =
                                 chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                            let meta_ver = meta_row
-                                .as_ref()
-                                .map(|m| m.metadata_version.max(1) as u64)
-                                .unwrap_or(1);
-                            let carried_meta = wasm_archive_policy::carried_metadata(
-                                backend,
-                                conversation_id,
-                                meta_row.as_ref(),
-                            )?;
                             let meta_key = derive_metadata_key_from_group(
                                 &mut group,
                                 provider.crypto(),
@@ -2174,7 +2171,9 @@ impl WasmMlsClient {
                                 MLSError::Cryptography(format!("derive metadata key: {e}"))
                             })?;
                             let carried_snap =
-                                chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
+                                wasm_archive_policy::reencrypt_metadata_snapshot_for_epoch(
+                                    prior_metadata_snapshot,
+                                    &prior_metadata_plaintext,
                                     &meta_key,
                                     &convo.group_id,
                                     &convo_uuid,
@@ -2182,15 +2181,6 @@ impl WasmMlsClient {
                                     next_epoch,
                                     &next_gch,
                                     &next_ctag,
-                                    &transition_id,
-                                    meta_ver,
-                                    1,
-                                    &self.account_did,
-                                    &canonical_dev_id,
-                                    auth_gen,
-                                    signer.public(),
-                                    &carried_meta,
-                                    wasm_archive_policy::metadata_nonce()?,
                                 )?;
                             Some((
                                 commit_aad_val,
@@ -2413,7 +2403,7 @@ impl WasmMlsClient {
                             "originSeq": convo.last_seq.saturating_add(1),
                             "originTransitionId": tid,
                             "roleAtOrigin": "admin",
-                            "signaturePublicKey": { "$bytes": STANDARD.encode(signer.public()) },
+                            "signaturePublicKey": STANDARD.encode(signer.public()),
                         },
                         "ciphertext": { "$bytes": STANDARD.encode(&ct) },
                         "ciphertextSha256": STANDARD.encode(Sha256::digest(&ct)),
@@ -3176,7 +3166,6 @@ impl WasmMlsClient {
 
         let staged = {
             let backend = db.backend();
-            let meta_row = backend.get_group_metadata(&canonical_cid)?;
             let overlay = KvWriteOverlay::new(backend);
             let inner = {
                 let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
@@ -3211,6 +3200,13 @@ impl WasmMlsClient {
                 if target_leaves.is_empty() {
                     return Ok(0);
                 }
+                let (prior_metadata_snapshot, prior_metadata_plaintext) =
+                    wasm_archive_policy::metadata_snapshot_plaintext_for_carry_forward(
+                        backend,
+                        &canonical_cid,
+                        &mut group,
+                        &provider,
+                    )?;
                 let aad_prior = chat_wire::build_aad_prior_coordinate(
                     &convo_uuid,
                     &convo.group_id,
@@ -3243,15 +3239,6 @@ impl WasmMlsClient {
                 let next_epoch = group.epoch().as_u64();
                 let (next_gch, next_ctag) =
                     chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                let meta_ver = meta_row
-                    .as_ref()
-                    .map(|m| m.metadata_version.max(1) as u64)
-                    .unwrap_or(1);
-                let carried_meta = wasm_archive_policy::carried_metadata(
-                    backend,
-                    &canonical_cid,
-                    meta_row.as_ref(),
-                )?;
                 let meta_key = derive_metadata_key_from_group(
                     &mut group,
                     provider.crypto(),
@@ -3260,24 +3247,18 @@ impl WasmMlsClient {
                     next_epoch,
                 )
                 .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
-                let carried_snap = chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
-                    &meta_key,
-                    &convo.group_id,
-                    &convo_uuid,
-                    prior_gen,
-                    next_epoch,
-                    &next_gch,
-                    &next_ctag,
-                    &transition_id,
-                    meta_ver,
-                    1,
-                    &self.account_did,
-                    canonical_dev_id,
-                    auth_gen,
-                    signer.public(),
-                    &carried_meta,
-                    wasm_archive_policy::metadata_nonce()?,
-                )?;
+                let carried_snap =
+                    wasm_archive_policy::reencrypt_metadata_snapshot_for_epoch(
+                        prior_metadata_snapshot,
+                        &prior_metadata_plaintext,
+                        &meta_key,
+                        &convo.group_id,
+                        &convo_uuid,
+                        prior_gen,
+                        next_epoch,
+                        &next_gch,
+                        &next_ctag,
+                    )?;
                 (
                     commit_aad_val,
                     commit_bytes,
@@ -3403,7 +3384,6 @@ impl WasmMlsClient {
             let db = self.require_db_mls()?;
             let staged_opt = {
                 let backend = db.backend();
-                let meta_row = backend.get_group_metadata(cid)?;
                 let overlay = KvWriteOverlay::new(backend);
                 let inner_opt = {
                     let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
@@ -3430,6 +3410,13 @@ impl WasmMlsClient {
                     if target_leaves.is_empty() {
                         None
                     } else {
+                        let (prior_metadata_snapshot, prior_metadata_plaintext) =
+                            wasm_archive_policy::metadata_snapshot_plaintext_for_carry_forward(
+                                backend,
+                                cid,
+                                &mut group,
+                                &provider,
+                            )?;
                         let aad_prior = chat_wire::build_aad_prior_coordinate(
                             &convo_uuid,
                             &convo.group_id,
@@ -3464,12 +3451,6 @@ impl WasmMlsClient {
                         let next_epoch = group.epoch().as_u64();
                         let (next_gch, next_ctag) =
                             chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                        let meta_ver = meta_row
-                            .as_ref()
-                            .map(|m| m.metadata_version.max(1) as u64)
-                            .unwrap_or(1);
-                        let carried_meta =
-                            wasm_archive_policy::carried_metadata(backend, cid, meta_row.as_ref())?;
                         let meta_key = derive_metadata_key_from_group(
                             &mut group,
                             provider.crypto(),
@@ -3479,7 +3460,9 @@ impl WasmMlsClient {
                         )
                         .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
                         let carried_snap =
-                            chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
+                            wasm_archive_policy::reencrypt_metadata_snapshot_for_epoch(
+                                prior_metadata_snapshot,
+                                &prior_metadata_plaintext,
                                 &meta_key,
                                 &convo.group_id,
                                 &convo_uuid,
@@ -3487,15 +3470,6 @@ impl WasmMlsClient {
                                 next_epoch,
                                 &next_gch,
                                 &next_ctag,
-                                &transition_id,
-                                meta_ver,
-                                1,
-                                &self.account_did,
-                                &canonical_dev_id,
-                                auth_gen,
-                                signer.public(),
-                                &carried_meta,
-                                wasm_archive_policy::metadata_nonce()?,
                             )?;
                         Some((
                             commit_aad_val,

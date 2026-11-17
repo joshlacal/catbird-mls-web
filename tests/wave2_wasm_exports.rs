@@ -34,6 +34,10 @@ use catbird_mls::client::{
     MailboxReadStateRecord, OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer,
     RegisteredDeviceInfo, UploadedConversationAttachment, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
+use catbird_mls::metadata::{
+    decrypt_metadata_snapshot_plaintext, derive_metadata_key_from_group,
+    encrypt_metadata_snapshot_plaintext_with_nonce,
+};
 use catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
 use catbird_mls::storage::MessageRow;
@@ -2895,6 +2899,12 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
     //        pending leave request from Bob, and verify Alice fulfills it via `#leaveCommitFulfillmentBody`!
     drop(alice_client);
     add_bob_leaf_to_local_group(&alice, alice_dev, &bob, bob_dev, cid);
+    let (prior_leave_snapshot, prior_leave_plaintext) = {
+        let db = WasmAccountDb::new(Rc::new(
+            SqliteConn::open(&db_path_for(&alice, alice_dev), &"ab".repeat(32)).unwrap(),
+        ));
+        stored_metadata_snapshot_and_plaintext(&db, cid)
+    };
     let synced_coords = {
         let db = WasmAccountDb::new(Rc::new(
             SqliteConn::open(&db_path_for(&alice, alice_dev), &"ab".repeat(32)).unwrap(),
@@ -2931,6 +2941,46 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
     });
     let fulfilled = alice_client.fulfill_pending_group_leaves().await.unwrap();
     assert_eq!(fulfilled, 1);
+    alice_client.close();
+    let (carried_leave_snapshot, carried_leave_plaintext) = {
+        let db = WasmAccountDb::new(Rc::new(
+            SqliteConn::open(&db_path_for(&alice, alice_dev), &"ab".repeat(32)).unwrap(),
+        ));
+        stored_metadata_snapshot_and_plaintext(&db, cid)
+    };
+    assert_eq!(
+        carried_leave_plaintext, prior_leave_plaintext,
+        "leave Commit must carry exact metadata plaintext"
+    );
+    let mut preserved_envelope = carried_leave_snapshot.clone();
+    for field in [
+        "nonce",
+        "ciphertext",
+        "ciphertextSha256",
+        "ciphertextSize",
+        "coordinate",
+    ] {
+        preserved_envelope[field] = prior_leave_snapshot[field].clone();
+    }
+    assert_eq!(
+        preserved_envelope, prior_leave_snapshot,
+        "leave Commit changed metadata origin, author proof or envelope"
+    );
+    assert_ne!(
+        carried_leave_snapshot["nonce"],
+        prior_leave_snapshot["nonce"]
+    );
+    assert_eq!(
+        chat_wire::json_bytes(&carried_leave_snapshot["ciphertext"])
+            .unwrap()
+            .len(),
+        chat_wire::json_bytes(&prior_leave_snapshot["ciphertext"])
+            .unwrap()
+            .len(),
+        "exact plaintext carry must preserve ciphertext length"
+    );
+    alice_client = open_client(&alice, alice_dev).await;
+
 
     // 5. `D-3` fail-closed `deleteAccountData`:
     //    Inject remote 500 error -> `deleteAccountData` MUST return `Err` AND preserve local OPFS!
@@ -2976,6 +3026,51 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
     let _ = SqliteConn::delete_opfs_database(&db_path_for(&bob, bob_dev));
 }
 
+fn stored_metadata_snapshot_and_plaintext(
+    db: &WasmAccountDb<Rc<SqliteConn>>,
+    cid: &str,
+) -> (Value, Vec<u8>) {
+    let snapshot: Value = serde_json::from_str(
+        &db.backend()
+            .get_account_meta(&format!("metadata_snapshot_json:{cid}"))
+            .unwrap()
+            .expect("metadata snapshot"),
+    )
+    .unwrap();
+    let convo = db.backend().get_conversation(cid).unwrap().unwrap();
+    let provider = db.openmls_provider().unwrap();
+    let mut group =
+        MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+            .unwrap()
+            .unwrap();
+    let epoch = snapshot["coordinate"]["epoch"].as_u64().unwrap();
+    assert_eq!(group.epoch().as_u64(), epoch);
+    let version = snapshot["metadataVersion"].as_u64().unwrap();
+    let nonce: [u8; 12] = chat_wire::json_bytes(&snapshot["nonce"])
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let ciphertext = chat_wire::json_bytes(&snapshot["ciphertext"]).unwrap();
+    let key = derive_metadata_key_from_group(
+        &mut group,
+        provider.crypto(),
+        provider.storage(),
+        &convo.group_id,
+        epoch,
+    )
+    .unwrap();
+    let plaintext = decrypt_metadata_snapshot_plaintext(
+        &key,
+        &convo.group_id,
+        epoch,
+        version,
+        &nonce,
+        &ciphertext,
+    )
+    .unwrap();
+    (snapshot, plaintext)
+}
+
 fn add_bob_leaf_to_local_group(alice: &str, alice_dev: &str, bob: &str, bob_dev: &str, cid: &str) {
     let bob_signer: SignatureKeyPair = {
         let bob_db = WasmAccountDb::new(Rc::new(
@@ -2991,6 +3086,7 @@ fn add_bob_leaf_to_local_group(alice: &str, alice_dev: &str, bob: &str, bob_dev:
     let db = WasmAccountDb::new(Rc::new(
         SqliteConn::open(&db_path_for(alice, alice_dev), &"ab".repeat(32)).unwrap(),
     ));
+    let (prior_snapshot, prior_plaintext) = stored_metadata_snapshot_and_plaintext(&db, cid);
     db.write_tx(|tx| {
         let signer_raw = tx.get_labyrinth_state("device_signer_json")?.unwrap();
         let alice_signer: SignatureKeyPair = serde_json::from_slice(&signer_raw).unwrap();
@@ -3034,6 +3130,59 @@ fn add_bob_leaf_to_local_group(alice: &str, alice_dev: &str, bob: &str, bob_dev:
 
         let next_epoch = group.epoch().as_u64();
         let (gch, ctag) = chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+        let metadata_version = prior_snapshot["metadataVersion"].as_u64().unwrap();
+        let metadata_key = derive_metadata_key_from_group(
+            &mut group,
+            provider.crypto(),
+            provider.storage(),
+            &convo.group_id,
+            next_epoch,
+        )
+        .unwrap();
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let previous_nonce = chat_wire::json_bytes(&prior_snapshot["nonce"]).unwrap();
+        assert_ne!(previous_nonce.as_slice(), nonce.as_slice());
+        let ciphertext = encrypt_metadata_snapshot_plaintext_with_nonce(
+            &metadata_key,
+            &convo.group_id,
+            next_epoch,
+            metadata_version,
+            &nonce,
+            &prior_plaintext,
+        )
+        .unwrap();
+        assert_eq!(
+            ciphertext.len(),
+            chat_wire::json_bytes(&prior_snapshot["ciphertext"])
+                .unwrap()
+                .len()
+        );
+        let mut next_snapshot = prior_snapshot.clone();
+        next_snapshot["ciphertext"] = json!({ "$bytes": STANDARD.encode(&ciphertext) });
+        next_snapshot["ciphertextSha256"] =
+            json!(STANDARD.encode(Sha256::digest(&ciphertext)));
+        next_snapshot["ciphertextSize"] = json!(ciphertext.len());
+        next_snapshot["nonce"] = json!({ "$bytes": STANDARD.encode(nonce) });
+        let coordinate = next_snapshot["coordinate"].as_object_mut().unwrap();
+        coordinate.insert(
+            "conversationId".into(),
+            json!(STANDARD.encode(uuid::Uuid::parse_str(cid).unwrap().as_bytes())),
+        );
+        coordinate.insert("generation".into(), json!(0));
+        coordinate.insert("epoch".into(), json!(next_epoch));
+        coordinate.insert(
+            "groupId".into(),
+            json!({ "$bytes": STANDARD.encode(&convo.group_id) }),
+        );
+        coordinate.insert(
+            "groupContextHash".into(),
+            json!({ "$bytes": STANDARD.encode(&gch) }),
+        );
+        coordinate.insert(
+            "confirmationTag".into(),
+            json!({ "$bytes": STANDARD.encode(&ctag) }),
+        );
         convo.epoch = next_epoch as i64;
         tx.upsert_conversation(&convo)?;
         let coords = json!({
@@ -3046,6 +3195,11 @@ fn add_bob_leaf_to_local_group(alice: &str, alice_dev: &str, bob: &str, bob_dev:
             "confirmationTag": { "$bytes": STANDARD.encode(&ctag) },
             "lifecycle": "active",
         });
+        tx.put_account_meta(
+            &format!("metadata_snapshot_json:{cid}"),
+            &next_snapshot.to_string(),
+            1,
+        )?;
         tx.put_account_meta(
             &format!("conversation_coords:{cid}"),
             &serde_json::to_string(&coords).unwrap(),

@@ -1456,39 +1456,126 @@ impl SqliteConn {
         Ok(rows.first().map(|row| message_row(row)))
     }
 
-    /// Drops queued archive items by `sender_did` only in `conversation_id` and before the
-    /// verified deletion sequence. Other conversations and post-deletion sends are untouched.
-    pub fn purge_labyrinth_queue_from_sender(
-        &self,
-        conversation_id: &str,
-        sender_did: &str,
-        before_seq: i64,
-    ) -> Result<(), catbird_mls::MLSError> {
-        self.exec_with_mixed_params(
-            "DELETE FROM labyrinth_queue \
-             WHERE conversation_id = ?1 \
-               AND json_extract(CAST(payload_bytes AS TEXT), '$.sender_did') = ?2 \
-               AND seq < ?3",
-            &[(1, conversation_id), (2, sender_did)],
-            &[(3, before_seq)],
+    /// Upgrade earlier browser databases that removed display rows but retained receipt-backed
+    /// decrypted frames. The caller commits the scrub and its completion flag together.
+    pub fn repair_legacy_erasure_evidence(&self, ts: i64) -> Result<(), catbird_mls::MLSError> {
+        use catbird_mls::client::deletion_authority::AppliedAccountDeletion;
+        use catbird_mls::storage::driver_wasm::WasmSqlBackend;
+        use catbird_mls::MLSError;
+        const DONE: &str = "browser.deletion_evidence_scrub_v1";
+        if self.get_account_meta(DONE)?.as_deref() == Some("1") {
+            return Ok(());
+        }
+        let prefix = "native.account_deleted:";
+        let rows = self.query_text_int_blob(
+            "SELECT state_key, value_bytes FROM labyrinth_state WHERE substr(state_key, 1, length(?1)) = ?1",
+            &[(1, prefix)], &[], 2, &[1],
+        ).map_err(map_wasm_mls_err)?;
+        for row in rows {
+            let (cid, did) = row[0]
+                .0
+                .as_deref()
+                .and_then(|s| s.strip_prefix(prefix))
+                .and_then(|s| s.find(":did:").map(|n| (&s[..n], &s[n + 1..])))
+                .ok_or_else(|| MLSError::Internal("invalid stored deletion key".into()))?;
+            let marker = row[1]
+                .1
+                .as_deref()
+                .and_then(AppliedAccountDeletion::decode)
+                .ok_or_else(|| MLSError::Internal("invalid stored deletion marker".into()))?;
+            self.purge_covered_account_data(cid, did, &marker)?;
+        }
+        self.put_account_meta(DONE, "1", ts)
+    }
+
+    pub fn all_conversation_ids(&self) -> Result<Vec<String>, catbird_mls::MLSError> {
+        self.query_text(
+            "SELECT conversation_id FROM conversations ORDER BY conversation_id",
+            &[],
+            1,
         )
+        .map(|rows| rows.into_iter().flatten().flatten().collect())
         .map_err(map_wasm_mls_err)
     }
 
-    /// Drops display rows covered by one conversation-scoped deletion sequence.
-    pub fn purge_messages_from_sender_before_seq(
+    /// Erase display rows, archive evidence (including orphan frames), and queued copies in the
+    /// caller's transaction. Prefer the verified receipt's issue time over local insertion time.
+    pub fn purge_covered_account_data(
         &self,
-        conversation_id: &str,
-        sender_did: &str,
-        before_seq: i64,
+        cid: &str,
+        did: &str,
+        marker: &catbird_mls::client::deletion_authority::StoredAccountDeletion,
     ) -> Result<(), catbird_mls::MLSError> {
-        self.exec_with_mixed_params(
-            "DELETE FROM messages \
-             WHERE conversation_id = ?1 AND sender_did = ?2 AND seq < ?3",
-            &[(1, conversation_id), (2, sender_did)],
-            &[(3, before_seq)],
-        )
-        .map_err(map_wasm_mls_err)
+        use catbird_mls::client::chat_wire;
+        use catbird_mls::storage::driver_wasm::WasmSqlBackend;
+        use catbird_mls::MLSError;
+
+        let rows = self.query_text(
+            "SELECT m.message_id, m.seq, COALESCE(
+                json_extract(json_extract(CAST(e.value_bytes AS TEXT), '$.sequencer_receipt_json'), '$.issued_at_ms'),
+                json_extract(CAST(u.value_bytes AS TEXT), '$.receipt.issuedAtMs'), m.created_at_ms)
+             FROM messages m
+             LEFT JOIN labyrinth_state e ON e.state_key = 'native.message:' || ?1 || ':' || m.message_id
+             LEFT JOIN labyrinth_state u ON u.state_key = 'native.unavailable:' || ?1 || ':' || m.message_id
+             WHERE m.conversation_id = ?1 AND m.sender_did = ?2",
+            &[(1, cid), (2, did)], 3,
+        ).map_err(map_wasm_mls_err)?;
+        let covered = |row: &[Option<String>]| -> Result<bool, MLSError> {
+            let seq = row[1]
+                .as_deref()
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| MLSError::Internal("missing deletion candidate sequence".into()))?;
+            let issued = row[2]
+                .as_deref()
+                .map(str::parse::<i64>)
+                .transpose()
+                .map_err(|_| MLSError::Internal("invalid deletion candidate issue time".into()))?;
+            Ok(marker.covers(seq, issued))
+        };
+        for row in rows {
+            if covered(&row)? {
+                let id = row[0]
+                    .as_deref()
+                    .ok_or_else(|| MLSError::Internal("missing message id".into()))?;
+                self.delete_message(cid, id)?;
+                self.delete_labyrinth_state_key(&format!("native.message:{cid}:{id}"))?;
+                self.delete_labyrinth_state_key(&chat_wire::unavailable_message_key(cid, id))?;
+                self.delete_labyrinth_state_key(&chat_wire::undecryptable_evidence_key(cid, id))?;
+            }
+        }
+        let prefix = format!("native.message:{cid}:");
+        let evidence = self.query_text(
+            "WITH frames AS (
+                SELECT state_key, json_extract(CAST(value_bytes AS TEXT), '$.sequencer_receipt_json') AS receipt
+                FROM labyrinth_state WHERE substr(state_key, 1, length(?1)) = ?1
+             ) SELECT state_key, json_extract(receipt, '$.seq'), json_extract(receipt, '$.issued_at_ms')
+             FROM frames WHERE substr(json_extract(receipt, '$.sender_device_did_url'), 1, length(?2)+1) = ?2 || '#'",
+            &[(1, &prefix), (2, did)], 3,
+        ).map_err(map_wasm_mls_err)?;
+        for row in evidence {
+            if covered(&row)? {
+                let key = row[0]
+                    .as_deref()
+                    .ok_or_else(|| MLSError::Internal("missing frame key".into()))?;
+                self.delete_labyrinth_state_key(key)?;
+            }
+        }
+        let queued = self.query_text(
+            "SELECT item_id, seq, COALESCE(
+                json_extract(json_extract(CAST(payload_bytes AS TEXT), '$.sequencer_receipt_json'), '$.issued_at_ms'),
+                json_extract(CAST(payload_bytes AS TEXT), '$.created_at_ms'))
+             FROM labyrinth_queue WHERE conversation_id = ?1 AND json_extract(CAST(payload_bytes AS TEXT), '$.sender_did') = ?2",
+            &[(1, cid), (2, did)], 3,
+        ).map_err(map_wasm_mls_err)?;
+        for row in queued {
+            if covered(&row)? {
+                let id = row[0]
+                    .as_deref()
+                    .ok_or_else(|| MLSError::Internal("missing queue id".into()))?;
+                self.dequeue_labyrinth_item(id)?;
+            }
+        }
+        Ok(())
     }
 
     /// Database path inside the OPFS SAH pool.

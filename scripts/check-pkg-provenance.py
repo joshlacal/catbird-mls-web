@@ -34,17 +34,19 @@ failures = []
 
 
 def sibling_head(repo):
-    """Last sealed commit of a sibling checkout: @- when @ is the empty working-copy commit."""
-    def jj(rev, template):
-        return subprocess.run(
-            ['jj', '--ignore-working-copy', 'log', '--no-graph', '-r', rev, '-T', template],
-            cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
-    dirty = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=normal'],
-                           cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
-    if dirty:
-        return None, f'{repo} has uncommitted changes, so it is not a sealed build input'
-    rev = '@-' if jj('@', 'empty') == 'true' else '@'
-    return jj(rev, 'commit_id'), None
+    """Last content-bearing sealed commit of a clean sibling checkout."""
+    if (repo / '.jj').exists():
+        # Normal jj secondary workspaces have no .git working tree. Snapshot the current
+        # files before checking the empty working-copy commit; --ignore-working-copy alone
+        # can see a previously sealed snapshot while the build consumed new file contents.
+        if subprocess.check_output(['jj', 'diff', '--summary'], cwd=repo, text=True).strip():
+            return None, f'{repo} has unsealed working-copy changes'
+        return subprocess.check_output(
+            ['jj', '--ignore-working-copy', 'log', '--no-graph', '-r', 'heads(ancestors(@-) ~ empty())', '-T', 'commit_id'],
+            cwd=repo, text=True).strip(), None
+    if subprocess.check_output(['git', 'status', '--porcelain'], cwd=repo, text=True).strip():
+        return None, f'{repo} has uncommitted changes'
+    return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip(), None
 
 
 if not args.no_siblings:

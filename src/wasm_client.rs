@@ -341,6 +341,7 @@ impl WasmMlsClient {
                         has_recovery_code: false,
                         has_passkey_prf: false,
                         recovery_needs_attention: false,
+                        recovery_generation: 0,
                         epoch_seq: 1,
                         active_device_ids: vec![canonical_device_id.clone()],
                         recovery_method_stale: false,
@@ -768,6 +769,7 @@ impl WasmMlsClient {
                 has_recovery_code: false,
                 has_passkey_prf: false,
                 recovery_needs_attention: false,
+                recovery_generation: 0,
                 epoch_seq: 0,
                 active_device_ids: vec![self.device_id.clone()],
                 recovery_method_stale: false,
@@ -1205,6 +1207,7 @@ impl WasmMlsClient {
         let db = WasmAccountDb::new(conn);
         let ts = now_ms();
         db.write_tx(|tx| {
+            tx.repair_legacy_erasure_evidence(ts)?;
             tx.put_account_meta("owner_did", &normalized_did, ts)?;
             tx.put_account_meta("device_id", &device_id, ts)?;
             tx.put_account_meta("home_ds_did", &home_ds_did, ts)?;
@@ -1440,7 +1443,7 @@ struct GoldenManifestVerificationReport {
 pub fn verify_golden_manifest(manifest_raw: &str, entries_js: JsValue) -> Result<JsValue, JsValue> {
     let files: Vec<GoldenManifestFileEntry> = serde_wasm_bindgen::from_value(entries_js)
         .map_err(|e| JsValue::from_str(&format!("invalid file entries: {e}")))?;
-    let mut expected: Vec<(String, String)> = Vec::new();
+    let mut expected = std::collections::BTreeMap::new();
     for line in manifest_raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1456,7 +1459,11 @@ pub fn verify_golden_manifest(manifest_raw: &str, entries_js: JsValue) -> Result
                 "invalid SHA-256 hex in MANIFEST.sha256 for {fname}"
             )));
         }
-        expected.push((sha.to_ascii_lowercase(), fname.to_owned()));
+        if fname.is_empty() || expected.insert(fname, sha.to_ascii_lowercase()).is_some() {
+            return Err(JsValue::from_str(
+                "empty or duplicate transcript name in MANIFEST.sha256",
+            ));
+        }
     }
     if expected.len() != 50 {
         return Err(JsValue::from_str(&format!(
@@ -1474,8 +1481,8 @@ pub fn verify_golden_manifest(manifest_raw: &str, entries_js: JsValue) -> Result
         .iter()
         .map(|f| (f.filename.as_str(), f.bytes.as_slice()))
         .collect();
-    for (expected_sha, fname) in &expected {
-        let Some(raw_bytes) = by_name.get(fname.as_str()) else {
+    for (fname, expected_sha) in &expected {
+        let Some(raw_bytes) = by_name.get(fname) else {
             return Err(JsValue::from_str(&format!(
                 "missing transcript file listed in MANIFEST.sha256: {fname}"
             )));

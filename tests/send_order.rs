@@ -3477,3 +3477,48 @@ async fn own_acceptance_receipt_is_bound_to_the_submitted_request() {
     drop(bob_client);
     assert!(web_own_acceptance_state(&bob, cid).2.is_some());
 }
+
+#[wasm_bindgen_test]
+async fn retained_sender_counter_gap_is_recorded_across_membership_commit() {
+    let _restore = install_ds();
+    let (alice, bob, carol) = (did("retainalice"), did("retainbob"), did("retaincarol"));
+    let cid = "00000000-0000-4000-8000-0000000c0097";
+    let members = [
+        (alice.as_str(), ALICE_DEVICE),
+        (bob.as_str(), BOB_DEVICE),
+        (carol.as_str(), CAROL_DEVICE),
+    ];
+    let mut clients = group(&members, cid).await.into_iter();
+    let (alice_client, bob_client) = (clients.next().unwrap(), clients.next().unwrap());
+    send(&bob_client, cid, 1, "before membership change")
+        .await
+        .unwrap();
+    alice_client.sync().await.unwrap();
+    bob_client
+        .remove_group_member(true, cid.into(), carol)
+        .await
+        .unwrap();
+    alice_client.sync().await.unwrap();
+    drop(bob_client);
+    account_db(&bob)
+        .write_tx(|tx| tx.put_account_meta(&chat_wire::send_counter_key(cid), "3", 0))
+        .unwrap();
+    let bob_client = open(&bob, BOB_DEVICE).await;
+    send(&bob_client, cid, 2, "after membership change")
+        .await
+        .unwrap();
+    alice_client.sync().await.unwrap();
+    let end = conversation_row(&alice_client, cid).last_seq;
+    drop(alice_client);
+    let stored = account_db(&alice)
+        .backend()
+        .get_account_meta(&send_counter_gap_key(cid, end))
+        .unwrap()
+        .unwrap();
+    let evidence: catbird_mls::client::send_counter::SendCounterEvidence =
+        serde_json::from_str(&stored).unwrap();
+    assert_eq!(
+        (evidence.expected, evidence.received, evidence.same_epoch),
+        (Some(2), 4, false)
+    );
+}

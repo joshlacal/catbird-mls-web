@@ -827,12 +827,12 @@ impl LocalConversationAuthority for WasmLocalConversationAuthority {
         let convos = self
             .db
             .backend()
-            .list_conversations(None, 500)
+            .all_conversation_ids()
             .map_err(OrchestratorError::Mls)?;
         let mut shared = BTreeSet::new();
         let mut saw_live_shared_group = false;
         for convo in convos {
-            let Some((_, _, applied, leaves)) = self.group_view(&convo.conversation_id)? else {
+            let Some((_, _, applied, leaves)) = self.group_view(&convo)? else {
                 continue;
             };
             if applied <= 0 || !leaves.iter().any(|(m, _)| *m == self.client.account_did) {
@@ -1099,6 +1099,10 @@ fn hide_deleted_accounts_wasm(
     let senders: BTreeSet<String> = messages.iter().filter_map(|m| m.sender.clone()).collect();
     let mut deleted: BTreeMap<String, StoredAccountDeletion> = BTreeMap::new();
     for did in &senders {
+        if tombstoned_dids.contains(did) {
+            deleted.insert(did.clone(), StoredAccountDeletion::SeqOnly(i64::MAX));
+            continue;
+        }
         if let Some(raw) = db
             .backend()
             .get_labyrinth_state(&chat_wire::account_deletion_key(conversation_id, did))?
@@ -1106,8 +1110,6 @@ fn hide_deleted_accounts_wasm(
             let marker = AppliedAccountDeletion::decode(&raw)
                 .unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
             deleted.insert(did.clone(), marker);
-        } else if tombstoned_dids.contains(did) {
-            deleted.insert(did.clone(), StoredAccountDeletion::SeqOnly(i64::MAX));
         }
     }
     for m in messages.iter() {
@@ -1356,6 +1358,7 @@ impl WasmMlsClient {
                     has_recovery_code: false,
                     has_passkey_prf: false,
                     recovery_needs_attention: false,
+                    recovery_generation: 0,
                     epoch_seq: 0,
                     active_device_ids: vec![self.device_id.clone()],
                     recovery_method_stale: false,
@@ -1917,6 +1920,63 @@ impl WasmMlsClient {
         Ok(u32::try_from(archived).unwrap_or(u32::MAX))
     }
 
+    async fn conversation_state_with_deletions(
+        &self,
+        token: &str,
+        device: &str,
+        cid: &str,
+        signer: &SignatureKeyPair,
+    ) -> Result<Value, MLSError> {
+        let mut after = 0_i64;
+        let mut entries = Vec::new();
+        loop {
+            let prior = after;
+            let cursor = after.to_string();
+            let mut state = self
+                .ds_signed_get(
+                    token,
+                    device,
+                    "blue.catbird.chat.getConversationState",
+                    &[
+                        ("actorDeviceId", device),
+                        ("conversationId", cid),
+                        ("deletionsAfter", &cursor),
+                    ],
+                    signer,
+                )
+                .await?;
+            let page = state["accountDeletions"].as_array_mut().ok_or_else(|| {
+                MLSError::Cryptography("missing conversation deletion inventory".into())
+            })?;
+            if page.len() > 100 {
+                return Err(MLSError::Cryptography(
+                    "oversized deletion inventory page".into(),
+                ));
+            }
+            for entry in page.drain(..) {
+                after = entry["seq"]
+                    .as_i64()
+                    .filter(|seq| *seq > after && *seq <= 9_007_199_254_740_991)
+                    .ok_or_else(|| {
+                        MLSError::Cryptography("unordered deletion inventory page".into())
+                    })?;
+                entries.push(entry);
+            }
+            match state.get("deletionsCursor") {
+                None => {
+                    state["accountDeletions"] = Value::Array(entries);
+                    return Ok(state);
+                }
+                Some(cursor_value) if cursor_value.as_i64() == Some(after) && after > prior => {}
+                _ => {
+                    return Err(MLSError::Cryptography(
+                        "invalid deletion inventory cursor".into(),
+                    ))
+                }
+            }
+        }
+    }
+
     async fn preverify_wasm_conversation_deletions(
         &self,
         conversation_id: &str,
@@ -1924,16 +1984,7 @@ impl WasmMlsClient {
         let (session_token, device_id) = self.require_live_session()?;
         let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
         let state = match self
-            .ds_signed_get(
-                &session_token,
-                &device_id,
-                "blue.catbird.chat.getConversationState",
-                &[
-                    ("actorDeviceId", &device_id),
-                    ("conversationId", conversation_id),
-                ],
-                &signer,
-            )
+            .conversation_state_with_deletions(&session_token, &device_id, conversation_id, &signer)
             .await
         {
             Ok(state) => state,
@@ -2051,14 +2102,10 @@ impl WasmMlsClient {
         let state = match prefetched_state {
             Some(state) => state,
             None => match self
-                .ds_signed_get(
+                .conversation_state_with_deletions(
                     &session_token,
                     &device_id,
-                    "blue.catbird.chat.getConversationState",
-                    &[
-                        ("actorDeviceId", &device_id),
-                        ("conversationId", conversation_id),
-                    ],
+                    conversation_id,
                     &signer,
                 )
                 .await
@@ -2123,34 +2170,20 @@ impl WasmMlsClient {
                 }
             }
         }
-        // PDS completeness check for foreign message senders whose deletion may have been
-        // omitted from `getConversationState["accountDeletions"]`.
-        let foreign_senders: Vec<String> = {
-            let all_senders: BTreeSet<String> = history
-                .iter()
-                .filter_map(|m| m.sender.as_deref())
-                .filter(|s| *s != self.account_did)
-                .map(str::to_owned)
-                .collect();
-            let backend = self.require_db_mls()?.backend();
-            let mut unchecked = Vec::new();
-            for did in all_senders {
-                let has_seq = backend
-                    .get_labyrinth_state(&chat_wire::account_deletion_key(conversation_id, &did))?
-                    .is_some();
-                if !has_seq {
-                    unchecked.push(did);
-                }
-            }
-            unchecked
-        };
+        // A new deletion can follow an older verified one. Inspect every author's current
+        // authenticated inventory, including our own account when other devices authored history.
+        let senders: BTreeSet<&str> = history.iter().filter_map(|m| m.sender.as_deref()).collect();
         let mut tombstoned_dids = BTreeSet::new();
-        for sender_did in foreign_senders {
+        for sender_did in senders {
             if self
-                .verify_foreign_sender_pds_deletion_wasm(&session_token, &sender_did)
+                .verify_foreign_sender_pds_deletion_wasm(
+                    &session_token,
+                    conversation_id,
+                    sender_did,
+                )
                 .await?
             {
-                tombstoned_dids.insert(sender_did);
+                tombstoned_dids.insert(sender_did.to_owned());
             }
         }
         Ok(tombstoned_dids)
@@ -2160,12 +2193,13 @@ impl WasmMlsClient {
         &self,
         pds_endpoint: &str,
         did: &str,
+        expected_count: usize,
     ) -> Result<Option<Vec<Value>>, MLSError> {
         let base = pds_endpoint.trim_end_matches('/');
         let mut cursor: Option<String> = None;
         let mut seen_cursors = BTreeSet::new();
         let mut all_records = Vec::new();
-        for page_idx in 0..chat_wire::MAX_PDS_LIST_RECORDS_PAGES {
+        for page_idx in 0..=expected_count {
             let mut url = format!(
                 "{base}/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit={}",
                 chat_wire::urlencode_form_component(did),
@@ -2183,15 +2217,16 @@ impl WasmMlsClient {
             let resp = self
                 .http
                 .get(&url)
+                .fetch_cache_no_store()
                 .send()
                 .await
                 .map_err(|_| MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()))?;
             let status = resp.status().as_u16();
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|_| MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()))?
-                .to_vec();
+            let bytes = super::wasm_client_sync::bounded_pds_response(
+                resp,
+                catbird_mls::labyrinth::repo_proof::MAX_CAR_ARCHIVE_BYTES,
+            )
+            .await?;
             if status >= 400 {
                 let err_code = serde_json::from_slice::<Value>(&bytes)
                     .ok()
@@ -2210,8 +2245,9 @@ impl WasmMlsClient {
                 deletion_authority::DEVICE_REVOCATION_COLLECTION,
                 &bytes,
             )?;
+            let empty = page_records.is_empty();
             all_records.extend(page_records);
-            if all_records.len() > chat_wire::MAX_PDS_LIST_RECORDS_ITEMS {
+            if all_records.len() > expected_count || (empty && next_cursor.is_some()) {
                 return Err(MLSError::InvalidState(
                     "ArchiveDeletionInventoryUnavailable".into(),
                 ));
@@ -2219,9 +2255,7 @@ impl WasmMlsClient {
             match next_cursor {
                 None => return Ok(Some(all_records)),
                 Some(next) => {
-                    if !seen_cursors.insert(next.clone())
-                        || page_idx + 1 == chat_wire::MAX_PDS_LIST_RECORDS_PAGES
-                    {
+                    if !seen_cursors.insert(next.clone()) || page_idx == expected_count {
                         return Err(MLSError::InvalidState(
                             "ArchiveDeletionInventoryUnavailable".into(),
                         ));
@@ -2236,6 +2270,7 @@ impl WasmMlsClient {
     async fn verify_foreign_sender_pds_deletion_wasm(
         &self,
         session_token: &str,
+        conversation_id: &str,
         sender_did: &str,
     ) -> Result<bool, MLSError> {
         let Some(doc_bytes) = self
@@ -2255,30 +2290,154 @@ impl WasmMlsClient {
                 "ArchiveDeletionInventoryUnavailable".into(),
             ));
         };
-        let Some(records) = self
-            .list_pds_revocations_or_tombstone_wasm(&pds_endpoint, sender_did)
-            .await?
-        else {
-            return Ok(true);
+        let unavailable = || MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into());
+        let atproto_key = DidDocument::parse_json(sender_did, &doc_bytes)
+            .ok()
+            .and_then(|doc| doc.atproto_key)
+            .ok_or_else(unavailable)?;
+        let repo_url = |method: &str| {
+            format!(
+                "{}/xrpc/com.atproto.sync.{method}?did={}",
+                pds_endpoint.trim_end_matches('/'),
+                chat_wire::urlencode_form_component(sender_did)
+            )
         };
+        let head = self
+            .http
+            .get(repo_url("getLatestCommit"))
+            .fetch_cache_no_store()
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        let status = head.status().as_u16();
+        let head = super::wasm_client_sync::bounded_pds_response(head, 64 * 1024).await?;
+        if Self::is_pds_repo_tombstone_response(status, &head) {
+            return Ok(true);
+        }
+        if !(200..300).contains(&status) {
+            return Err(unavailable());
+        }
+        let head: Value = serde_json::from_slice(&head).map_err(|_| unavailable())?;
+        let cid = head["cid"].as_str().ok_or_else(unavailable)?;
+        let rev = head["rev"].as_str().ok_or_else(unavailable)?;
+        // Walk only Merkle search tree branches intersecting the revocation collection.
+        // Older personal data servers may only support exporting a bounded full repository.
+        let mut inventory = catbird_mls::labyrinth::repo_proof::RevocationInventory::new(
+            sender_did,
+            cid,
+            rev,
+            &atproto_key,
+        )
+        .map_err(|_| unavailable())?;
+        let mut first_block = true;
+        let proven = loop {
+            let Some(block) = inventory.next_block() else {
+                break inventory.finish().map_err(|_| unavailable())?;
+            };
+            let response = self
+                .http
+                .get(format!(
+                    "{}&cids={}",
+                    repo_url("getBlocks"),
+                    chat_wire::urlencode_form_component(&block)
+                ))
+                .fetch_cache_no_store()
+                .send()
+                .await
+                .map_err(|_| unavailable())?;
+            let status = response.status().as_u16();
+            let limit = if (200..300).contains(&status) {
+                catbird_mls::labyrinth::repo_proof::MAX_CAR_ARCHIVE_BYTES
+            } else {
+                64 * 1024
+            };
+            let bytes = super::wasm_client_sync::bounded_pds_response(response, limit).await?;
+            let unsupported = matches!(status, 404 | 405 | 501)
+                || (status == 400
+                    && serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .is_some_and(|v| {
+                            matches!(
+                                v["error"].as_str(),
+                                Some("MethodNotImplemented" | "XRPCNotSupported")
+                            )
+                        }));
+            if first_block && unsupported {
+                let repo = self
+                    .http
+                    .get(repo_url("getRepo"))
+                    .fetch_cache_no_store()
+                    .send()
+                    .await
+                    .map_err(|_| unavailable())?;
+                if !repo.status().is_success() {
+                    return Err(unavailable());
+                }
+                let bytes = super::wasm_client_sync::bounded_pds_response(
+                    repo,
+                    catbird_mls::labyrinth::repo_proof::MAX_CAR_ARCHIVE_BYTES,
+                )
+                .await?;
+                break catbird_mls::labyrinth::repo_proof::verify_revocation_inventory(
+                    &bytes,
+                    sender_did,
+                    cid,
+                    rev,
+                    &atproto_key,
+                )
+                .map_err(|_| unavailable())?;
+            }
+            if !(200..300).contains(&status) {
+                return Err(unavailable());
+            }
+            inventory.ingest(&bytes).map_err(|_| unavailable())?;
+            first_block = false;
+        };
+        self.observe_pds_repo_rev_floor_wasm(sender_did, rev, cid)?;
+        let records = self
+            .list_pds_revocations_or_tombstone_wasm(&pds_endpoint, sender_did, proven.len())
+            .await?
+            .ok_or_else(unavailable)?;
         let rev_prefix = format!(
             "at://{sender_did}/{}/",
             deletion_authority::DEVICE_REVOCATION_COLLECTION
         );
+        let mut listed = BTreeMap::new();
+        for record in &records {
+            let key = record["uri"]
+                .as_str()
+                .and_then(|uri| uri.strip_prefix(&rev_prefix))
+                .filter(|k| !k.is_empty() && !k.contains('/'))
+                .ok_or_else(unavailable)?;
+            let cid = record["cid"].as_str().ok_or_else(unavailable)?;
+            if listed.insert(key.to_owned(), cid.to_owned()).is_some() {
+                return Err(unavailable());
+            }
+        }
+        if listed != proven.into_iter().collect() {
+            return Err(unavailable());
+        }
+        let applied = self
+            .require_db_mls()?
+            .backend()
+            .get_labyrinth_state(&chat_wire::account_deletion_key(
+                conversation_id,
+                sender_did,
+            ))?
+            .and_then(|bytes| AppliedAccountDeletion::decode(&bytes));
         for rec_entry in &records {
-            let Some(uri) = rec_entry.get("uri").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(rkey) = uri
-                .strip_prefix(&rev_prefix)
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && !s.contains('/'))
-            else {
-                continue;
-            };
-            let Some(val) = rec_entry.get("value") else {
-                continue;
-            };
+            let rkey = rec_entry["uri"]
+                .as_str()
+                .and_then(|uri| uri.strip_prefix(&rev_prefix))
+                .ok_or_else(unavailable)?;
+            let val = rec_entry.get("value").ok_or_else(unavailable)?;
+            let rev_cid = rec_entry["cid"].as_str().ok_or_else(unavailable)?;
+            let (value_cid, _) =
+                catbird_mls::labyrinth::repo_proof::encode_atproto_json_record_dagcbor(val)
+                    .map_err(|_| unavailable())?;
+            if value_cid.to_string() != rev_cid {
+                return Err(unavailable());
+            }
             let is_self_deletion = val.get("actorDeviceId").and_then(Value::as_str) == Some(rkey)
                 && val.get("targetDeviceId").and_then(Value::as_str) == Some(rkey)
                 && val
@@ -2290,39 +2449,42 @@ impl WasmMlsClient {
             if !is_self_deletion {
                 continue;
             }
-            let Some(rev_cid) = rec_entry
-                .get("cid")
-                .and_then(Value::as_str)
-                .filter(|c| !c.is_empty())
-            else {
-                return Err(MLSError::InvalidState(
-                    "ArchiveDeletionUnverified".into(),
-                ));
-            };
-            let Some(atproto_key) =
-                atproto_spaces::did_resolver::DidDocument::parse_json(sender_did, &doc_bytes)
-                    .ok()
-                    .and_then(|d| d.atproto_key)
-            else {
-                return Err(MLSError::InvalidState(
-                    "ArchiveDeletionUnverified".into(),
-                ));
-            };
-            let device_car = self
-                .fetch_pds_record_car_wasm(
-                    &pds_endpoint,
-                    sender_did,
-                    deletion_authority::DEVICE_RECORD_COLLECTION,
-                    rkey,
-                    deletion_authority::MAX_REVOCATION_PROOF_BYTES,
-                )
-                .await
-                .map_err(|_| MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()))?;
             let revocation_car = self
                 .fetch_pds_record_car_wasm(
                     &pds_endpoint,
                     sender_did,
                     deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                    rkey,
+                    deletion_authority::MAX_REVOCATION_PROOF_BYTES,
+                )
+                .await
+                .map_err(|_| {
+                    MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into())
+                })?;
+            let (_, rev_rev) =
+                catbird_mls::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
+                    &revocation_car,
+                    sender_did,
+                    deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                    rkey,
+                    Some(rev_cid),
+                    val,
+                    &atproto_key,
+                )
+                .map_err(|_| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
+            self.observe_pds_repo_rev_floor_wasm(
+                sender_did,
+                &rev_rev,
+                &format!(
+                    "at://{sender_did}/{}/{rkey}",
+                    deletion_authority::DEVICE_REVOCATION_COLLECTION
+                ),
+            )?;
+            let device_car = self
+                .fetch_pds_record_car_wasm(
+                    &pds_endpoint,
+                    sender_did,
+                    deletion_authority::DEVICE_RECORD_COLLECTION,
                     rkey,
                     deletion_authority::MAX_REVOCATION_PROOF_BYTES,
                 )
@@ -2345,26 +2507,7 @@ impl WasmMlsClient {
                     deletion_authority::DEVICE_RECORD_COLLECTION
                 ),
             )?;
-            let (_, rev_rev) =
-                catbird_mls::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
-                    &revocation_car,
-                    sender_did,
-                    deletion_authority::DEVICE_REVOCATION_COLLECTION,
-                    rkey,
-                    Some(rev_cid),
-                    val,
-                    &atproto_key,
-                )
-                .map_err(|_| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
-            self.observe_pds_repo_rev_floor_wasm(
-                sender_did,
-                &rev_rev,
-                &format!(
-                    "at://{sender_did}/{}/{rkey}",
-                    deletion_authority::DEVICE_REVOCATION_COLLECTION
-                ),
-            )?;
-            let _ = deletion_authority::verify_foreign_self_deletion_from_cars(
+            let deletion = deletion_authority::verify_foreign_self_deletion_from_cars(
                 &device_car,
                 &revocation_car,
                 sender_did,
@@ -2372,9 +2515,13 @@ impl WasmMlsClient {
                 &doc_bytes,
             )
             .ok_or_else(|| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
-            return Err(MLSError::InvalidState(
-                "ArchiveDeletionUnverified".into(),
-            ));
+            if !applied
+                .as_ref()
+                .and_then(|marker| marker.operation(&deletion.operation_id))
+                .is_some_and(|op| op.actor_device_id == deletion.actor_device_id)
+            {
+                return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
+            }
         }
         Ok(false)
     }
@@ -2864,6 +3011,7 @@ impl WasmMlsClient {
         }
 
         Ok(DeviceRevocationReport {
+            recovery_generation: 0,
             target_device_id: target_trimmed.to_owned(),
             ds_revoked,
             groups_updated,
@@ -3015,9 +3163,9 @@ impl WasmMlsClient {
                     .unwrap_or(false);
                 if !other_active {
                     if let Ok(db) = self.require_db_mls() {
-                        if let Ok(convs) = db.backend().list_conversations(None, 500) {
+                        if let Ok(convs) = db.backend().all_conversation_ids() {
                             for conv in convs {
-                                let _ = self.leave_conversation_impl(&conv.conversation_id).await;
+                                let _ = self.leave_conversation_impl(&conv).await;
                             }
                         }
                     }

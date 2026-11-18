@@ -167,6 +167,7 @@ struct Wave2World {
     deleted_accounts: BTreeSet<String>,
     deleted_account_proofs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
     pds_repo_status_for: BTreeMap<String, (u16, String)>,
+    blocks_unsupported: bool,
     sequence: u64,
 }
 
@@ -878,6 +879,77 @@ fn dispatch_fetch_inner(
                 origin
             };
             WireResponse::json(200, json!({ "didDoc": build_did_doc(did, endpoint) }))
+        }
+        "com.atproto.sync.getLatestCommit"
+        | "com.atproto.sync.getRepo"
+        | "com.atproto.sync.getBlocks" => {
+            if nsid == "com.atproto.sync.getBlocks" && WORLD.with(|c| c.borrow().blocks_unsupported)
+            {
+                return WireResponse::json(501, json!({"error":"MethodNotImplemented"}));
+            }
+            let did = params.get("did").unwrap();
+            let records = WORLD.with(|cell| {
+                let world = cell.borrow();
+                if let Some((status, code)) = world.pds_repo_status_for.get(did) {
+                    return Err(WireResponse::json(*status, json!({"error": code})));
+                }
+                let mut rows = Vec::new();
+                for (collection, records) in [
+                    (labyrinth::records::nsid::MAILBOX_KEYS, &world.mailbox_keys),
+                    ("blue.catbird.chat.device", &world.chat_devices),
+                    (
+                        "blue.catbird.chat.deviceRevocation",
+                        &world.chat_device_revocations,
+                    ),
+                ] {
+                    for ((owner, rkey), record) in records {
+                        if owner == did {
+                            rows.push((format!("{collection}/{rkey}"), record.dagcbor.clone()));
+                        }
+                    }
+                }
+                if let Some(declaration) = world.chat_declarations.get(did) {
+                    rows.push((
+                        "blue.catbird.chat.declaration/self".into(),
+                        declaration.dagcbor.clone(),
+                    ));
+                }
+                Ok(rows)
+            });
+            let records = match records {
+                Ok(rows) => rows,
+                Err(response) => return response,
+            };
+            let key = SpaceSigningKey::from_p256_secret(&p256_key(did, b"sign"), "#atproto");
+            let rev = "3lb2zzzzzzzzz";
+            let (root, car) = build_repo_proof_car_v1(did, rev, &records, &key).unwrap();
+            if nsid == "com.atproto.sync.getLatestCommit" {
+                WireResponse::json(200, json!({"cid": root.to_string(), "rev": rev}))
+            } else if nsid == "com.atproto.sync.getBlocks" {
+                let cid = params.get("cids").unwrap();
+                let (_, cid_bytes) = multibase::decode(cid).unwrap();
+                let (header_len, rest) = unsigned_varint::decode::usize(&car).unwrap();
+                let mut rest = &rest[header_len..];
+                while !rest.is_empty() {
+                    let (len, data) = unsigned_varint::decode::usize(rest).unwrap();
+                    let (block, remaining) = data.split_at(len);
+                    if block.starts_with(&cid_bytes) {
+                        let header =
+                            serde_ipld_dagcbor::to_vec(&json!({"roots":[],"version":1})).unwrap();
+                        let mut buffer = unsigned_varint::encode::usize_buffer();
+                        let mut one =
+                            unsigned_varint::encode::usize(header.len(), &mut buffer).to_vec();
+                        one.extend(header);
+                        one.extend(unsigned_varint::encode::usize(block.len(), &mut buffer));
+                        one.extend(block);
+                        return WireResponse::bytes(200, "application/vnd.ipld.car", one);
+                    }
+                    rest = remaining;
+                }
+                WireResponse::json(404, json!({"error":"BlockNotFound"}))
+            } else {
+                WireResponse::bytes(200, "application/vnd.ipld.car", car)
+            }
         }
         "com.atproto.sync.getRecord" => {
             let did = params.get("did").unwrap();
@@ -1809,23 +1881,31 @@ fn dispatch_fetch_inner(
                         json!({"error": "ConversationNotFound", "message": cid}),
                     );
                 };
-                WireResponse::json(
-                    200,
-                    json!({
+                let after = params
+                    .get("deletionsAfter")
+                    .and_then(|raw| raw.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let mut rows = st
+                    .account_deletions
+                    .iter()
+                    .filter(|v| v["seq"].as_i64().is_some_and(|seq| seq > after));
+                let page: Vec<_> = rows.by_ref().take(100).collect();
+                let more = rows.next().is_some();
+                let mut result = json!({
                         "sequencerDid": SEQUENCER,
-                        "state": {
-                            "conversationId": cid,
-                            "sequencerDid": SEQUENCER,
-                            "conversationKind": st.kind,
-                            "coordinates": st.coordinates,
-                            "participants": st.participants,
-                            "leaves": st.leaves,
-                        },
-                        "accountDeletions": st.account_deletions,
-                        "pendingLeaveRequests": st.pending_leave_requests,
-                        "pendingLeafRecoveryRequests": [],
-                    }),
-                )
+                        "conversationKind": st.kind,
+                        "coordinates": st.coordinates,
+                        "participants": st.participants,
+                        "leaves": st.leaves,
+                    },
+                    "accountDeletions": page,
+                    "pendingLeaveRequests": st.pending_leave_requests,
+                    "pendingLeafRecoveryRequests": [],
+                });
+                if more {
+                    result["deletionsCursor"] = page.last().unwrap()["seq"].clone();
+                }
+                WireResponse::json(200, result)
             })
         }
         "blue.catbird.chat.closeConversation" => {
@@ -2942,26 +3022,44 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
         .await
         .unwrap();
     assert_eq!(reindexed, 2);
+    WORLD.with(|c| {
+        let mut world = c.borrow_mut();
+        assert!(world.calls["com.atproto.sync.getBlocks"] >= 2);
+        assert!(!world.calls.contains_key("com.atproto.sync.getRepo"));
+        world.blocks_unsupported = true;
+    });
+    alice_client
+        .verify_and_reindex_history(cid.into())
+        .await
+        .unwrap();
+    WORLD.with(|c| {
+        let mut world = c.borrow_mut();
+        assert!(world.calls["com.atproto.sync.getRepo"] >= 1);
+        world.blocks_unsupported = false;
+    });
     let restored_msgs: Vec<MessageRow> =
         serde_wasm_bindgen::from_value(alice_client.list_messages(cid.into(), None, 10).unwrap())
             .unwrap();
     assert_eq!(restored_msgs.len(), 2);
 
-    WORLD.with(|cell| {
-        cell.borrow_mut()
-            .convo_states
-            .get_mut(cid)
-            .unwrap()
-            .account_deletions = vec![json!({
-                "$type": "blue.catbird.chat.defs#accountDeletedEntry",
-                "entryId": "00000000-0000-4000-8000-0000000d04a1",
-                "conversationId": cid,
-                "seq": 3,
-                "deletedDid": bob,
-                "sequencerDid": SEQUENCER,
-                "sequencerAuthority": {},
-                "receivedAt": "2026-11-14T00:02:00.000Z",
-            })];
+    let state_calls = WORLD.with(|cell| {
+        let mut world = cell.borrow_mut();
+        let count = world.calls["blue.catbird.chat.getConversationState"];
+        world.convo_states.get_mut(cid).unwrap().account_deletions = (3..=103)
+            .map(|seq| {
+                json!({
+                    "$type": "blue.catbird.chat.defs#accountDeletedEntry",
+                    "entryId": "00000000-0000-4000-8000-0000000d04a1",
+                    "conversationId": cid,
+                    "seq": seq,
+                    "deletedDid": bob,
+                    "sequencerDid": SEQUENCER,
+                    "sequencerAuthority": {},
+                    "receivedAt": "2026-11-14T00:02:00.000Z",
+                })
+            })
+            .collect();
+        count
     });
     let deletion_error = alice_client
         .verify_and_reindex_history(cid.into())
@@ -2969,6 +3067,10 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
         .expect_err("archive reindex must block on unverified listed deletion")
         .as_string()
         .unwrap_or_default();
+    assert_eq!(
+        WORLD.with(|c| c.borrow().calls["blue.catbird.chat.getConversationState"]),
+        state_calls + 2
+    );
     assert!(
         deletion_error.contains("ArchiveDeletionUnverified"),
         "{deletion_error}"

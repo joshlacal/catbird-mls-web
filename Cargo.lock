@@ -531,6 +531,7 @@ dependencies = [
  "ciborium",
  "console_error_panic_hook",
  "ed25519-dalek 2.2.0",
+ "futures-util",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "getrandom 0.4.3",
@@ -558,6 +559,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tls_codec",
  "tracing",
+ "unsigned-varint",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -3921,6 +3923,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -3940,12 +3943,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -5470,6 +5475,19 @@ name = "wasm-bindgen-test-shared"
 version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ab365ce29ba0232367502b2894556ae77a9c214d33dbf453fdba7f586905918"
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
 
 [[package]]
 name = "web-sys"

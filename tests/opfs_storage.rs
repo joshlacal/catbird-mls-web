@@ -163,3 +163,52 @@ fn journal_mode_rollback_results(mode: &str) -> [bool; 3] {
         rollback_after_commit(mode),
     ]
 }
+
+#[wasm_bindgen_test]
+fn verified_erasure_scrubs_only_covered_frames_including_orphans() {
+    use catbird_mls::client::deletion_authority::{AppliedAccountDeletion, StoredAccountDeletion};
+    use catbird_mls::storage::{LabyrinthQueueRow, MessageRow};
+    use serde_json::json;
+
+    let db = WasmAccountDb::new(SqliteConn::open_in_memory(&"ad".repeat(32)).unwrap());
+    let sender = "did:plc:fixture";
+    let cid = "fixture-conversation";
+    let applied = AppliedAccountDeletion {
+        seq: 10,
+        signed_at_ms: 1_000_000,
+        operation_id: "first".into(),
+        actor_device_id: Some("phone".into()),
+    };
+    let cutoff = applied.purge_bound_ms();
+    let marker = StoredAccountDeletion::Signed(applied);
+    db.write_tx(|tx| {
+        for (id, seq, issued) in [("before", 1, cutoff), ("orphan", 2, cutoff),
+                                   ("later", 3, cutoff + 1), ("afterseq", 11, cutoff)] {
+            let receipt = json!({"sender_device_did_url": format!("{sender}#phone"),
+                "seq": seq, "issued_at_ms": issued}).to_string();
+            let evidence = json!({"labyrinth_frame_json":"fixture frame", "sequencer_receipt_json": receipt,
+                "sender_did":sender, "created_at_ms":1});
+            if id != "orphan" {
+                tx.insert_message(&MessageRow {message_id: id.into(), conversation_id: cid.into(),
+                    group_id: vec![], epoch: 1, seq, sender_did: sender.into(), sender_device_id: "phone".into(),
+                    plaintext_json: "fixture frame".into(), created_at_ms: 1, is_own: false})?;
+            }
+            tx.put_labyrinth_state(&format!("native.message:{cid}:{id}"), &serde_json::to_vec(&evidence)?, 1)?;
+            tx.enqueue_labyrinth_item(&LabyrinthQueueRow {item_id:id.into(), conversation_id:cid.into(),
+                group_id_hex:"00".into(), seq, payload_bytes: serde_json::to_vec(&evidence)?, created_at_ms:1})?;
+        }
+        // The previous browser writer could leave orphan plaintext after deleting display rows.
+        // Reopening with an already applied marker must repair exactly the same covered frames.
+        tx.put_labyrinth_state(&catbird_mls::client::chat_wire::account_deletion_key(cid, sender),
+            &marker.encode().unwrap(), 1)?;
+        tx.repair_legacy_erasure_evidence(2)?;
+        tx.repair_legacy_erasure_evidence(3)?;
+        for (id, retained) in [("before",false),("orphan",false),("later",true),("afterseq",true)] {
+            assert_eq!(tx.get_message(id)?.is_some(), retained);
+            assert_eq!(tx.get_labyrinth_state(&format!("native.message:{cid}:{id}"))?.is_some(), retained);
+        }
+        let queue = tx.list_labyrinth_queue(Some(cid), 100)?;
+        assert_eq!(queue.iter().map(|r| r.item_id.as_str()).collect::<Vec<_>>(), ["later","afterseq"]);
+        Ok(())
+    }).unwrap();
+}

@@ -2559,6 +2559,17 @@ impl WasmMlsClient {
             }
             pending.kv_batch.apply(tx)?;
             if let Some(mut c) = convo {
+                let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
+                let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
+                    .map_err(|e| {
+                        MLSError::Cryptography(format!("load group after own commit: {e:?}"))
+                    })?
+                    .ok_or_else(|| MLSError::group_not_found(cid))?;
+                if let Some(prior) = pending.prior["epoch"].as_u64() {
+                    crate::wasm_client_sync::advance_wasm_counter_epoch(
+                        tx, cid, generation, prior, &group, ts,
+                    )?;
+                }
                 c.epoch = epoch;
                 if seq == c.last_seq.saturating_add(1) {
                     c.last_seq = seq;

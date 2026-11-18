@@ -26,7 +26,9 @@ use catbird_mls::client::deletion_authority::{
     UnverifiedAccountDeletion, UnverifiedDeletionReason,
 };
 use catbird_mls::client::send_counter::{
-    classify_peer_send_counter, send_counter_gap_key, PeerCounterPrior, PeerCounterVerdict,
+    advance_epoch_chain, classify_peer_send_counter, peer_send_continuity_key,
+    peer_send_continuity_prefix, select_peer_counter_prior, send_counter_epoch_chain_key,
+    send_counter_gap_key, EpochChain, PeerCounterContinuity, PeerCounterVerdict,
     SendCounterEvidence,
 };
 use catbird_mls::client::{chat_wire, QueuedLabyrinthArchivePayload};
@@ -484,6 +486,75 @@ pub(crate) fn apply_verified_roster_effects(
     Ok(())
 }
 
+pub(crate) async fn bounded_pds_response(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, MLSError> {
+    use futures_util::StreamExt;
+    let unavailable = || MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into());
+    if response
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
+        return Err(unavailable());
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| unavailable())?;
+        if chunk.len() > limit - bytes.len() {
+            return Err(unavailable());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn advance_wasm_counter_epoch(
+    tx: &SqliteConn,
+    cid: &str,
+    generation: i64,
+    prior: u64,
+    group: &MlsGroup,
+    ts: i64,
+) -> Result<(), MLSError> {
+    let key = send_counter_epoch_chain_key(cid, generation);
+    let next = group.epoch().as_u64();
+    let old_chain = tx
+        .get_account_meta(&key)?
+        .as_deref()
+        .and_then(EpochChain::decode);
+    if old_chain.is_some_and(|c| c.current == next) {
+        return Ok(());
+    }
+    let chain = advance_epoch_chain(old_chain, prior, next);
+    tx.put_account_meta(&key, &chain.encode(), ts)?;
+    let prefix = peer_send_continuity_prefix(cid, generation);
+    let members: BTreeSet<_> = group
+        .members()
+        .map(|member| {
+            chat_wire::parse_scoped_credential_did_device(member.credential.serialized_content())
+        })
+        .collect::<Result<_, _>>()?;
+    for row in tx
+        .query_text(
+            "SELECT key, value_json FROM account_meta WHERE substr(key,1,length(?1))=?1",
+            &[(1, &prefix)],
+            2,
+        )
+        .map_err(|e| MLSError::Internal(e.to_string()))?
+    {
+        let (Some(key), Some(raw)) = (row[0].as_deref(), row[1].as_deref()) else {
+            return Err(MLSError::Internal("empty peer counter metadata".into()));
+        };
+        let known: PeerCounterContinuity = serde_json::from_str(raw)?;
+        if !group.is_active() || !members.contains(&(known.sender_did, known.sender_device_id)) {
+            tx.delete_account_meta(key)?;
+        }
+    }
+    Ok(())
+}
+
 fn record_wasm_peer_send_counter(
     tx: &(impl WasmSqlBackend + ?Sized),
     cid: &str,
@@ -492,25 +563,63 @@ fn record_wasm_peer_send_counter(
     seq: i64,
     sender_did: &str,
     sender_device_id: &str,
-    send_counter: u64,
+    send_counter: Option<u64>,
     recorded_at_ms: i64,
 ) -> Result<(), MLSError> {
-    let key = chat_wire::peer_send_counter_key(cid, generation, epoch, sender_did, sender_device_id);
-    let prior = tx
+    let epoch_u =
+        u64::try_from(epoch).map_err(|_| MLSError::Cryptography("negative sender epoch".into()))?;
+    let key =
+        chat_wire::peer_send_counter_key(cid, generation, epoch, sender_did, sender_device_id);
+    let continuity_key = peer_send_continuity_key(cid, generation, sender_did, sender_device_id);
+    let known = tx
+        .get_account_meta(&continuity_key)?
+        .as_deref()
+        .map(serde_json::from_str::<PeerCounterContinuity>)
+        .transpose()?;
+    let chain = tx
+        .get_account_meta(&send_counter_epoch_chain_key(cid, generation))?
+        .as_deref()
+        .and_then(EpochChain::decode);
+    let last = tx
         .get_account_meta(&key)?
-        .map(|raw| {
-            raw.parse::<u64>()
-                .map_err(|_| MLSError::Internal(format!("corrupt peer send counter {raw:?}")))
-        })
-        .transpose()?
-        .map(|last| PeerCounterPrior {
-            last,
-            skipped: 0,
-            same_epoch: true,
-        });
+        .as_deref()
+        .map(str::parse::<u64>)
+        .transpose()
+        .map_err(|_| MLSError::Internal("invalid stored peer send counter".into()))?;
+    let prior = select_peer_counter_prior(
+        last,
+        known.as_ref().map(|k| (k.counter, k.skipped, k.epoch)),
+        chain,
+        epoch_u,
+    );
+    let observation = |counter, skipped| PeerCounterContinuity {
+        sender_did: sender_did.to_owned(),
+        sender_device_id: sender_device_id.to_owned(),
+        epoch: epoch_u,
+        seq,
+        skipped,
+        counter,
+    };
+    let Some(send_counter) = send_counter else {
+        if let Some(prior) = prior {
+            tx.put_account_meta(
+                &continuity_key,
+                &serde_json::to_string(&observation(prior.last, prior.skipped.saturating_add(1)))?,
+                recorded_at_ms,
+            )?;
+        } else {
+            tx.delete_account_meta(&continuity_key)?;
+        }
+        return Ok(());
+    };
     let verdict = classify_peer_send_counter(prior, send_counter)?;
     if !matches!(verdict, PeerCounterVerdict::Regressed { .. }) {
         tx.put_account_meta(&key, &send_counter.to_string(), recorded_at_ms)?;
+        tx.put_account_meta(
+            &continuity_key,
+            &serde_json::to_string(&observation(send_counter, 0))?,
+            recorded_at_ms,
+        )?;
     }
     if let (true, Some(prior)) = (verdict.is_anomaly(), prior) {
         let (kind, expected) = match verdict {
@@ -1152,11 +1261,7 @@ impl WasmMlsClient {
                 proof_resp.status().as_u16()
             )));
         }
-        let bytes = proof_resp
-            .bytes()
-            .await
-            .map_err(|e| MLSError::Internal(e.to_string()))?
-            .to_vec();
+        let bytes = bounded_pds_response(proof_resp, max_bytes).await?;
         if bytes.is_empty() || bytes.len() > max_bytes {
             return Err(MLSError::Cryptography(format!(
                 "sync.getRecord(at://{did}/{collection}/{rkey}) size {} out of bounds (limit {max_bytes})",
@@ -4147,8 +4252,13 @@ impl WasmMlsClient {
         else {
             return Err(refused("reservation holds no KeyPackage"));
         };
+        let operation_secs = now_ms().max(0) as u64 / 1000;
         let validated_kp = kp_in
-            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .validate_with_lifetime_policy(
+                provider.crypto(),
+                ProtocolVersion::Mls10,
+                LeafNodeLifetimePolicy::VerifyAt(operation_secs),
+            )
             .map_err(|e| MLSError::Cryptography(format!("validate recovery KP: {e:?}")))?;
         chat_wire::require_recovery_key_package(
             &authorization,
@@ -4218,6 +4328,7 @@ impl WasmMlsClient {
         group.set_aad(commit_aad_bytes);
         let mut builder = group
             .commit_builder()
+            .leaf_node_lifetime_policy(LeafNodeLifetimePolicy::VerifyAt(operation_secs))
             .propose_removals(held)
             .propose_adds([validated_kp])
             .force_self_update(true)
@@ -4750,13 +4861,8 @@ impl WasmMlsClient {
     ) -> Vec<Vec<u8>> {
         let mut conversation_ids = vec![cid.to_owned()];
         if let Ok(db) = self.require_db_mls() {
-            if let Ok(conversations) = db.backend().list_conversations(None, 500) {
-                conversation_ids.extend(
-                    conversations
-                        .into_iter()
-                        .map(|conversation| conversation.conversation_id)
-                        .filter(|other| other != cid),
-                );
+            if let Ok(conversations) = db.backend().all_conversation_ids() {
+                conversation_ids.extend(conversations.into_iter().filter(|other| other != cid));
             }
         }
         let mut keys = Vec::new();
@@ -4830,6 +4936,38 @@ impl WasmMlsClient {
             true,
         )
         .await
+    }
+
+    /// After repository signing-key rotation, accept a historical record only when the
+    /// current key independently authenticates the exact same content-addressed record.
+    async fn reanchor_deletion_record(
+        &self,
+        historical: &[u8],
+        did: &str,
+        collection: &str,
+        device: &str,
+        document: &[u8],
+    ) -> Option<Vec<u8>> {
+        let doc = atproto_spaces::did_resolver::DidDocument::parse_json(did, document).ok()?;
+        let endpoint = doc.pds_endpoint().ok()?;
+        let key = doc.atproto_key.as_ref()?;
+        let current = self
+            .fetch_pds_record_car_wasm(
+                endpoint,
+                did,
+                collection,
+                device,
+                deletion_authority::MAX_REVOCATION_PROOF_BYTES,
+            )
+            .await
+            .ok()?;
+        let rev = catbird_mls::labyrinth::repo_proof::verify_reanchored_record(
+            historical, &current, did, collection, device, key,
+        )
+        .ok()?;
+        self.observe_pds_repo_rev_floor_wasm(did, &rev, collection)
+            .ok()?;
+        Some(current)
     }
 
     pub(crate) async fn process_account_deletion_with_persistence(
@@ -4935,13 +5073,31 @@ impl WasmMlsClient {
                         .resolve_did_document(session_token, &deleted_did)
                         .await?
                     {
-                        if let Some(key) = deletion_authority::device_key_from_key_proof(
-                            &proof,
-                            &deleted_did,
-                            &write.actor_device_id,
-                            write.signed_at_ms,
-                            &document,
-                        ) {
+                        let verify_key = |proof: &[u8]| {
+                            deletion_authority::device_key_from_key_proof(
+                                proof,
+                                &deleted_did,
+                                &write.actor_device_id,
+                                write.signed_at_ms,
+                                &document,
+                            )
+                        };
+                        let mut key = verify_key(&proof);
+                        if key.is_none() {
+                            if let Some(current) = self
+                                .reanchor_deletion_record(
+                                    &proof,
+                                    &deleted_did,
+                                    deletion_authority::DEVICE_RECORD_COLLECTION,
+                                    &write.actor_device_id,
+                                    &document,
+                                )
+                                .await
+                            {
+                                key = verify_key(&current);
+                            }
+                        }
+                        if let Some(key) = key {
                             if deletion_authority::actor_write_signature_valid(&write, &key) {
                                 verified_key = <[u8; 32]>::try_from(key.as_slice()).ok();
                             }
@@ -4997,70 +5153,93 @@ impl WasmMlsClient {
                     ))?
                     .as_deref()
                     .and_then(|raw| std::str::from_utf8(raw).ok()?.parse::<i64>().ok());
-                if let Some(applied_seq) = applied_op {
-                    if applied_seq == seq {
-                        return Ok(None);
-                    }
+                if applied_op.is_some_and(|prior_seq| prior_seq != seq) {
                     Some(UnverifiedDeletionReason::Replayed)
                 } else {
-                    let existing = db
+                    let marker = db
                         .backend()
                         .get_labyrinth_state(&chat_wire::account_deletion_key(cid, &deleted_did))?
-                        .and_then(|raw| AppliedAccountDeletion::decode(&raw));
-                    match existing {
-                        Some(marker) if marker.seq() == seq => return Ok(None),
-                        Some(_) => Some(UnverifiedDeletionReason::Replayed),
-                        None => match deletion_authority::revocation_proof_bytes(entry) {
-                            Ok(None) => Some(UnverifiedDeletionReason::RevocationStatusUnproven),
-                            Err(reason) => Some(reason),
-                            Ok(Some(rev_proof)) => {
-                                let doc_opt = match did_document_cache {
-                                    Some(doc) => Some(doc),
-                                    None => {
-                                        self.resolve_did_document(session_token, &deleted_did)
-                                            .await?
-                                    }
-                                };
-                                match doc_opt {
-                                    None => Some(UnverifiedDeletionReason::RevocationStatusUnproven),
-                                    Some(doc) => {
-                                        match deletion_authority::verify_self_deletion_revocation_proof(
-                                            &rev_proof,
+                        .as_deref()
+                        .and_then(AppliedAccountDeletion::decode);
+                    if marker
+                        .as_ref()
+                        .and_then(|m| m.operation(&write.operation_id))
+                        .is_some_and(|op| {
+                            op.seq == seq
+                                && op.signed_at_ms == write.signed_at_ms
+                                && op.actor_device_id.as_deref()
+                                    == Some(write.actor_device_id.as_str())
+                        })
+                    {
+                        return Ok(None);
+                    }
+                    match deletion_authority::revocation_proof_bytes(entry) {
+                        Ok(None) => Some(UnverifiedDeletionReason::RevocationStatusUnproven),
+                        Err(reason) => Some(reason),
+                        Ok(Some(rev_proof)) => {
+                            let doc_opt = match did_document_cache {
+                                Some(doc) => Some(doc),
+                                None => {
+                                    self.resolve_did_document(session_token, &deleted_did)
+                                        .await?
+                                }
+                            };
+                            match doc_opt {
+                                None => Some(UnverifiedDeletionReason::RevocationStatusUnproven),
+                                Some(doc) => {
+                                    let verify = |proof: &[u8]| {
+                                        deletion_authority::verify_self_deletion_revocation_proof(
+                                            proof,
                                             &deleted_did,
                                             &write,
                                             &verified_key,
                                             &doc,
-                                        ) {
-                                            Ok(()) => {
-                                                if !persist {
-                                                    return Ok(None);
-                                                }
-                                                let applied = AppliedAccountDeletion {
-                                                    seq,
-                                                    signed_at_ms: write.signed_at_ms,
-                                                    operation_id: write.operation_id.clone(),
-                                                    actor_device_id: Some(
-                                                        write.actor_device_id.clone(),
-                                                    ),
-                                                };
-                                                let applied_ok = self.apply_verified_account_deletion(
-                                                    cid,
-                                                    &deleted_did,
-                                                    &applied,
-                                                    entry,
-                                                    now_ms(),
-                                                )?;
-                                                if applied_ok {
-                                                    return Ok(None);
-                                                }
-                                                Some(UnverifiedDeletionReason::Replayed)
-                                            }
-                                            Err(reason) => Some(reason),
+                                        )
+                                    };
+                                    let mut result = verify(&rev_proof);
+                                    if result.is_err() {
+                                        if let Some(current) = self
+                                            .reanchor_deletion_record(
+                                                &rev_proof,
+                                                &deleted_did,
+                                                deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                                                &write.actor_device_id,
+                                                &doc,
+                                            )
+                                            .await
+                                        {
+                                            result = verify(&current);
                                         }
+                                    }
+                                    match result {
+                                        Ok(()) => {
+                                            if !persist {
+                                                return Ok(None);
+                                            }
+                                            let applied = AppliedAccountDeletion {
+                                                seq,
+                                                signed_at_ms: write.signed_at_ms,
+                                                operation_id: write.operation_id.clone(),
+                                                actor_device_id: Some(
+                                                    write.actor_device_id.clone(),
+                                                ),
+                                            };
+                                            let applied_ok = self.apply_verified_account_deletion(
+                                                cid,
+                                                &deleted_did,
+                                                &applied,
+                                                now_ms(),
+                                            )?;
+                                            if applied_ok {
+                                                return Ok(None);
+                                            }
+                                            Some(UnverifiedDeletionReason::Replayed)
+                                        }
+                                        Err(reason) => Some(reason),
                                     }
                                 }
                             }
-                        },
+                        }
                     }
                 }
             }
@@ -5089,7 +5268,6 @@ impl WasmMlsClient {
         cid: &str,
         deleted_did: &str,
         applied: &AppliedAccountDeletion,
-        _entry: &Value,
         ts: i64,
     ) -> Result<bool, MLSError> {
         let marker_key = chat_wire::account_deletion_key(cid, deleted_did);
@@ -5100,18 +5278,27 @@ impl WasmMlsClient {
         );
         let unverified_key =
             deletion_authority::unverified_deletion_key(cid, deleted_did, applied.seq);
-        let encoded = serde_json::to_vec(applied)
-            .map_err(|e| MLSError::Internal(format!("encode applied deletion: {e}")))?;
         self.require_db_mls()?.write_tx(|tx| {
-            let existing = tx.get_labyrinth_state(&marker_key)?;
-            let prior_op = tx.get_labyrinth_state(&op_key)?;
-            if existing.is_some() || prior_op.is_some() {
-                let already_same = existing
-                    .as_deref()
-                    .and_then(AppliedAccountDeletion::decode)
-                    .is_some_and(|m| m.seq() == applied.seq);
-                return Ok(already_same);
+            use deletion_authority::StoredAccountDeletion;
+            let existing = tx
+                .get_labyrinth_state(&marker_key)?
+                .as_deref()
+                .map(|raw| {
+                    AppliedAccountDeletion::decode(raw).ok_or_else(|| {
+                        MLSError::Cryptography("corrupt account deletion marker".into())
+                    })
+                })
+                .transpose()?;
+            let expected_seq = applied.seq.to_string();
+            if tx
+                .get_labyrinth_state(&op_key)?
+                .is_some_and(|raw| raw != expected_seq.as_bytes())
+            {
+                return Ok(false);
             }
+            let merged = StoredAccountDeletion::merge_verified(existing.as_ref(), applied.clone())
+                .map_err(MLSError::Cryptography)?;
+            let encoded = merged.encode().map_err(MLSError::Internal)?;
             tx.put_labyrinth_state(&marker_key, &encoded, ts)?;
             tx.put_labyrinth_state(&op_key, applied.seq.to_string().as_bytes(), ts)?;
             let del_meta_key = deletion_authority::verified_deleted_account_key(deleted_did);
@@ -5121,9 +5308,8 @@ impl WasmMlsClient {
                 .and_then(|raw| raw.parse::<i64>().ok())
                 .map_or(del_ms, |old| old.min(del_ms));
             tx.put_account_meta(&del_meta_key, &earliest_del_ms.to_string(), ts)?;
-            let _ = tx.delete_labyrinth_state_key(&unverified_key);
-            tx.purge_messages_from_sender_before_seq(cid, deleted_did, applied.seq)?;
-            tx.purge_labyrinth_queue_from_sender(cid, deleted_did, applied.seq)?;
+            tx.delete_labyrinth_state_key(&unverified_key)?;
+            tx.purge_covered_account_data(cid, deleted_did, &merged)?;
             Ok(true)
         })
     }
@@ -5320,19 +5506,17 @@ impl WasmMlsClient {
             if evidence.sender_did != self.account_did
                 || evidence.sender_device_id != self.device_id
             {
-                if let Some(send_counter) = evidence.send_counter {
-                    record_wasm_peer_send_counter(
-                        tx,
-                        cid,
-                        convo.generation,
-                        evidence.epoch,
-                        evidence.seq,
-                        &evidence.sender_did,
-                        &evidence.sender_device_id,
-                        send_counter,
-                        evidence.recorded_at_ms,
-                    )?;
-                }
+                record_wasm_peer_send_counter(
+                    tx,
+                    cid,
+                    convo.generation,
+                    evidence.epoch,
+                    evidence.seq,
+                    &evidence.sender_did,
+                    &evidence.sender_device_id,
+                    evidence.send_counter,
+                    evidence.recorded_at_ms,
+                )?;
             }
             if tx.get_message(&evidence.message_id)?.is_none() {
                 let is_own = evidence.sender_did == self.account_did;
@@ -5817,7 +6001,11 @@ impl WasmMlsClient {
                     return Err(refused("not for the local epoch"));
                 }
                 let processed = group
-                    .process_message(&provider, message)
+                    .process_message_with_lifetime_policy(
+                        &provider,
+                        message,
+                        LeafNodeLifetimePolicy::VerifyAt(ts.max(0) as u64 / 1000),
+                    )
                     .map_err(|e| refused(&format!("process: {e:?}")))?;
                 let actor = format!(
                     "{}#{}",
@@ -5898,6 +6086,9 @@ impl WasmMlsClient {
                         ts,
                     )?;
                 }
+            }
+            if let Some(prior) = body["prior"]["epoch"].as_u64() {
+                advance_wasm_counter_epoch(tx, cid, c.generation, prior, &group, ts)?;
             }
             c.epoch = group.epoch().as_u64() as i64;
             tx.put_account_meta(&format!("conversation_coords:{cid}"), &next.to_string(), ts)?;
@@ -6303,26 +6494,17 @@ impl WasmMlsClient {
                         if pruned.sender_did != self.account_did
                             || pruned.sender_device_id != canonical_dev_id
                         {
-                            let key = chat_wire::peer_send_counter_key(
+                            record_wasm_peer_send_counter(
+                                tx,
                                 cid,
                                 pruned.generation,
                                 pruned.epoch,
+                                entry_seq,
                                 &pruned.sender_did,
                                 &pruned.sender_device_id,
-                            );
-                            if let Some(last) = tx.get_account_meta(&key)? {
-                                let next = last
-                                    .parse::<u64>()
-                                    .ok()
-                                    .and_then(|counter| counter.checked_add(1))
-                                    .ok_or_else(|| {
-                                        MLSError::Cryptography(
-                                            "peer sendCounter exhausted at pruned entry".into(),
-                                        )
-                                    })?;
-                                chat_wire::verify_next_peer_send_counter(Some(&last), next)?;
-                                tx.put_account_meta(&key, &next.to_string(), ts)?;
-                            }
+                                None,
+                                ts,
+                            )?;
                         }
                         c.last_seq = c.last_seq.max(entry_seq);
                         c.updated_at_ms = ts;
@@ -6429,7 +6611,7 @@ impl WasmMlsClient {
                             entry_seq,
                             sender_did,
                             sender_device_id,
-                            *send_counter,
+                            Some(*send_counter),
                             ts,
                         )?;
                     }

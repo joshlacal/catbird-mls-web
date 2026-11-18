@@ -1670,8 +1670,17 @@ async fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_appl
 
 /// A v2 `accountDeletedEntry` the sequencer signs under `#mls-receipt-1`, or unsigned.
 fn account_deletion_entry(cid: &str, deleted_did: &str, seq: u64, signed: bool) -> Value {
+    account_deletion_entry_at(cid, deleted_did, seq, signed, "2026-11-07T12:00:00.000Z")
+}
+
+fn account_deletion_entry_at(
+    cid: &str,
+    deleted_did: &str,
+    seq: u64,
+    signed: bool,
+    received_at: &str,
+) -> Value {
     let entry_id = uuid::Uuid::new_v4().to_string();
-    let received_at = "2026-11-07T12:00:00.000Z";
     let mut entry = json!({
         "$type": "blue.catbird.chat.defs#accountDeletedEntry",
         "conversationId": cid, "deletedDid": deleted_did, "entryId": entry_id,
@@ -1706,6 +1715,117 @@ fn account_deletion_entry(cid: &str, deleted_did: &str, seq: u64, signed: bool) 
         });
     }
     entry
+}
+
+/// A complete account deletion signed by the enrolled device, its PDS, and the sequencer.
+fn authorized_deletion_entry(cid: &str, did: &str, device: &str, seq: u64) -> Value {
+    use openmls_traits::signatures::Signer as _;
+    let key = device_signer(&account_db(did));
+    let op = uuid::Uuid::new_v4().simple().to_string();
+    let instant = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut entry = account_deletion_entry_at(cid, did, seq, true, &instant);
+    let body = serde_json::to_vec(&json!({
+        "operationId": op, "actorDeviceId": device,
+        "endpointNsid": "blue.catbird.labyrinth.deleteAccountData",
+        "payloadSha256": hex::encode(Sha256::digest(b"{}")), "signedAt": instant,
+    }))
+    .unwrap();
+    let signature = key
+        .sign(&[deletion_authority::WRITE_DOMAIN, &body].concat())
+        .unwrap();
+    entry["actorWrite"] = json!({
+        "writeBody": STANDARD.encode(&body), "payloadBytes": STANDARD.encode(b"{}"),
+        "signature": STANDARD.encode(signature)
+    });
+    let enrollment =
+        chat_wire::build_pds_device_put_record_body_at(did, device, key.public(), &instant)
+            .unwrap();
+    let revocation = chat_wire::build_pds_device_revocation_create_record_body_at(
+        did,
+        device,
+        device,
+        &instant,
+        &key,
+        Some(&format!("deleteAccountData:{op}")),
+    )
+    .unwrap();
+    for (field, record) in [("keyProof", enrollment), ("revocationProof", revocation)] {
+        let write: Value = serde_json::from_slice(&record).unwrap();
+        entry[field] = json!(pds_repo_op(
+            "car".into(),
+            did.into(),
+            write["collection"].as_str().unwrap().into(),
+            device.into(),
+            write["record"].to_string()
+        ));
+    }
+    entry
+}
+
+#[wasm_bindgen_test]
+async fn verified_deletions_purge_across_an_unreadable_gap_without_acknowledging_it() {
+    let _restore = install_ds();
+    let (alice, bob, carol) = (did("gapalice"), did("gapbob"), did("gapcarol"));
+    let cid = "00000000-0000-4000-8000-0000000c0061";
+    let mut clients = group(
+        &[
+            (&alice, ALICE_DEVICE),
+            (&bob, BOB_DEVICE),
+            (&carol, CAROL_DEVICE),
+        ],
+        cid,
+    )
+    .await
+    .into_iter();
+    let (reader, bob_client, carol_client) = (
+        clients.next().unwrap(),
+        clients.next().unwrap(),
+        clients.next().unwrap(),
+    );
+    send(&bob_client, cid, 1, "Bob's old message")
+        .await
+        .unwrap();
+    send(&carol_client, cid, 2, "Carol's old message")
+        .await
+        .unwrap();
+    send(&reader, cid, 3, "surviving message").await.unwrap();
+    reader.sync().await.unwrap();
+    assert_eq!(conversation_row(&reader, cid).last_seq, 4);
+    let ack = ackedUpTo(cid, ALICE_DEVICE);
+    drop((reader, bob_client, carol_client));
+    let coordinates = stored_coords(&alice, cid);
+    // The home can no longer serve entries 5–6. An insufficient deletion for
+    // Alice precedes two independently authorized erasures for the other members.
+    for entry in [
+        account_deletion_entry(cid, &alice, 7, true),
+        authorized_deletion_entry(cid, &bob, BOB_DEVICE, 8),
+        authorized_deletion_entry(cid, &carol, CAROL_DEVICE, 9),
+    ] {
+        setEntry(cid, &entry.to_string());
+    }
+    let reader = open(&alice, ALICE_DEVICE).await;
+    for _ in 0..2 {
+        let error = reader
+            .sync()
+            .await
+            .expect_err("ordered delivery must still report the gap")
+            .as_string()
+            .unwrap_or_default();
+        assert!(error.contains("non-contiguous"), "{error}");
+        assert_eq!(conversation_row(&reader, cid).last_seq, 4);
+        assert_eq!(ackedUpTo(cid, ALICE_DEVICE), ack);
+        assert_eq!(
+            timeline(&reader, cid),
+            timeline_of(&[(4, "surviving message")])
+        );
+    }
+    drop(reader);
+    assert_eq!(stored_coords(&alice, cid), coordinates);
+    let reopened = open(&alice, ALICE_DEVICE).await;
+    assert_eq!(
+        timeline(&reopened, cid),
+        timeline_of(&[(4, "surviving message")])
+    );
 }
 
 /// Labyrinth archive is paused, so sync's queue flush leaves every queued row in place.

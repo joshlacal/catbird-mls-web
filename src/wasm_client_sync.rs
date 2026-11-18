@@ -6222,6 +6222,38 @@ impl WasmMlsClient {
             if page_entries.is_empty() {
                 break;
             }
+            if page_entries.len() > 100 {
+                return Err(MLSError::Cryptography(
+                    "getEntries exceeded the requested page limit".into(),
+                ));
+            }
+            // A behind device can receive a genuine erasure even when its intervening
+            // entries are unavailable. Apply that independent proof before another
+            // page, an unrelated key lookup, or ordered MLS processing can fail.
+            // Only the ordered pass below advances the local cursor or acknowledges.
+            let mut deletions: Vec<_> = page_entries
+                .iter()
+                .filter(|entry| entry["$type"].as_str() == Some(ACCOUNT_DELETED_ENTRY_KIND))
+                .filter_map(|entry| {
+                    let seq = entry["seq"].as_i64().filter(|seq| *seq > 0)?;
+                    Some((seq, entry))
+                })
+                .collect();
+            deletions.sort_by_key(|(seq, _)| *seq);
+            for (seq, entry) in deletions {
+                if let Err(error) = self
+                    .process_account_deletion_impl(
+                        session_token,
+                        cid,
+                        &convo.sequencer_did,
+                        entry,
+                        seq,
+                    )
+                    .await
+                {
+                    tracing::warn!(cid, seq, %error, "standalone deletion verification deferred");
+                }
+            }
             let page_max_seq = page_entries
                 .iter()
                 .filter_map(|e| e.get("seq").and_then(|s| s.as_i64()))

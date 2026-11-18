@@ -1,5 +1,5 @@
 {
-  "coreRevision": "bc2762a004219fa562d5d9b9077f90a949931af9",
+  "coreRevision": "53d02fc296f7d5c20930802ed9f2d0363d8c5d8c",
   "artifacts": [
     {
       "target": "src/generated/blue.catbird.chat.defs.json",
@@ -23,12 +23,12 @@
     }
   ],
   "wasmPackage": {
-    "coreRevision": "bc2762a004219fa562d5d9b9077f90a949931af9",
+    "coreRevision": "53d02fc296f7d5c20930802ed9f2d0363d8c5d8c",
     "labyrinthRevision": "182e76d00d66f7a1b72bbc4248438bd68e25a2fa",
     "catbirdAtprotoRevision": "e3356fd4f3349de1d647e3558964d08449c03b13",
     "build": "./build.sh using wasm-pack 0.14.0 and bundled wasm-opt, rustc 1.99.1 (58cf8f9c3), cargo 1.99.1 (5f94df478), offline release build for wasm32-unknown-unknown",
     "files": {
-      "catbird_mls_web_bg.wasm": "45af9f7800f7039b001500f94caca89aa6fb6ff80751de702aee89791fd70232",
+      "catbird_mls_web_bg.wasm": "6a2e20ceb0bcfd7c915921d7327f0c3072c43a033acfa55c2adc44698cca5484",
       "catbird_mls_web.js": "c559ce47d9431937ae2f75650c953b7d7fd1466d53a624461c8b4fca91c5bda2",
       "catbird_mls_web.d.ts": "5e939296f32e0f148b2d273c1e4c449904d5a9a283f38855f5c8c09d92f34f4f",
       "catbird_mls_web_bg.wasm.d.ts": "e798cabf901f4f40fe61c97da8cdda88eae5811c5fa55531f45d9346f6fea4a8"

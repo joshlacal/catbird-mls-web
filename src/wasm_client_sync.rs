@@ -192,6 +192,7 @@ fn state_view_sequencer_did(state: &Value) -> Option<&str> {
 fn stage_welcome<P: OpenMlsProvider>(
     provider: &P,
     welcome: &[u8],
+    operation_secs: u64,
 ) -> Result<(StagedWelcome, Option<Vec<u8>>), MLSError> {
     let MlsMessageBodyIn::Welcome(welcome) = MlsMessageIn::tls_deserialize_exact(welcome)
         .map_err(|e| MLSError::Cryptography(format!("deserialize Welcome: {e:?}")))?
@@ -199,18 +200,15 @@ fn stage_welcome<P: OpenMlsProvider>(
     else {
         return Err(MLSError::Cryptography("not a Welcome".into()));
     };
-    let builder = StagedWelcome::build_from_welcome(provider, &build_join_config(), welcome)
-        .map_err(|e| MLSError::Cryptography(format!("stage Welcome: {e:?}")))?;
-    let attestation = builder
-        .processed_welcome()
-        .unverified_group_info()
-        .extensions()
-        .unknown(chat_wire::ROSTER_ATTESTATION_EXTENSION_TYPE)
-        .map(|extension| extension.0.clone());
-    let staged = builder
-        .build()
-        .map_err(|e| MLSError::Cryptography(format!("stage Welcome: {e:?}")))?;
-    Ok((staged, attestation))
+    catbird_mls::sim_hooks::build_staged_welcome_with_extension_at(
+        provider,
+        &build_join_config(),
+        welcome,
+        None,
+        operation_secs,
+        Some(chat_wire::ROSTER_ATTESTATION_EXTENSION_TYPE),
+    )
+    .map_err(|e| MLSError::Cryptography(format!("stage Welcome: {e:?}")))
 }
 
 fn require_browser_welcome_receipt_inputs(
@@ -2378,6 +2376,13 @@ impl WasmMlsClient {
             }
             let staged: QueuedLabyrinthArchivePayload = serde_json::from_str(&staged_str)
                 .map_err(|e| MLSError::Internal(format!("parse c33_pending_opening: {e}")))?;
+            if let Some(marker) = tx.applied_deletion_marker(conversation_id, &staged.sender_did)? {
+                let (seq, issued) = crate::sqlite_conn::archive_frame_position(&staged)?;
+                if marker.covers(seq, Some(issued)) {
+                    tx.purge_covered_account_data(conversation_id, &staged.sender_did, &marker)?;
+                    return Ok(false);
+                }
+            }
             wasm_archive_policy::enqueue(tx, &staged)?;
             tx.put_account_meta(&key, "archived", ts)?;
             let mut reqs = tx.list_requests(None)?;
@@ -3026,6 +3031,7 @@ impl WasmMlsClient {
         signer: &SignatureKeyPair,
         cid: &str,
     ) -> Result<bool, MLSError> {
+        let ts = now_ms();
         let entries_val = self
             .ds_signed_get(
                 session_token,
@@ -3313,7 +3319,6 @@ impl WasmMlsClient {
         catbird_mls::direct_request_shared_crypto::validate_request_welcome_receipt(
             &welcome_input,
         )?;
-        let ts = now_ms();
         let pub_norm_str = String::from_utf8(pub_norm_bytes)
             .map_err(|e| MLSError::Internal(format!("C33 pub UTF-8: {e}")))?;
         let coords_canon = chat_wire::canonicalize_wire_coordinate(&vp["next"], Some(cid))?;
@@ -3335,8 +3340,10 @@ impl WasmMlsClient {
                 ));
             };
             let staged =
-                StagedWelcome::new_from_welcome(&provider, &build_join_config(), welcome, None)
-                    .map_err(|e| MLSError::Cryptography(format!("stage C33 Welcome: {e:?}")))?;
+                catbird_mls::sim_hooks::build_staged_welcome_at(
+                    &provider, &build_join_config(), welcome, None, ts.max(0) as u64 / 1000,
+                )
+                .map_err(|e| MLSError::Cryptography(format!("stage C33 Welcome: {e:?}")))?;
             let sender_member = staged
                 .welcome_sender()
                 .map_err(|e| MLSError::Cryptography(format!("welcome_sender: {e:?}")))?;
@@ -3391,6 +3398,11 @@ impl WasmMlsClient {
             tx.put_account_meta(
                 &format!("metadata_snapshot_json:{cid}"),
                 &metadata_snapshot_str,
+                ts,
+            )?;
+            tx.put_labyrinth_state(
+                &format!("c33_opening_receipt:{cid}:{first_message_id}"),
+                dr_rcpt_json.as_bytes(),
                 ts,
             )?;
             tx.upsert_request(&RequestRow {
@@ -3466,6 +3478,9 @@ impl WasmMlsClient {
                         .map_err(|e| MLSError::Internal(e.to_string()))?,
                     ts,
                 )?;
+            }
+            if let Some(marker) = tx.applied_deletion_marker(cid, sender_did)? {
+                tx.purge_covered_account_data(cid, sender_did, &marker)?;
             }
             Ok(())
         })?;
@@ -3827,6 +3842,8 @@ impl WasmMlsClient {
         sequencer_did: &str,
         retired: Option<&ConversationRow>,
     ) -> Result<Value, MLSError> {
+        let ts = now_ms();
+        let operation_secs = ts.max(0) as u64 / 1000;
         let refused = |what: &str| MLSError::Cryptography(format!("recovery Welcome: {what}"));
         let after = transition_seq.saturating_sub(1).to_string();
         let page = self
@@ -3866,7 +3883,7 @@ impl WasmMlsClient {
         let (fulfiller_key, attestation, leaf_dids) = {
             let overlay = KvWriteOverlay::new(db.backend());
             let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
-            let (staged, attestation) = stage_welcome(&provider, welcome_bytes)?;
+            let (staged, attestation) = stage_welcome(&provider, welcome_bytes, operation_secs)?;
             let mut fulfiller_key = None;
             let mut leaf_dids = Vec::new();
             for member in staged.members() {
@@ -3959,10 +3976,9 @@ impl WasmMlsClient {
             &request_digest,
         )
         .await?;
-        let ts = now_ms();
         db.write_tx(|tx| {
             let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(tx))?;
-            let (staged, _) = stage_welcome(&provider, welcome_bytes)?;
+            let (staged, _) = stage_welcome(&provider, welcome_bytes, operation_secs)?;
             let sender = staged
                 .welcome_sender()
                 .map_err(|e| MLSError::Cryptography(format!("welcome_sender: {e:?}")))?;
@@ -5344,7 +5360,8 @@ impl WasmMlsClient {
                         "cached message has no retained authenticated archive frame".into(),
                     )
                 })?;
-            let evidence: QueuedLabyrinthArchivePayload = serde_json::from_slice(&raw)
+            // Live ingestion and history reindex both retain these authenticated fields.
+            let evidence: crate::wasm_archive::WasmArchiveEvidence = serde_json::from_slice(&raw)
                 .map_err(|e| MLSError::Cryptography(format!("cached archive evidence: {e}")))?;
             let prior_receipt = evidence.sequencer_receipt_json.as_deref().ok_or_else(|| {
                 MLSError::Cryptography("cached message has no verified I13 receipt".into())
@@ -5394,7 +5411,12 @@ impl WasmMlsClient {
             if evidence.message_id != message_id
                 || evidence.conversation_id != cid
                 // An imported or replaced row never inherits another frame's receipt.
-                || evidence.plaintext_json != message.plaintext_json
+                || !evidence.plaintext_json.as_ref().map_or_else(
+                    || chat_wire::archive_frame_matches_local_plaintext(&message.plaintext_json, &evidence.labyrinth_frame_json),
+                    |verified_display| *verified_display == message.plaintext_json,
+                )
+                || message.epoch != i64::try_from(prior.epoch).unwrap_or(-1)
+                || message.seq != entry_seq
                 || message.conversation_id != cid
                 || message.group_id != convo.group_id
                 || attestation.sender_did != message.sender_did
@@ -5407,9 +5429,14 @@ impl WasmMlsClient {
                     "I13: cached archive proof binding mismatch".into(),
                 ));
             }
-            let mut policy_evidence = evidence.clone();
-            policy_evidence.seq = entry_seq;
-            wasm_archive_policy::observe_frame(tx, &policy_evidence)?;
+            wasm_archive_policy::observe_verified_frame(
+                tx, cid, entry_seq, &evidence.labyrinth_frame_json, evidence.created_at_ms,
+            )?;
+            if let Some(marker) = tx.applied_deletion_marker(cid, &message.sender_did)? {
+                if marker.covers(entry_seq, Some(prior.issued_at_ms)) {
+                    tx.purge_covered_account_data(cid, &message.sender_did, &marker)?;
+                }
+            }
             convo.last_seq = convo.last_seq.max(entry_seq);
             convo.updated_at_ms = ts;
             tx.upsert_conversation(&convo)
@@ -6773,6 +6800,14 @@ impl WasmMlsClient {
                         created_at_ms: ts,
                     };
 
+                    // An archive restore can verify deletions before the live cursor
+                    // catches up. Process the ratchet and policy without reintroducing plaintext.
+                    if tx.archive_frame_covered(&archive)? {
+                        wasm_archive_policy::observe_frame(tx, &archive)?;
+                        c.last_seq = c.last_seq.max(entry_seq);
+                        c.updated_at_ms = ts;
+                        return tx.upsert_conversation(&c);
+                    }
                     tx.insert_message(&MessageRow {
                         message_id: msg_id.to_string(),
                         conversation_id: cid.to_string(),
@@ -7019,8 +7054,63 @@ impl WasmMlsClient {
 
 #[cfg(test)]
 mod tests {
-    use super::require_browser_welcome_receipt_inputs;
+    use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn welcome_uses_captured_time_across_leaf_expiry() {
+        use openmls_libcrux_crypto::Provider;
+        let suite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+        let now = now_ms() as u64 / 1000;
+        let expiry = now + 3600;
+        for operation_secs in [expiry - 1, expiry + 1] {
+            let alice = Provider::new().unwrap();
+            let bob = Provider::new().unwrap();
+            let signer = |provider: &Provider| {
+                let pair = SignatureKeyPair::new(suite.signature_algorithm()).unwrap();
+                pair.store(provider.storage()).unwrap();
+                pair
+            };
+            let credential = |name: &[u8], key: &SignatureKeyPair| CredentialWithKey {
+                credential: BasicCredential::new(name.to_vec()).into(),
+                signature_key: key.public().into(),
+            };
+            let alice_key = signer(&alice);
+            let bob_key = signer(&bob);
+            let config = MlsGroupCreateConfig::builder()
+                .ciphersuite(suite)
+                .lifetime(Lifetime::init(now - 60, now + 86_400))
+                .use_ratchet_tree_extension(true)
+                .build();
+            let mut group = MlsGroup::new(
+                &alice,
+                &alice_key,
+                &config,
+                credential(b"alice", &alice_key),
+            )
+            .unwrap();
+            let package = KeyPackage::builder()
+                .key_package_lifetime(Lifetime::init(now - 60, expiry))
+                .leaf_node_capabilities(Capabilities::builder().ciphersuites(vec![suite]).build())
+                .build(suite, &bob, &bob_key, credential(b"bob", &bob_key))
+                .unwrap();
+            let (_, welcome, _) = group
+                .add_members(&alice, &alice_key, &[package.key_package().clone()])
+                .unwrap();
+            let staged = stage_welcome(
+                &bob,
+                &welcome.tls_serialize_detached().unwrap(),
+                operation_secs,
+            );
+            if operation_secs < expiry {
+                staged.unwrap().0.into_group(&bob).unwrap();
+            } else {
+                assert!(
+                    matches!(staged, Err(MLSError::Cryptography(message)) if message.contains("Expired"))
+                );
+            }
+        }
+    }
 
     #[wasm_bindgen_test]
     fn browser_welcome_requires_verified_receipt_inputs() {

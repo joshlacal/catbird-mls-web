@@ -1841,6 +1841,47 @@ async fn a_pruned_entry_moves_the_cursor_only_under_its_verified_receipt() {
     assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
 }
 
+#[wasm_bindgen_test]
+async fn live_catchup_after_archive_deletion_advances_without_plaintext() {
+    use deletion_authority::{AppliedAccountDeletion, StoredAccountDeletion};
+    let _restore = install_ds();
+    let (alice, bob) = (did("latealice"), did("latebob"));
+    let cid = "00000000-0000-4000-8000-00000000ea03";
+    let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
+    send(&bob_client, cid, 1, "old message").await.unwrap();
+    drop(alice_client);
+    let receipt = entry_at(cid, 2)["sequencerReceipt"].clone();
+    let issued_at_ms = receipt["issuedAtMs"].as_i64().unwrap();
+    let marker = StoredAccountDeletion::Signed(AppliedAccountDeletion {
+        seq: 3,
+        signed_at_ms: issued_at_ms,
+        operation_id: "verified-by-archive".into(),
+        actor_device_id: Some(BOB_DEVICE.into()),
+    });
+    account_db(&alice)
+        .write_tx(|tx| {
+            tx.put_labyrinth_state(
+                &chat_wire::account_deletion_key(cid, &bob),
+                &marker.encode().unwrap(),
+                issued_at_ms,
+            )
+        })
+        .unwrap();
+    let alice_client = open(&alice, ALICE_DEVICE).await;
+    alice_client.sync().await.unwrap();
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+    assert!(timeline(&alice_client, cid).is_empty());
+    drop(alice_client);
+    let db = account_db(&alice);
+    let key = format!("native.message:{cid}:{}", message_id(1));
+    assert!(db.backend().get_labyrinth_state(&key).unwrap().is_none());
+    assert!(db
+        .backend()
+        .list_labyrinth_queue(Some(cid), 10)
+        .unwrap()
+        .is_empty());
+}
+
 /// A stored message re-presented under another seq must prove that seq with its own receipt
 /// against the retained evidence. Fail-before: any stored message id moved the cursor
 /// unverified.
@@ -1851,6 +1892,35 @@ async fn a_stored_message_replayed_at_another_seq_never_moves_the_cursor() {
     let cid = "00000000-0000-4000-8000-0000000c0008";
     let (alice_client, bob_client) = conversation(&alice, &bob, cid).await;
     send(&bob_client, cid, 1, "once").await.unwrap();
+    alice_client.sync().await.unwrap();
+    assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
+    // A fresh device may reindex its archive before its live cursor catches up. The
+    // smaller historical evidence still binds to the same genuine live receipt.
+    drop(alice_client);
+    account_db(&alice)
+        .write_tx(|tx| {
+            let key = format!("native.message:{cid}:{}", message_id(1));
+            let mut evidence: Value =
+                serde_json::from_slice(&tx.get_labyrinth_state(&key)?.unwrap())?;
+            evidence.as_object_mut().unwrap().retain(|field, _| {
+                matches!(
+                    field.as_str(),
+                    "message_id"
+                        | "conversation_id"
+                        | "labyrinth_frame_json"
+                        | "frame_nonce_b64"
+                        | "sequencer_receipt_json"
+                        | "original_sender_attestation_json"
+                        | "created_at_ms"
+                )
+            });
+            tx.put_labyrinth_state(&key, &serde_json::to_vec(&evidence)?, 0)?;
+            let mut convo = tx.get_conversation(cid)?.unwrap();
+            convo.last_seq = 1;
+            tx.upsert_conversation(&convo)
+        })
+        .unwrap();
+    let alice_client = open(&alice, ALICE_DEVICE).await;
     alice_client.sync().await.unwrap();
     assert_eq!(conversation_row(&alice_client, cid).last_seq, 2);
     assert_eq!(replayEntry(cid, 2), 3);

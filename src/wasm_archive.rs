@@ -954,14 +954,16 @@ fn stored_transport_mek(raw: &[u8], space: &str, transport_pub: [u8; 32]) -> Opt
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct WasmArchiveEvidence {
-    message_id: String,
-    conversation_id: String,
-    labyrinth_frame_json: String,
-    frame_nonce_b64: Option<String>,
-    sequencer_receipt_json: Option<String>,
-    original_sender_attestation_json: Option<String>,
-    created_at_ms: i64,
+pub(crate) struct WasmArchiveEvidence {
+    pub(crate) message_id: String,
+    pub(crate) conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plaintext_json: Option<String>,
+    pub(crate) labyrinth_frame_json: String,
+    pub(crate) frame_nonce_b64: Option<String>,
+    pub(crate) sequencer_receipt_json: Option<String>,
+    pub(crate) original_sender_attestation_json: Option<String>,
+    pub(crate) created_at_ms: i64,
 }
 
 type WasmRestoreCopy = (
@@ -1036,6 +1038,7 @@ fn wasm_restore_copies(
         let evidence = WasmArchiveEvidence {
             message_id: row.message_id.clone(),
             conversation_id: conversation_id.into(),
+            plaintext_json: None,
             labyrinth_frame_json: row.plaintext_json.clone(),
             frame_nonce_b64: Some(STANDARD.encode(nonce)),
             sequencer_receipt_json: Some(
@@ -1074,6 +1077,7 @@ fn select_wasm_restore_copy<'a>(
     };
     let mut matching = copies.iter().filter(|(row, _, _)| {
         local.conversation_id == row.conversation_id
+            && local.group_id == row.group_id
             && local.seq == row.seq
             && local.epoch == row.epoch
             && local.sender_did == row.sender_did
@@ -2561,41 +2565,60 @@ impl WasmMlsClient {
             for group in copies.values() {
                 let message_id = &group[0].0.message_id;
                 let local = tx.get_message(message_id)?;
-                let has_local_evidence = tx
-                    .get_labyrinth_state(&format!("native.message:{conversation_id}:{message_id}"))?
-                    .is_some();
+                let evidence = tx.get_labyrinth_state(
+                    &format!("native.message:{conversation_id}:{message_id}"),
+                )?;
                 let gap_key = chat_wire::undecryptable_evidence_key(conversation_id, message_id);
                 let gap = local.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
-                let effective_local = if has_local_evidence {
-                    local.as_ref()
-                } else {
-                    None
-                };
-                if let Some(copy) = select_wasm_restore_copy(group, effective_local, gap) {
+                let local_anchor = local.as_ref().filter(|_| evidence.is_some() || gap);
+                let mut selected = select_wasm_restore_copy(group, local_anchor, gap);
+                if selected.is_none() {
+                    // Older reindexers could persist valid evidence next to stale display
+                    // attribution. Bind that exact verified receipt to a fresh archive copy.
+                    let receipt = evidence.as_deref()
+                        .map(serde_json::from_slice::<WasmArchiveEvidence>).transpose()?
+                        .and_then(|e| e.sequencer_receipt_json)
+                        .as_deref().map(serde_json::from_str::<chat_wire::StoredArchivedReceipt>)
+                        .transpose()?;
+                    if let Some(receipt) = receipt {
+                        selected = group.iter().find(|(row, _, archived)| {
+                            *archived == receipt && local.as_ref().is_some_and(|display| {
+                                chat_wire::archive_frame_matches_local_plaintext(
+                                    &display.plaintext_json, &row.plaintext_json,
+                                )
+                            })
+                        });
+                    }
+                }
+                if let Some(copy) = selected {
                     chosen_by_id.insert(message_id.clone(), copy);
                 }
             }
-            let existing_rows = tx.list_messages(conversation_id, None, 100_000)?;
-            for existing in &existing_rows {
-                let ev_key = format!("native.message:{conversation_id}:{}", existing.message_id);
-                if tx.get_labyrinth_state(&ev_key)?.is_some() {
-                    continue;
-                }
-                let matches_verified =
-                    chosen_by_id
-                        .get(&existing.message_id)
-                        .is_some_and(|(row, _, _)| {
-                            row.seq == existing.seq
-                                && row.sender_did == existing.sender_did
-                                && chat_wire::archive_frame_matches_local_plaintext(
-                                    &existing.plaintext_json,
-                                    &row.plaintext_json,
-                                )
-                        });
-                if !matches_verified {
-                    tx.delete_message(conversation_id, &existing.message_id)?;
-                }
-            }
+            // Preserve authenticated gap placeholders. Check old
+            // archive evidence against display attribution even when the remote copy expired.
+            tx.exec_with_text_params(
+                "WITH local AS (
+                    SELECT m.message_id AS mid, m.seq, m.epoch, m.sender_did, m.sender_device_id,
+                        m.is_own, hex(m.group_id) AS gid, e.state_key AS evidence,
+                        json_extract(CAST(e.value_bytes AS TEXT), '$.sequencer_receipt_json') AS r
+                    FROM messages m LEFT JOIN labyrinth_state e
+                        ON e.state_key = 'native.message:' || ?1 || ':' || m.message_id
+                    WHERE m.conversation_id = ?1
+                 )
+                 DELETE FROM messages WHERE conversation_id = ?1 AND message_id IN (
+                    SELECT mid FROM local WHERE (
+                      evidence IS NULL AND NOT EXISTS (SELECT 1 FROM labyrinth_state
+                        WHERE state_key IN ('native.undecryptable:' || ?1 || ':' || mid,
+                                            'native.unavailable:' || ?1 || ':' || mid))
+                    ) OR (r IS NOT NULL AND (
+                      seq != json_extract(r, '$.seq') OR epoch != json_extract(r, '$.epoch')
+                      OR sender_did || '#' || sender_device_id != json_extract(r, '$.sender_device_did_url')
+                      OR is_own != (sender_did = ?2) OR gid != (
+                        SELECT group_concat(printf('%02X', value), '') FROM json_each(r, '$.group_id'))
+                    ))
+                 )",
+                &[(1, conversation_id), (2, &self.account_did)],
+            ).map_err(|e| MLSError::Internal(e.to_string()))?;
             let mut count = 0u32;
             for (row, evidence, _) in chosen_by_id.into_values() {
                 let existing = tx.get_message(&row.message_id)?;
@@ -3831,6 +3854,11 @@ impl WasmMlsClient {
 
         let mut flushed = 0;
         for (item_id, payload) in items {
+            // A concurrent sync may have erased this item while recipient keys were fetched.
+            if db.backend().archive_frame_covered(payload)? {
+                db.write_tx(|tx| tx.dequeue_labyrinth_item(item_id))?;
+                continue;
+            }
             let (batch_space, body) = chat_wire::build_space_apply_writes_for_queue_payload(
                 payload,
                 &mek,

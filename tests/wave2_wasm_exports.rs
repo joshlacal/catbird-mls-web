@@ -3010,18 +3010,29 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
             SqliteConn::open(&db_path_for(&alice, alice_dev), &"ab".repeat(32)).unwrap(),
         ));
         db.write_tx(|tx| {
-            tx.delete_message(cid, img_mid)?;
-            tx.delete_message(cid, voice_mid)?;
-            let _ = tx.delete_labyrinth_state_key(&format!("native.message:{cid}:{img_mid}"));
-            let _ = tx.delete_labyrinth_state_key(&format!("native.message:{cid}:{voice_mid}"));
+            let mut legacy = tx.get_message(img_mid)?.unwrap();
+            legacy.sender_device_id = "legacy-device".into();
+            legacy.group_id = vec![1, 2, 3];
+            legacy.epoch += 1;
+            tx.insert_message(&legacy)?;
+            // One old row already received genuine archive evidence on a prior reindex.
+            // The other has identical content but no independent local evidence.
+            let mut voice = tx.get_message(voice_mid)?.unwrap();
+            voice.sender_device_id = "stale-voice-device".into();
+            tx.insert_message(&voice)?;
+            tx.delete_labyrinth_state_key(&format!("native.message:{cid}:{voice_mid}"))?;
+            // Many legacy rows can share sequence numbers. The old one-shot limit left
+            // unverified history visible outside the first 100,000 rows.
+            tx.exec_with_text_params(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100001)
+                 INSERT INTO messages(message_id, conversation_id, group_id, epoch, seq, sender_did,
+                     sender_device_id, plaintext_json, created_at_ms, is_own)
+                 SELECT 'old-' || i, ?1, X'00', 1, 0, ?2, 'legacy-device', '{}', 0, 0 FROM n",
+                &[(1, cid), (2, &alice)],
+            ).map_err(|e| catbird_mls::MLSError::Internal(e.to_string()))?;
             Ok(())
         })
         .unwrap();
-        assert!(db
-            .backend()
-            .list_messages(cid, None, 10)
-            .unwrap()
-            .is_empty());
     }
 
     let alice_client = open_client(&alice, alice_dev).await;
@@ -3030,6 +3041,16 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
         .await
         .unwrap();
     assert_eq!(reindexed, 2);
+    let repaired: Vec<MessageRow> =
+        serde_wasm_bindgen::from_value(alice_client.list_messages(cid.into(), None, 10).unwrap())
+            .unwrap();
+    assert_eq!(repaired.len(), 2);
+    let image = repaired.iter().find(|row| row.message_id == img_mid).unwrap();
+    assert_eq!(image.sender_device_id, img_row.sender_device_id);
+    assert_eq!(image.group_id, img_row.group_id);
+    assert_eq!(image.epoch, img_row.epoch);
+    let voice = repaired.iter().find(|row| row.message_id == voice_mid).unwrap();
+    assert_eq!(voice.sender_device_id, voice_row.sender_device_id);
     WORLD.with(|c| {
         let mut world = c.borrow_mut();
         assert!(world.calls["com.atproto.sync.getBlocks"] >= 2);

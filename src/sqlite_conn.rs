@@ -71,6 +71,29 @@ thread_local! {
     static OPFS_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Use the signed archive time when available. Older queued records may lack a receipt.
+pub(crate) fn archive_frame_position(
+    frame: &catbird_mls::client::QueuedLabyrinthArchivePayload,
+) -> Result<(i64, i64), catbird_mls::MLSError> {
+    use catbird_mls::client::chat_wire::StoredArchivedReceipt;
+    use catbird_mls::MLSError;
+
+    let Some(raw) = frame.sequencer_receipt_json.as_deref() else {
+        return Ok((frame.seq, frame.created_at_ms));
+    };
+    let receipt: StoredArchivedReceipt = serde_json::from_str(raw)?;
+    if receipt.conversation_id != frame.conversation_id
+        || receipt.seq != frame.seq as u64
+        || receipt.sender_device_did_url
+            != format!("{}#{}", frame.sender_did, frame.sender_device_id)
+    {
+        return Err(MLSError::Cryptography(
+            "inconsistent stored archive receipt".into(),
+        ));
+    }
+    Ok((frame.seq, receipt.issued_at_ms))
+}
+
 /// Origin-wide exclusive owner of the persistent SAH pool. The pool itself does
 /// not exclude other Workers or tabs: on a cold directory each context creates
 /// its own backing files for the same database name (split brain). The Web Lock
@@ -1462,7 +1485,7 @@ impl SqliteConn {
         use catbird_mls::client::deletion_authority::AppliedAccountDeletion;
         use catbird_mls::storage::driver_wasm::WasmSqlBackend;
         use catbird_mls::MLSError;
-        const DONE: &str = "browser.deletion_evidence_scrub_v1";
+        const DONE: &str = "browser.deletion_evidence_scrub_v2";
         if self.get_account_meta(DONE)?.as_deref() == Some("1") {
             return Ok(());
         }
@@ -1498,6 +1521,127 @@ impl SqliteConn {
         .map_err(map_wasm_mls_err)
     }
 
+    /// Intake and acceptance both run under the same write transaction as the erasure.
+    pub(crate) fn applied_deletion_marker(
+        &self,
+        cid: &str,
+        did: &str,
+    ) -> Result<
+        Option<catbird_mls::client::deletion_authority::StoredAccountDeletion>,
+        catbird_mls::MLSError,
+    > {
+        use catbird_mls::client::{chat_wire, deletion_authority::AppliedAccountDeletion};
+        use catbird_mls::storage::driver_wasm::WasmSqlBackend;
+
+        self.get_labyrinth_state(&chat_wire::account_deletion_key(cid, did))?
+            .as_deref()
+            .map(|raw| {
+                AppliedAccountDeletion::decode(raw).ok_or_else(|| {
+                    catbird_mls::MLSError::Cryptography("corrupt account deletion marker".into())
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn archive_frame_covered(
+        &self,
+        frame: &catbird_mls::client::QueuedLabyrinthArchivePayload,
+    ) -> Result<bool, catbird_mls::MLSError> {
+        let Some(marker) =
+            self.applied_deletion_marker(&frame.conversation_id, &frame.sender_did)?
+        else {
+            return Ok(false);
+        };
+        let (seq, issued) = archive_frame_position(frame)?;
+        Ok(marker.covers(seq, Some(issued)))
+    }
+
+    fn scrub_direct_request_openings(
+        &self,
+        cid: &str,
+        did: &str,
+        marker: &catbird_mls::client::deletion_authority::StoredAccountDeletion,
+    ) -> Result<(), catbird_mls::MLSError> {
+        use catbird_mls::client::QueuedLabyrinthArchivePayload;
+        use catbird_mls::storage::driver_wasm::WasmSqlBackend;
+        use catbird_mls::MLSError;
+
+        let stage_key = format!("c33_pending_opening:{cid}");
+        let stage = self
+            .get_account_meta(&stage_key)?
+            .filter(|raw| !raw.is_empty() && raw != "archived")
+            .map(|raw| serde_json::from_str::<QueuedLabyrinthArchivePayload>(&raw))
+            .transpose()?
+            .filter(|frame| frame.conversation_id == cid && frame.sender_did == did);
+        let stage_position = stage.as_ref().map(archive_frame_position).transpose()?;
+
+        // The signed opening receipt, archived evidence, queued copy, and display row also
+        // cover accepted requests whose pending frame was replaced by the "archived" sentinel.
+        let rows = self.query_text(
+            "WITH openings AS (
+                SELECT r.request_id AS id, r.first_message_id AS mid,
+                    COALESCE(CAST(s.value_bytes AS TEXT),
+                        json_extract(CAST(e.value_bytes AS TEXT), '$.sequencer_receipt_json'),
+                        json_extract(CAST(q.payload_bytes AS TEXT), '$.sequencer_receipt_json')) AS receipt,
+                    COALESCE(m.seq, q.seq) AS seq, COALESCE(m.created_at_ms, q.created_at_ms) AS stamp
+                FROM requests r
+                LEFT JOIN labyrinth_state s ON s.state_key = 'c33_opening_receipt:' || ?1 || ':' || r.first_message_id
+                LEFT JOIN labyrinth_state e ON e.state_key = 'native.message:' || ?1 || ':' || r.first_message_id
+                LEFT JOIN labyrinth_queue q ON q.item_id = r.first_message_id AND q.conversation_id = ?1
+                LEFT JOIN messages m ON m.message_id = r.first_message_id AND m.conversation_id = ?1
+                WHERE r.conversation_id = ?1 AND r.sender_did = ?2 AND r.first_message_id IS NOT NULL
+            ) SELECT id, mid, json_extract(receipt, '$.seq'), json_extract(receipt, '$.issued_at_ms'), seq, stamp
+              FROM openings",
+            &[(1, cid), (2, did)], 6,
+        ).map_err(map_wasm_mls_err)?;
+        for row in rows {
+            let id = row[0]
+                .as_deref()
+                .ok_or_else(|| MLSError::Internal("missing request id".into()))?;
+            let mid = row[1]
+                .as_deref()
+                .ok_or_else(|| MLSError::Internal("missing opening id".into()))?;
+            let number = |index: usize| {
+                row[index]
+                    .as_deref()
+                    .map(str::parse::<i64>)
+                    .transpose()
+                    .map_err(|_| MLSError::Internal("invalid stored opening coordinates".into()))
+            };
+            let staged = stage
+                .as_ref()
+                .filter(|frame| frame.message_id == mid)
+                .and(stage_position);
+            // A legacy display-only request whose originating frame was already removed has
+            // unknown coordinates. The shared conservative rule holds that orphan preview.
+            let seq = number(2)?
+                .or(staged.map(|(seq, _)| seq))
+                .or(number(4)?)
+                .unwrap_or(0);
+            let issued = number(3)?.or(staged.map(|(_, stamp)| stamp)).or(number(5)?);
+            if marker.covers(seq, issued) {
+                self.exec_with_text_params(
+                    "UPDATE requests SET payload_json = '{}' WHERE request_id = ?1",
+                    &[(1, id)],
+                )
+                .map_err(map_wasm_mls_err)?;
+                self.delete_message(cid, mid)?;
+                self.delete_labyrinth_state_key(&format!("native.message:{cid}:{mid}"))?;
+                self.delete_labyrinth_state_key(
+                    &catbird_mls::client::chat_wire::undecryptable_evidence_key(cid, mid),
+                )?;
+                self.delete_labyrinth_state_key(
+                    &catbird_mls::client::chat_wire::unavailable_message_key(cid, mid),
+                )?;
+                self.dequeue_labyrinth_item(mid)?;
+            }
+        }
+        if stage_position.is_some_and(|(seq, issued)| marker.covers(seq, Some(issued))) {
+            self.delete_account_meta(&stage_key)?;
+        }
+        Ok(())
+    }
+
     /// Erase display rows, archive evidence (including orphan frames), and queued copies in the
     /// caller's transaction. Prefer the verified receipt's issue time over local insertion time.
     pub fn purge_covered_account_data(
@@ -1510,11 +1654,14 @@ impl SqliteConn {
         use catbird_mls::storage::driver_wasm::WasmSqlBackend;
         use catbird_mls::MLSError;
 
+        self.scrub_direct_request_openings(cid, did, marker)?;
         let rows = self.query_text(
             "SELECT m.message_id, m.seq, COALESCE(
+                json_extract(CAST(s.value_bytes AS TEXT), '$.issued_at_ms'),
                 json_extract(json_extract(CAST(e.value_bytes AS TEXT), '$.sequencer_receipt_json'), '$.issued_at_ms'),
                 json_extract(CAST(u.value_bytes AS TEXT), '$.receipt.issuedAtMs'), m.created_at_ms)
              FROM messages m
+             LEFT JOIN labyrinth_state s ON s.state_key = 'c33_opening_receipt:' || ?1 || ':' || m.message_id
              LEFT JOIN labyrinth_state e ON e.state_key = 'native.message:' || ?1 || ':' || m.message_id
              LEFT JOIN labyrinth_state u ON u.state_key = 'native.unavailable:' || ?1 || ':' || m.message_id
              WHERE m.conversation_id = ?1 AND m.sender_did = ?2",

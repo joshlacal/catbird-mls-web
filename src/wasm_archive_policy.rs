@@ -706,7 +706,23 @@ pub(crate) fn observe_frame(
     tx: &impl WasmSqlBackend,
     payload: &QueuedLabyrinthArchivePayload,
 ) -> Result<(), MLSError> {
-    let frame = frame_value(&payload.labyrinth_frame_json);
+    observe_verified_frame(
+        tx,
+        &payload.conversation_id,
+        payload.seq,
+        &payload.labyrinth_frame_json,
+        payload.created_at_ms,
+    )
+}
+
+pub(crate) fn observe_verified_frame(
+    tx: &impl WasmSqlBackend,
+    conversation_id: &str,
+    seq: i64,
+    frame_json: &str,
+    created_at_ms: i64,
+) -> Result<(), MLSError> {
+    let frame = frame_value(frame_json);
     let change = frame.as_ref().and_then(|frame| {
         (frame["messageType"] == "system"
             && frame["backupPolicy"] == 1
@@ -716,17 +732,11 @@ pub(crate) fn observe_frame(
     });
     let requested = match change {
         Some(enabled) => enabled,
-        None if frame_no_backup(&payload.labyrinth_frame_json) => false,
+        None if frame_no_backup(frame_json) => false,
         None => return Ok(()),
     };
-    if requested != enabled_at_seq(tx, &payload.conversation_id, payload.seq)? {
-        record_flip(
-            tx,
-            &payload.conversation_id,
-            payload.seq,
-            requested,
-            payload.created_at_ms,
-        )?;
+    if requested != enabled_at_seq(tx, conversation_id, seq)? {
+        record_flip(tx, conversation_id, seq, requested, created_at_ms)?;
     }
     Ok(())
 }

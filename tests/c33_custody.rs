@@ -1247,6 +1247,101 @@ async fn a_pruned_openings_participants_come_from_its_signed_outcome() {
     assert!(conversations(&bob_client).is_empty());
 }
 
+/// Open a v1 database containing a previously applied deletion and pending C33 requests.
+#[wasm_bindgen_test]
+async fn covered_opening_stays_erased_after_restart_and_acceptance() {
+    use catbird_mls::client::deletion_authority::{
+        AppliedAccountDeletion, StoredAccountDeletion, DELETION_CLOCK_SKEW_MS,
+    };
+    let _restore = install_ds();
+    let (alice, bob) = (did("eraseopeningalice"), did("eraseopeningbob"));
+    let covered = "00000000-0000-4000-8000-00000000ea01";
+    let later = "00000000-0000-4000-8000-00000000ea02";
+    let (client, raws) = published(&alice, &bob, &[covered, later]).await;
+    serve_openings(&raws, &alice, &bob);
+    sync(&client).await.unwrap();
+    let later_preview = request(&client, later).payload_json;
+    let covered_mid = request(&client, covered).first_message_id.unwrap();
+    assert_ne!(request(&client, covered).payload_json, "{}");
+    assert_ne!(later_preview, "{}");
+    drop(client);
+
+    let db = account_db(&bob);
+    db.write_tx(|tx| {
+        for cid in [covered, later] {
+            let stage_key = format!("c33_pending_opening:{cid}");
+            let stage: QueuedLabyrinthArchivePayload =
+                serde_json::from_str(&tx.get_account_meta(&stage_key)?.unwrap())?;
+            let receipt: StoredArchivedReceipt =
+                serde_json::from_str(stage.sequencer_receipt_json.as_deref().unwrap())?;
+            let signed_at_ms = if cid == covered {
+                receipt.issued_at_ms
+            } else {
+                receipt.issued_at_ms - DELETION_CLOCK_SKEW_MS - 1
+            };
+            let marker = StoredAccountDeletion::Signed(AppliedAccountDeletion {
+                seq: stage.seq + 1,
+                signed_at_ms,
+                operation_id: cid.into(),
+                actor_device_id: Some(ALICE_DEVICE.into()),
+            });
+            tx.put_labyrinth_state(
+                &chat_wire::account_deletion_key(cid, &alice),
+                &marker.encode().unwrap(),
+                signed_at_ms,
+            )?;
+            // A v1 install had no independent opening receipt. On the covered request
+            // simulate a prior deletion pass that already scrubbed display and archive evidence.
+            tx.delete_labyrinth_state_key(&format!(
+                "c33_opening_receipt:{cid}:{}",
+                stage.message_id
+            ))?;
+            if cid == covered {
+                tx.delete_message(cid, &stage.message_id)?;
+                tx.delete_labyrinth_state_key(&format!(
+                    "native.message:{cid}:{}",
+                    stage.message_id
+                ))?;
+            }
+        }
+        tx.put_account_meta("browser.deletion_evidence_scrub_v1", "1", 0)?;
+        tx.delete_account_meta("browser.deletion_evidence_scrub_v2")
+    })
+    .unwrap();
+    drop(db);
+
+    let client = open(&bob, BOB_DEVICE).await;
+    assert_eq!(request(&client, covered).payload_json, "{}");
+    assert_eq!(request(&client, covered).consent, "incomingPending");
+    assert_eq!(request(&client, later).payload_json, later_preview);
+    assert_eq!(messages(&client, later).len(), 1);
+    accept(&client, covered).await.unwrap();
+    drop(client);
+    let client = open(&bob, BOB_DEVICE).await;
+    assert_eq!(request(&client, covered).consent, "accepted");
+    assert_eq!(request(&client, covered).payload_json, "{}");
+    assert!(messages(&client, covered)
+        .iter()
+        .all(|row| row.message_id != covered_mid));
+    drop(client);
+    let db = account_db(&bob);
+    assert!(db
+        .backend()
+        .get_account_meta(&format!("c33_pending_opening:{covered}"))
+        .unwrap()
+        .is_none());
+    assert!(db
+        .backend()
+        .list_labyrinth_queue(Some(covered), 10)
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .backend()
+        .get_account_meta(&format!("c33_pending_opening:{later}"))
+        .unwrap()
+        .is_some());
+}
+
 /// Accepting moves the cursor and coordinates only over its own verified entry: the legacy
 /// acceptance-commit receipt over the sequenced entry carrying Bob's signed acceptance, plus
 /// that entry's mandatory Task 5 I13 receipt, and only when the entry is next. Missing I13 or a

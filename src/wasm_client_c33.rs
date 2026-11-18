@@ -719,6 +719,11 @@ impl WasmMlsClient {
                 &metadata_snapshot_json,
                 ts,
             )?;
+            tx.put_labyrinth_state(
+                &format!("c33_opening_receipt:{conversation_id}:{first_message_id}"),
+                opening_receipt_json.as_bytes(),
+                ts,
+            )?;
             tx.upsert_request(&RequestRow {
                 request_id: request_id.clone(),
                 conversation_id: conversation_id.clone(),
@@ -774,6 +779,9 @@ impl WasmMlsClient {
                 &staged_opening,
                 ts,
             )?;
+            if let Some(marker) = tx.applied_deletion_marker(conversation_id, &self.account_did)? {
+                tx.purge_covered_account_data(conversation_id, &self.account_did, &marker)?;
+            }
             // The attempt is resolved in the same write that applies its bootstrap.
             tx.delete_account_meta(&key)?;
             Ok(row)

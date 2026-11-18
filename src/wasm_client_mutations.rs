@@ -2012,7 +2012,7 @@ impl WasmMlsClient {
                 c.updated_at_ms = ts;
                 tx.upsert_conversation(&c)?;
             }
-            let row = MessageRow {
+            let mut row = MessageRow {
                 message_id: queued.message_id.clone(),
                 conversation_id: queued.conversation_id.clone(),
                 group_id,
@@ -2030,6 +2030,14 @@ impl WasmMlsClient {
                 send_counter,
             )?;
             tx.put_account_meta(&counter_key, &confirmed.to_string(), ts)?;
+            // Reconciliation of an old send can follow an archive-verified deletion.
+            if tx.archive_frame_covered(&queued)? {
+                wasm_archive_policy::observe_frame(tx, &queued)?;
+                tx.dequeue_labyrinth_item(&queued.message_id)?;
+                tx.delete_account_meta(&journal_key)?;
+                row.plaintext_json = "{}".into();
+                return Ok((row, gap_convo));
+            }
             tx.insert_message(&row)?;
             let queued_bytes =
                 serde_json::to_vec(&queued).map_err(|e| MLSError::Internal(e.to_string()))?;

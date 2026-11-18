@@ -1,5 +1,5 @@
 {
-  "coreRevision": "939ed6cfe13821834b8042318c8d5bebd8e739be",
+  "coreRevision": "c38a604b77e45963da8e539af1ea4c7f68530f41",
   "artifacts": [
     {
       "target": "src/generated/blue.catbird.chat.defs.json",
@@ -23,7 +23,7 @@
     }
   ],
   "wasmPackage": {
-    "coreRevision": "939ed6cfe13821834b8042318c8d5bebd8e739be",
+    "coreRevision": "c38a604b77e45963da8e539af1ea4c7f68530f41",
     "labyrinthRevision": "182e76d00d66f7a1b72bbc4248438bd68e25a2fa",
     "catbirdAtprotoRevision": "9e3ed5ec0235f105e643c5af563eb09a2bbbca86",
     "build": "./build.sh using wasm-pack 0.14.0 and bundled wasm-opt, rustc 1.99.1 (58cf8f9c3), cargo 1.99.1 (5f94df478), offline release build for wasm32-unknown-unknown",

@@ -2222,12 +2222,17 @@ async fn pending_approval_second_device_car_v1_approval_and_device_revocation() 
     let bootstrap_recovery_code = dev1.create_recovery_code_live().await.unwrap();
 
     // 2. Second browser device enrolls -> `mls-ds` returns `status: "pending_approval"`.
-    let dev2 = open_client(&did, dev2_id).await;
+    let mut dev2 = open_client(&did, dev2_id).await;
     let _ = enroll(&dev2).await;
     assert!(
         dev2.is_device_pending_approval().unwrap(),
         "2nd device must enter pending_approval"
     );
+    let calls_before_delete = WORLD.with(|c| c.borrow().calls.clone());
+    let error = dev2.delete_account_data().await.unwrap_err();
+    assert!(error.as_string().unwrap().contains("DevicePendingApproval"));
+    assert!(dev2.is_device_pending_approval().unwrap());
+    WORLD.with(|c| assert_eq!(c.borrow().calls, calls_before_delete));
     assert_eq!(
         device_call_count("blue.catbird.chat.publishDirectRequestKeys", dev2_id),
         0,

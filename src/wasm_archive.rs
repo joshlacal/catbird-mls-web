@@ -3202,6 +3202,11 @@ impl WasmMlsClient {
         }
         const RETRY_META_KEY: &str = "delete_account_retry_state";
 
+        if self.is_device_pending_approval_impl()? {
+            return Err(MLSError::PendingDeviceAccess {
+                reason: "DevicePendingApproval".into(),
+            });
+        }
         let db = self.require_db_mls()?;
         let deps = self.wasm_archive_deps()?;
         let (session_token, own_device_id) = self.require_live_session()?;

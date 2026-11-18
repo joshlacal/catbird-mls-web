@@ -1892,6 +1892,9 @@ fn dispatch_fetch_inner(
                 let page: Vec<_> = rows.by_ref().take(100).collect();
                 let more = rows.next().is_some();
                 let mut result = json!({
+                    "sequencerDid": SEQUENCER,
+                    "state": {
+                        "conversationId": cid,
                         "sequencerDid": SEQUENCER,
                         "conversationKind": st.kind,
                         "coordinates": st.coordinates,

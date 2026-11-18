@@ -1,10 +1,10 @@
 {
-  "coreRevision": "22cabc25c543796415fda4473f04d387c1cc7c7e",
+  "coreRevision": "d7d4ee15249520bad7928b1eb20635b31fc7fc79",
   "artifacts": [
     {
       "target": "src/generated/blue.catbird.chat.defs.json",
       "source": "src/orchestrator/generated/blue.catbird.chat.defs.json",
-      "sha256": "22f415fc0015a259fa0adcb16b0285369cb77facce4ca51e5f7e4d8489825b94"
+      "sha256": "da004142b2742eefeb7d67bbb1de8b7e1f343e69791846e57470d58c40e647f1"
     },
     {
       "target": "tests/fixtures/mls_chat_signing_domain_vectors.json",
@@ -23,15 +23,15 @@
     }
   ],
   "wasmPackage": {
-    "coreRevision": "22cabc25c543796415fda4473f04d387c1cc7c7e",
+    "coreRevision": "d7d4ee15249520bad7928b1eb20635b31fc7fc79",
     "labyrinthRevision": "182e76d00d66f7a1b72bbc4248438bd68e25a2fa",
-    "catbirdAtprotoRevision": "2b42978527ccf3f7b0382e4b6f2448c4c3590aad",
-    "build": "./build.sh (wasm-pack 0.14.0 --target web --release with its bundled wasm-opt; rustc 1.99.1 per rust-toolchain.toml; build.sh's extra wasm-opt -Oz pass skipped because no wasm-opt is on PATH)",
+    "catbirdAtprotoRevision": "9e3ed5ec0235f105e643c5af563eb09a2bbbca86",
+    "build": "./build.sh using wasm-pack 0.14.0 and bundled wasm-opt, rustc 1.99.1 (58cf8f9c3), cargo 1.99.1 (5f94df478), offline release build for wasm32-unknown-unknown",
     "files": {
-      "catbird_mls_web_bg.wasm": "f4d95fce5c8dac1f212a84ac34c08e300cd3f1dc0f4ee78a32d00080d0bb2e1e",
-      "catbird_mls_web.js": "68d79e2b0762fd05274ed29d9b02d19ee5d96cfc3e1d41d7e0af10aab199cb56",
-      "catbird_mls_web.d.ts": "c6c74ad7ec41aeff3f154bedb6282322a4bf8ced31f41c767f60701426fb8011",
-      "catbird_mls_web_bg.wasm.d.ts": "05571b40185faf14c7c956b8e50849977b83eaec8b44e3d74908fcff7617f992"
+      "catbird_mls_web_bg.wasm": "1db1da32d669d0703878883e0db549f273a1d8208d7d477e27aa1f3f48215707",
+      "catbird_mls_web.js": "ae514ab580f8853de3cc3f0ebe62c24436b7de6f5500f1ae5fa5956fa8a19ac1",
+      "catbird_mls_web.d.ts": "5e939296f32e0f148b2d273c1e4c449904d5a9a283f38855f5c8c09d92f34f4f",
+      "catbird_mls_web_bg.wasm.d.ts": "e798cabf901f4f40fe61c97da8cdda88eae5811c5fa55531f45d9346f6fea4a8"
     }
   }
 }

@@ -1073,6 +1073,12 @@ fn dispatch_fetch_inner(
                     let mut w = cell.borrow_mut();
                     match collection {
                         c if c == labyrinth::records::nsid::MAILBOX_KEYS => {
+                            if rkey != labyrinth::store::pds::SELF_RKEY {
+                                return Err(WireResponse::json(
+                                    403,
+                                    json!({"error": "Forbidden", "message": "mailboxKeys epoch snapshots are create-only"}),
+                                ));
+                            }
                             let cur = w.mailbox_keys.get(&(repo.to_owned(), rkey.to_owned()));
                             if b.get("swapRecord")
                                 .and_then(Value::as_str)
@@ -1216,6 +1222,14 @@ fn dispatch_fetch_inner(
                 }),
             )
         }
+        "com.atproto.space.createSpace" => {
+            let account = account_opt.expect("createSpace bearer");
+            let b: Value = serde_json::from_slice(body).unwrap();
+            let space_type = b["spaceType"].as_str().unwrap_or("");
+            let skey = b["skey"].as_str().unwrap_or("self");
+            let uri = format!("at://{account}/space/{space_type}/{skey}");
+            WireResponse::json(200, json!({ "uri": uri }))
+        }
         "com.atproto.space.getDelegationToken" => {
             let account = account_opt.expect("delegation bearer");
             let space = SpaceUri::parse_hedged(params.get("space").unwrap()).unwrap();
@@ -1344,6 +1358,14 @@ fn dispatch_fetch_inner(
         }
         "com.atproto.space.listSpaces" => {
             let account = account_opt.expect("listSpaces bearer");
+            let filter_type = params.get("spaceType").map(String::as_str);
+            let filter_did = params.get("spaceDid").map(String::as_str);
+            if filter_type.is_none() && filter_did.is_none() {
+                return WireResponse::json(
+                    401,
+                    json!({"error": "Unauthorized", "message": "listSpaces requires spaceType or spaceDid"}),
+                );
+            }
             WORLD.with(|cell| {
                 let w = cell.borrow();
                 let spaces: BTreeSet<_> = w
@@ -1351,6 +1373,13 @@ fn dispatch_fetch_inner(
                     .keys()
                     .filter(|(_, repo, _, _)| repo == &account)
                     .map(|(s, _, _, _)| s.clone())
+                    .filter(|uri| {
+                        let Ok(parsed) = SpaceUri::parse_hedged(uri) else {
+                            return false;
+                        };
+                        filter_type.is_none_or(|t| parsed.space_type == t)
+                            && filter_did.is_none_or(|d| parsed.authority == d)
+                    })
                     .collect();
                 WireResponse::json(
                     200,

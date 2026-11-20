@@ -578,7 +578,7 @@ impl WasmMlsClient {
             )
             .await?;
         if !(200..300).contains(&st1) {
-            if matches!(st1, 400 | 409) {
+            if matches!(st1, 400 | 409 | 500) {
                 let get_url = format!(
                     "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.device&rkey={}",
                     self.pds_base(),

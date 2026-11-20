@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use openmls::prelude::*;
@@ -1192,11 +1192,14 @@ impl WasmMlsClient {
                     "I4 inline CAR proof exceeds {max_car_bytes}-byte ceiling for `{expected_uri}`"
                 )));
             }
-            STANDARD.decode(b64).map_err(|e| {
-                MLSError::Cryptography(format!(
-                    "I4 inline CAR proof base64 decode failed for `{expected_uri}`: {e}"
-                ))
-            })?
+            STANDARD
+                .decode(b64)
+                .or_else(|_| STANDARD_NO_PAD.decode(b64))
+                .map_err(|e| {
+                    MLSError::Cryptography(format!(
+                        "I4 inline CAR proof base64 decode failed for `{expected_uri}`: {e}"
+                    ))
+                })?
         } else {
             self.fetch_pds_record_car_wasm(
                 pds_endpoint,
@@ -1302,7 +1305,7 @@ impl WasmMlsClient {
         if (200..300).contains(&status) {
             return Ok(());
         }
-        if matches!(status, 400 | 409) {
+        if matches!(status, 400 | 409 | 500) {
             let get_url = format!(
                 "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
                 self.pds_base(),

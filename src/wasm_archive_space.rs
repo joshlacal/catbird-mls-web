@@ -83,6 +83,7 @@ struct Credential {
 struct ReadContext {
     space: SpaceUri,
     writer: String,
+    writer_pds: Option<String>,
     personal: bool,
     kem_key: Option<String>,
     credential: Credential,
@@ -303,10 +304,15 @@ impl WebArchiveGateway {
         }
         let authority = self.space_document(&space.authority).await?;
         let authority_kem = authority.atproto_kem_did_key.clone();
-        let kem_key = if writer == authority.id {
-            authority_kem.clone()
+        let (kem_key, writer_pds) = if writer == authority.id {
+            (
+                authority_kem.clone(),
+                authority.pds_endpoint().ok().map(str::to_owned),
+            )
         } else {
-            self.space_document(&writer).await?.atproto_kem_did_key
+            let writer_doc = self.space_document(&writer).await?;
+            let pds = writer_doc.pds_endpoint().ok().map(str::to_owned);
+            (writer_doc.atproto_kem_did_key, pds)
         };
         let credential = match self.space_credential(&space, personal, authority).await? {
             Ok(credential) => credential,
@@ -315,6 +321,7 @@ impl WebArchiveGateway {
         let mut context = ReadContext {
             space,
             writer,
+            writer_pds,
             personal,
             kem_key,
             credential,
@@ -450,6 +457,19 @@ impl WebArchiveGateway {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<LabyrinthSpaceResponse, String> {
+        let base = self.client.pds_base();
+        self.space_http_to_base(&base, method, path, headers, body)
+            .await
+    }
+
+    async fn space_http_to_base(
+        &self,
+        base: &str,
+        method: &str,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    ) -> Result<LabyrinthSpaceResponse, String> {
         let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
         let has_auth = headers
             .iter()
@@ -460,7 +480,7 @@ impl WebArchiveGateway {
         let mut req = self
             .client
             .http
-            .request(method, format!("{}{path}", self.client.pds_base()));
+            .request(method, format!("{}{path}", base.trim_end_matches('/')));
         if !has_auth {
             req = req.bearer_auth(&self.session_token);
         }
@@ -940,7 +960,15 @@ impl WebArchiveGateway {
             if let Some((accept, _, _)) = &negotiated {
                 headers.push((ACCEPT_SIGNATURE_HEADER.into(), accept.clone()));
             }
-            self.pds_space_http("GET", path, headers, None).await?
+            // Personal Space reads carry `Atproto-Space-Credential` + RFC 9421 HTTP signatures.
+            // The BFF gateway strips those headers, so send directly to the account's resolved PDS.
+            let fallback_base = self.client.pds_base();
+            let target_base = context
+                .writer_pds
+                .as_deref()
+                .unwrap_or(fallback_base.as_str());
+            self.space_http_to_base(target_base, "GET", path, headers, None)
+                .await?
         } else {
             let query = path.split_once('?').map(|(_, query)| query);
             let body = serde_json::to_vec(&serde_json::json!({

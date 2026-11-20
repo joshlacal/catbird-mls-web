@@ -8,7 +8,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use atproto_spaces::did_resolver::DidDocument;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+    Engine as _,
+};
 use openmls::prelude::{GroupId, MlsGroup};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::{signatures::Signer as _, OpenMlsProvider as _};
@@ -222,6 +225,7 @@ impl WebArchiveGateway {
         let car_bytes = if let Some(b64) = inline_proof {
             STANDARD
                 .decode(b64)
+                .or_else(|_| STANDARD_NO_PAD.decode(b64))
                 .map_err(|_| labyrinth::Error::Malformed("mailboxKeys inline CAR proof"))?
         } else {
             let pds = doc
@@ -373,18 +377,27 @@ impl PublicRepoBackend for WebArchiveGateway {
             "rkey": rkey,
             "record": record_val,
         });
-        if let Some(cid) = swap_cid {
-            body["swapRecord"] = json!(cid);
-        }
+        // Only the `self` pointer is ever overwritten. Per-epoch snapshots are written once
+        // via `createRecord` because the production gateway forbids `putRecord` on non-`self`
+        // `mailboxKeys` rkeys (`Y-6` / `B4`).
+        let method = if rkey == labyrinth::store::pds::SELF_RKEY {
+            if let Some(cid) = swap_cid {
+                body["swapRecord"] = json!(cid);
+            }
+            "com.atproto.repo.putRecord"
+        } else {
+            if swap_cid.is_some() {
+                return Err(labyrinth::Error::Malformed(
+                    "mailboxKeys epoch snapshots are create-only",
+                ));
+            }
+            "com.atproto.repo.createRecord"
+        };
         let payload =
             serde_json::to_vec(&body).map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
         let (status, resp_bytes) = self
             .client
-            .pds_post_json(
-                &self.session_token,
-                "/xrpc/com.atproto.repo.putRecord",
-                payload,
-            )
+            .pds_post_json(&self.session_token, &format!("/xrpc/{method}"), payload)
             .await
             .map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
         let parsed: Option<Value> = serde_json::from_slice(&resp_bytes).ok();
@@ -402,12 +415,12 @@ impl PublicRepoBackend for WebArchiveGateway {
             };
             return Err(map_xrpc_error(err));
         }
-        let json = parsed.ok_or(labyrinth::Error::Malformed("putRecord JSON"))?;
+        let json = parsed.ok_or(labyrinth::Error::Malformed("mailboxKeys write JSON"))?;
         json["cid"]
             .as_str()
             .filter(|cid| !cid.is_empty())
             .map(str::to_owned)
-            .ok_or(labyrinth::Error::Malformed("putRecord missing CID"))
+            .ok_or(labyrinth::Error::Malformed("mailboxKeys write missing CID"))
     }
 
     async fn get_mailbox_keys(

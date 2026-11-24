@@ -20,4 +20,4 @@ pkg/
 # Cargo
 **/*.rs.bk
 /_trash/
-
+_site/

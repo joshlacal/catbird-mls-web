@@ -2714,12 +2714,9 @@ impl WasmMlsClient {
         iv: &[u8],
         expected_sha256: Option<&[u8]>,
     ) -> Result<Vec<u8>, MLSError> {
-        let mut parts = locator.splitn(3, '|');
-        let (Some(space_uri), Some(repo_did), Some(cid)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
+        let Some((space_uri, repo_did, cid)) = split_attachment_locator(locator) else {
             return Err(MLSError::invalid_input(
-                "attachment locator must be \"{spaceURI}|{repoDID}|{cid}\"",
+                "attachment locator must be \"{spaceURI}|{repoDID}|{cid}\" or \"{spaceURI}/{repoDID}#{cid}\"",
             ));
         };
         if cid.trim().is_empty() || cid.contains('|') {
@@ -3921,4 +3918,21 @@ impl WasmMlsClient {
             pending_otc_offer_digits: RefCell::new(None),
         }
     }
+}
+
+/// Split a Space attachment locator into `(spaceURI, repoDID, cid)`.
+///
+/// Accepts both shapes Catbird iOS reads (`MLSSpaceBlobLocator.parse`):
+/// `"{spaceURI}|{repoDID}|{cid}"` and `"{spaceURI}/{repoDID}#{cid}"`.
+pub(crate) fn split_attachment_locator(locator: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = locator.trim();
+    if trimmed.contains('|') {
+        let mut parts = trimmed.splitn(3, '|');
+        let (space, repo, cid) = (parts.next()?, parts.next()?, parts.next()?);
+        return (!space.trim().is_empty() && !repo.trim().is_empty() && !cid.trim().is_empty())
+            .then_some((space, repo, cid));
+    }
+    let (before_hash, cid) = trimmed.split_once('#')?;
+    let (space, repo) = before_hash.rsplit_once('/')?;
+    (!space.is_empty() && !repo.is_empty() && !cid.is_empty()).then_some((space, repo, cid))
 }

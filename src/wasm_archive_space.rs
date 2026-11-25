@@ -1,7 +1,8 @@
 //! Authenticated Nov-12 ATProto Spaces wire transport (`atproto_spaces`) for `WasmMlsClient`.
 //!
 //! Enforces:
-//! - Hedged `at://did/space/<nsid>/<rkey>` URI parsing (`SpaceUri::parse_hedged`)
+//! - Strict `at:space/<did>/<nsid>/<skey>` URI parsing on the wire (`SpaceUri::parse`); stored
+//!   pins read leniently (`SpaceUri::parse_hedged`)
 //! - Ephemeral P-256 `did:key` delegation -> `authorizeSpaceSync` (personal mailbox) /
 //!   `blue.catbird.chat.relaySpaceCredential` (conversation Space)
 //! - Signed `catbird-space-denial+jwt` verification on `403` conversation Space credential refusals
@@ -281,7 +282,7 @@ impl WebArchiveGateway {
         }) {
             return Err("wasm_space_conflicting_auth_headers".into());
         }
-        let space = SpaceUri::parse_hedged(required(&params, "space")?)
+        let space = SpaceUri::parse(required(&params, "space")?)
             .map_err(|e| format!("wasm_space_invalid_space: {e}"))?;
         let writer = if writer_endpoint {
             required(&params, "repo")?.to_owned()
@@ -772,7 +773,7 @@ impl WebArchiveGateway {
         let claims = verify_space_token(SpaceTokenKind::Credential, &jwt, &resolver, now)
             .await
             .map_err(|e| format!("wasm_space_invalid_credential: {e}"))?;
-        let claims_space = SpaceUri::parse_hedged(&claims.sub).ok().map(|s| s.raw);
+        let claims_space = SpaceUri::parse(&claims.sub).ok().map(|s| s.raw);
         if claims.iss != space.authority
             || claims_space.as_deref() != Some(space.raw.as_str())
             || claims.cnf_kid.as_deref() != Some(kid.as_str())
@@ -855,7 +856,7 @@ impl WebArchiveGateway {
         if header.typ != SPACE_DENIAL_TYP || header.kid != atproto_spaces::tokens::ATPROTO_KEY_ID {
             return Err("not a Space denial".into());
         }
-        let claims_space = SpaceUri::parse_hedged(&claims.sub).ok().map(|s| s.raw);
+        let claims_space = SpaceUri::parse(&claims.sub).ok().map(|s| s.raw);
         if claims.iss != space.authority
             || claims_space.as_deref() != Some(space.raw.as_str())
             || claims.aud != self.client.account_did
@@ -1537,7 +1538,7 @@ impl WebArchiveGateway {
                 .map_err(|e| format!("wasm_space_list_coordinates: {e}"))?;
             let stub_uri_norm = stub.uri.as_deref().map(|u| {
                 if let Some((prefix, rest)) = u.split_once(&format!("/{}/", context.writer)) {
-                    if let Ok(parsed) = SpaceUri::parse_hedged(prefix) {
+                    if let Ok(parsed) = SpaceUri::parse(prefix) {
                         return format!("{}/{}/{rest}", parsed.raw, context.writer);
                     }
                 }
@@ -1546,7 +1547,7 @@ impl WebArchiveGateway {
             let stub_space_norm = stub
                 .space
                 .as_deref()
-                .and_then(|s| SpaceUri::parse_hedged(s).ok().map(|p| p.raw));
+                .and_then(|s| SpaceUri::parse(s).ok().map(|p| p.raw));
             if params
                 .get("collection")
                 .is_some_and(|c| c != &stub.collection)
@@ -1834,7 +1835,7 @@ fn verify_record(
         .map_err(|e| format!("wasm_space_record_coordinates: {e}"))?;
     let envelope_uri =
         if let Some((prefix, rest)) = envelope.uri.split_once(&format!("/{}/", context.writer)) {
-            if let Ok(parsed) = SpaceUri::parse_hedged(prefix) {
+            if let Ok(parsed) = SpaceUri::parse(prefix) {
                 format!("{}/{}/{rest}", parsed.raw, context.writer)
             } else {
                 envelope.uri.clone()
@@ -1870,7 +1871,7 @@ fn verify_commit(
     commit: &Commit,
 ) -> Result<(), String> {
     let (key_share, secret) = negotiated;
-    let commit_space = SpaceUri::parse_hedged(&commit.space).ok().map(|s| s.raw);
+    let commit_space = SpaceUri::parse(&commit.space).ok().map(|s| s.raw);
     if commit_space.as_deref() != Some(context.space.raw.as_str())
         || commit.repo != context.writer
         || commit.ver != 1

@@ -655,7 +655,7 @@ async fn flush_distributes_a_transport_mek_every_member_epoch_opens() {
     drop(client);
 
     let writes = space_writes();
-    let space = format!("at://{SEQUENCER}/space/blue.catbird.labyrinth.conversation/{cid}-0");
+    let space = format!("at:space/{SEQUENCER}/blue.catbird.labyrinth.conversation/{cid}-0");
     let created: Vec<_> = writes
         .iter()
         .map(|w| {

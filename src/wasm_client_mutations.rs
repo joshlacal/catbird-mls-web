@@ -579,25 +579,14 @@ impl WasmMlsClient {
             .await?;
         if !(200..300).contains(&st1) {
             if matches!(st1, 400 | 409 | 500) {
-                let get_url = format!(
-                    "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.device&rkey={}",
-                    self.pds_base(),
+                let get_path = format!(
+                    "/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.device&rkey={}",
                     chat_wire::urlencode_form_component(&self.account_did),
                     chat_wire::urlencode_form_component(canonical_dev_id),
                 );
-                let resp = self
-                    .http
-                    .get(&get_url)
-                    .bearer_auth(session_token)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        MLSError::Internal(format!(
-                            "getRecord blue.catbird.chat.device failed: {e}"
-                        ))
-                    })?;
-                if resp.status().is_success() {
-                    let existing: Value = resp.json().await.map_err(|e| {
+                let (get_status, _, get_bytes) = self.pds_get(session_token, &get_path).await?;
+                if (200..300).contains(&get_status) {
+                    let existing: Value = serde_json::from_slice(&get_bytes).map_err(|e| {
                         MLSError::Internal(format!("parse existing chat.device record: {e}"))
                     })?;
                     if !chat_wire::pds_device_record_matches(&existing["value"], pub_key) {

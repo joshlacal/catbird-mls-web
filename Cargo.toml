@@ -44,6 +44,7 @@ web-sys = { version = "0.3", features = [
     "EventTarget",
     "Blob",
     "BinaryType",
+    "CryptoKey",
     "console",
 ]}
 serde-wasm-bindgen = "0.6"
@@ -101,7 +102,10 @@ atproto-spaces = { path = "../catbird-atproto/atproto-spaces", default-features 
 # Labyrinth records, MEKs and directory for the browser archive (already in the graph via
 # catbird_mls).
 labyrinth = { path = "../labyrinth", features = ["space"] }
+petrel = { path = "../Petrel/rust/petrel", default-features = false, features = ["wasm"] }
+petrel-core = { path = "../Petrel/rust/petrel-core", default-features = false, features = ["wasm"] }
 http = "1"
+url = "2.5"
 multibase = "0.9"
 subtle = "2"
 zeroize = "1"

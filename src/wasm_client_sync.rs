@@ -648,6 +648,9 @@ fn record_wasm_peer_send_counter(
 
 impl WasmMlsClient {
     pub(crate) fn effective_auth_token(&self) -> Option<String> {
+        if self.petrel_auth.borrow().is_some() {
+            return Some("__petrel_oauth__".to_string());
+        }
         if let Some(tok) = self
             .auth_token
             .borrow()
@@ -726,6 +729,13 @@ impl WasmMlsClient {
             .split('#')
             .next()
             .unwrap_or(&self.home_ds_did);
+        if let Some(auth) = self.petrel_auth.borrow().clone() {
+            let audience = format!("{aud_clean}#{}", crate::wasm_auth::DELIVERY_SERVICE_ID);
+            return auth
+                .service_token(&self.account_did, &audience, nsid)
+                .await
+                .map_err(MLSError::Internal);
+        }
         let url = format!(
             "{}/xrpc/com.atproto.server.getServiceAuth?aud={}&lxm={}",
             self.pds_base(),
@@ -981,6 +991,22 @@ impl WasmMlsClient {
         path: &str,
         body: Vec<u8>,
     ) -> Result<(u16, Vec<u8>), MLSError> {
+        if let Some(auth) = self.petrel_auth.borrow().clone() {
+            let (nsid, params) = crate::wasm_auth::split_xrpc_path(path)
+                .map_err(MLSError::Internal)?;
+            let resp = auth
+                .pds_exchange(
+                    &self.account_did,
+                    http::Method::POST,
+                    &nsid,
+                    params,
+                    http::HeaderMap::new(),
+                    Some((bytes::Bytes::from(body), "application/json".to_string())),
+                )
+                .await
+                .map_err(|e| MLSError::Internal(format!("POST {path} failed: {e}")))?;
+            return Ok((resp.status().as_u16(), resp.into_body().to_vec()));
+        }
         let url = format!("{}{path}", self.pds_base());
         let resp = self
             .http
@@ -998,6 +1024,55 @@ impl WasmMlsClient {
             .map_err(|e| MLSError::Internal(format!("read {path} body: {e}")))?
             .to_vec();
         Ok((status, bytes))
+    }
+
+    pub(crate) async fn pds_get(
+        &self,
+        session_token: &str,
+        path: &str,
+    ) -> Result<(u16, Option<String>, Vec<u8>), MLSError> {
+        if let Some(auth) = self.petrel_auth.borrow().clone() {
+            let (nsid, params) = crate::wasm_auth::split_xrpc_path(path)
+                .map_err(MLSError::Internal)?;
+            let resp = auth
+                .pds_exchange(
+                    &self.account_did,
+                    http::Method::GET,
+                    &nsid,
+                    params,
+                    http::HeaderMap::new(),
+                    None,
+                )
+                .await
+                .map_err(|e| MLSError::Internal(format!("GET {path} failed: {e}")))?;
+            let status = resp.status().as_u16();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            return Ok((status, content_type, resp.into_body().to_vec()));
+        }
+        let url = format!("{}{path}", self.pds_base());
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(session_token)
+            .send()
+            .await
+            .map_err(|e| MLSError::Internal(format!("GET {path} failed: {e}")))?;
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| MLSError::Internal(format!("read {path} body: {e}")))?
+            .to_vec();
+        Ok((status, content_type, bytes))
     }
 
     pub(crate) async fn resolve_did_document(
@@ -1306,27 +1381,16 @@ impl WasmMlsClient {
             return Ok(());
         }
         if matches!(status, 400 | 409 | 500) {
-            let get_url = format!(
-                "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
-                self.pds_base(),
+            let get_path = format!(
+                "/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
                 chat_wire::urlencode_form_component(&self.account_did),
                 chat_wire::urlencode_form_component(
                     deletion_authority::DEVICE_REVOCATION_COLLECTION
                 ),
                 chat_wire::urlencode_form_component(own_device_id),
             );
-            let get_resp = self
-                .http
-                .get(&get_url)
-                .bearer_auth(session_token)
-                .send()
-                .await
-                .map_err(|e| MLSError::Internal(format!("GET getRecord deviceRevocation: {e}")))?;
-            if get_resp.status().as_u16() == 200 {
-                let bytes = get_resp
-                    .bytes()
-                    .await
-                    .map_err(|e| MLSError::Internal(e.to_string()))?;
+            let (get_status, _, bytes) = self.pds_get(session_token, &get_path).await?;
+            if get_status == 200 {
                 let parsed: Value = serde_json::from_slice(&bytes).map_err(|e| {
                     MLSError::Cryptography(format!(
                         "parse existing PDS deviceRevocation/{own_device_id} getRecord JSON: {e}"

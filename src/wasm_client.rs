@@ -66,6 +66,7 @@ pub struct WasmMlsClient {
     pub(crate) home_ds_endpoint: String,
     pub(crate) pds_endpoint: String,
     pub(crate) auth_token: RefCell<Option<String>>,
+    pub(crate) petrel_auth: RefCell<Option<Rc<crate::wasm_auth::WasmAuthInner>>>,
     pub(crate) http: reqwest::Client,
     pub(crate) db: Option<WasmAccountDb<Rc<SqliteConn>>>,
     pub(crate) pending_otc_initiator: RefCell<Option<PendingOtcInitiator>>,
@@ -130,6 +131,7 @@ impl WasmMlsClient {
 
     fn wipe_and_close_local_storage(&mut self) -> Result<(), MLSError> {
         *self.auth_token.borrow_mut() = None;
+        *self.petrel_auth.borrow_mut() = None;
         crate::sync_public_api_state(&self.home_ds_endpoint, &self.home_ds_did, None);
         *self.pending_otc_initiator.borrow_mut() = None;
         *self.pending_otc_offer_digits.borrow_mut() = None;
@@ -142,7 +144,7 @@ impl WasmMlsClient {
         Ok(())
     }
 
-    /// Inject or refresh the `nest` BFF / OAuth bearer session token for live XRPC dispatches.
+    /// Inject or refresh the legacy bearer session token for live XRPC dispatches.
     #[wasm_bindgen(js_name = setAuthToken)]
     pub fn set_auth_token(&self, token: Option<String>) {
         let cleaned = token.filter(|s| !s.trim().is_empty());
@@ -152,6 +154,24 @@ impl WasmMlsClient {
             cleaned.as_deref(),
         );
         *self.auth_token.borrow_mut() = cleaned;
+    }
+
+    /// Attach Petrel's direct DPoP-bound OAuth session for PDS XRPC and service auth.
+    #[wasm_bindgen(js_name = setPetrelAuth)]
+    pub fn set_petrel_auth(&self, auth: Option<crate::wasm_auth::WasmAuthClient>) {
+        let inner = auth.map(|a| Rc::clone(&a.inner));
+        *self.petrel_auth.borrow_mut() = inner;
+    }
+
+    /// Attach Petrel's direct DPoP-bound OAuth session by reference (without consuming the JS handle).
+    #[wasm_bindgen(js_name = bindPetrelAuth)]
+    pub fn bind_petrel_auth(&self, auth: &crate::wasm_auth::WasmAuthClient) {
+        *self.petrel_auth.borrow_mut() = Some(Rc::clone(&auth.inner));
+    }
+
+    #[wasm_bindgen(js_name = clearPetrelAuth)]
+    pub fn clear_petrel_auth(&self) {
+        *self.petrel_auth.borrow_mut() = None;
     }
 
     #[wasm_bindgen(js_name = accountDid)]
@@ -1225,6 +1245,7 @@ impl WasmMlsClient {
             home_ds_endpoint,
             pds_endpoint,
             auth_token: RefCell::new(None),
+            petrel_auth: RefCell::new(None),
             http: reqwest::Client::new(),
             db: Some(db),
             pending_otc_initiator: RefCell::new(None),

@@ -457,6 +457,64 @@ impl WebArchiveGateway {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<LabyrinthSpaceResponse, String> {
+        let has_auth = headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+        if !has_auth {
+            if let Some(auth) = self.client.petrel_auth.borrow().clone() {
+                let http_method = http::Method::from_bytes(method.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                let (nsid, params) = crate::wasm_auth::split_xrpc_path(path)?;
+                let mut header_map = http::HeaderMap::new();
+                let mut content_type = None;
+                for (name, value) in headers {
+                    if name.eq_ignore_ascii_case("content-type") {
+                        content_type = Some(value.clone());
+                    }
+                    if crate::wasm_auth::is_managed_header(&name) {
+                        continue;
+                    }
+                    let hn = http::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| format!("invalid header name `{name}`"))?;
+                    let hv = http::HeaderValue::from_str(&value)
+                        .map_err(|_| format!("invalid header value `{name}`"))?;
+                    header_map.append(hn, hv);
+                }
+                let body_pair = body.map(|bytes| {
+                    (
+                        bytes::Bytes::from(bytes),
+                        content_type.unwrap_or_else(|| "application/json".to_string()),
+                    )
+                });
+                let response = auth
+                    .pds_exchange(
+                        &self.client.account_did,
+                        http_method,
+                        &nsid,
+                        params,
+                        header_map,
+                        body_pair,
+                    )
+                    .await?;
+                let status = response.status().as_u16();
+                let mut resp_ct = None;
+                let mut resp_headers = Vec::new();
+                for (name, value) in response.headers() {
+                    if let Ok(val_str) = value.to_str() {
+                        if name.as_str().eq_ignore_ascii_case("content-type") {
+                            resp_ct = Some(val_str.to_owned());
+                        }
+                        resp_headers.push((name.as_str().to_owned(), val_str.to_owned()));
+                    }
+                }
+                return Ok(LabyrinthSpaceResponse {
+                    status,
+                    content_type: resp_ct,
+                    headers: resp_headers,
+                    body: response.into_body().to_vec(),
+                });
+            }
+        }
         let base = self.client.pds_base();
         self.space_http_to_base(&base, method, path, headers, body)
             .await

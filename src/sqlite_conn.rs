@@ -593,7 +593,9 @@ impl SqliteConn {
 
     /// Rewrites stored alpha-form Space URIs (`at://{did}/space/...`) to `at:space/{did}/...`
     /// once per database: `conversations.space_uri`, `pending_ops` `$.archive.space_uri`, the
-    /// `labyrinth_queue` envelope's `space_uri`, and the Space pin / writer revision floor JSON
+    /// `account_meta` send journals' `$.archive.space_uri` (`application_send:`) and staged C33
+    /// openings' `$.space_uri` (`c33_pending_opening:`), the `labyrinth_queue` envelope's
+    /// `space_uri`, and the Space pin / writer revision floor JSON
     /// under `wasm.placements:` and `wasm.writer_rev_floors:`. Only old-form values change, so an
     /// interrupted run finishes on the next open; MLS state and message content are untouched.
     /// TODO: remove before beta.
@@ -644,6 +646,32 @@ impl SqliteConn {
                              WHERE op_kind = ?1 AND op_key = ?2",
                             &[(1, kind.as_str()), (2, key.as_str()), (3, new_uri.as_str())],
                         )?;
+                    }
+                }
+            }
+            // `account_meta` journals that later become archive queue items: a send journal's
+            // `$.archive.space_uri` and a staged C33 opening's `$.space_uri`. The signed request
+            // body, frame, receipt and attestation are left as they are.
+            for (pattern, path) in [
+                ("application_send:*", "$.archive.space_uri"),
+                ("c33_pending_opening:*", "$.space_uri"),
+            ] {
+                for row in self.query_text(
+                    "SELECT key, uri FROM (\
+                     SELECT key, CASE WHEN json_valid(value_json) \
+                     THEN json_extract(value_json, ?2) END AS uri \
+                     FROM account_meta WHERE key GLOB ?1) WHERE uri LIKE 'at://%/space/%'",
+                    &[(1, pattern), (2, path)],
+                    2,
+                )? {
+                    if let [Some(key), Some(uri)] = row.as_slice() {
+                        if let Some(new_uri) = from_legacy_space_uri(uri) {
+                            self.exec_with_text_params(
+                                "UPDATE account_meta SET value_json = \
+                                 json_set(value_json, ?2, ?3) WHERE key = ?1",
+                                &[(1, key.as_str()), (2, path), (3, new_uri.as_str())],
+                            )?;
+                        }
                     }
                 }
             }

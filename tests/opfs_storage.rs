@@ -212,3 +212,98 @@ fn verified_erasure_scrubs_only_covered_frames_including_orphans() {
         Ok(())
     }).unwrap();
 }
+
+#[wasm_bindgen_test]
+async fn space_uri_rewrite_covers_send_journals_and_staged_openings() {
+    use catbird_mls::storage::space_uri_rewrite::SPACE_URI_REWRITE_MARKER_KEY;
+    SqliteConn::initialize_opfs().await.unwrap();
+    let path = format!("space-uri-rewrite-{}.db", uuid::Uuid::new_v4());
+    let key = "ac".repeat(32);
+    let legacy = "at://did:web:ds.example/space/blue.catbird.labyrinth.conversation/c1-0";
+    let current = "at:space/did:web:ds.example/blue.catbird.labyrinth.conversation/c1-0";
+    // Signed bytes that happen to hold a legacy-form URI must survive unchanged.
+    let send = serde_json::json!({
+        "body": {"$type": "blue.catbird.chat.defs#applicationSendBody", "sendCounter": 7,
+                 "aad": {"note": legacy}},
+        "archive": {"space_uri": legacy, "labyrinth_frame_json": format!("{{\"s\":\"{legacy}\"}}")},
+    });
+    let opening = serde_json::json!({
+        "space_uri": legacy,
+        "labyrinth_frame_json": format!("{{\"s\":\"{legacy}\"}}"),
+        "sequencer_receipt_json": format!("{{\"space\":\"{legacy}\"}}"),
+    });
+    let rows = [
+        ("application_send:c1:m1", send.to_string()),
+        ("c33_pending_opening:c1", opening.to_string()),
+        ("c33_pending_opening:c2", "archived".to_string()),
+        // A similar key outside the journal prefixes is not touched.
+        ("xapplication_send:c1:m1", send.to_string()),
+    ];
+    {
+        let conn = SqliteConn::open(&path, &key).unwrap();
+        for (k, v) in &rows {
+            conn.exec_with_text_params(
+                "INSERT OR REPLACE INTO account_meta(key, value_json, updated_at_ms) VALUES(?1, ?2, 0)",
+                &[(1, *k), (2, v.as_str())],
+            )
+            .unwrap();
+        }
+        // A fresh database is already marked; clear it to model a pre-rewrite database.
+        conn.exec_with_text_params(
+            "DELETE FROM account_meta WHERE key = ?1",
+            &[(1, SPACE_URI_REWRITE_MARKER_KEY)],
+        )
+        .unwrap();
+    }
+    let read = |conn: &SqliteConn, k: &str| -> String {
+        conn.query_text(
+            "SELECT value_json FROM account_meta WHERE key = ?1",
+            &[(1, k)],
+            1,
+        )
+        .unwrap()[0][0]
+            .clone()
+            .unwrap()
+    };
+    let expect = |conn: &SqliteConn| {
+        let send_after: serde_json::Value =
+            serde_json::from_str(&read(conn, "application_send:c1:m1")).unwrap();
+        assert_eq!(send_after["archive"]["space_uri"], current);
+        assert_eq!(
+            send_after["body"], send["body"],
+            "signed request body unchanged"
+        );
+        assert_eq!(
+            send_after["archive"]["labyrinth_frame_json"],
+            send["archive"]["labyrinth_frame_json"]
+        );
+        let opening_after: serde_json::Value =
+            serde_json::from_str(&read(conn, "c33_pending_opening:c1")).unwrap();
+        assert_eq!(opening_after["space_uri"], current);
+        assert_eq!(
+            opening_after["labyrinth_frame_json"],
+            opening["labyrinth_frame_json"]
+        );
+        assert_eq!(
+            opening_after["sequencer_receipt_json"],
+            opening["sequencer_receipt_json"]
+        );
+        assert_eq!(read(conn, "c33_pending_opening:c2"), "archived");
+        let other: serde_json::Value =
+            serde_json::from_str(&read(conn, "xapplication_send:c1:m1")).unwrap();
+        assert_eq!(other["archive"]["space_uri"], legacy);
+        assert_eq!(read(conn, SPACE_URI_REWRITE_MARKER_KEY), "1");
+    };
+    {
+        let conn = SqliteConn::open(&path, &key).unwrap();
+        expect(&conn);
+        // Re-running over already rewritten values changes nothing.
+        conn.exec_with_text_params(
+            "DELETE FROM account_meta WHERE key = ?1",
+            &[(1, SPACE_URI_REWRITE_MARKER_KEY)],
+        )
+        .unwrap();
+    }
+    let conn = SqliteConn::open(&path, &key).unwrap();
+    expect(&conn);
+}

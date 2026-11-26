@@ -1656,13 +1656,16 @@ impl SqliteConn {
             }
         }
 
-        // account_meta: mailbox placement request values (whole JSON), and staged C33
-        // openings, whose top-level `space_uri` is enqueued unchanged once accepted.
+        // account_meta: mailbox placement request values (whole JSON), and the two journals
+        // that later become archive queue items unchanged: a send journal's
+        // `$.archive.space_uri` and a staged C33 opening's top-level `space_uri`. The signed
+        // request body, frame, receipt and attestation in them are left as they are.
         let rows = self
             .query_text(
                 "SELECT key, value_json FROM account_meta \
                  WHERE key LIKE 'direct_request_value_v2:labyrinthMailboxPlacement:%' \
-                 OR key LIKE 'c33_pending_opening:%'",
+                 OR key LIKE 'c33_pending_opening:%' \
+                 OR key LIKE 'application_send:%'",
                 &[],
                 2,
             )
@@ -1676,6 +1679,8 @@ impl SqliteConn {
             };
             let changed = if key.starts_with("c33_pending_opening:") {
                 rewrite_field(&mut value, "/space_uri")
+            } else if key.starts_with("application_send:") {
+                rewrite_field(&mut value, "/archive/space_uri")
             } else {
                 rewrite_json_space_uris(&mut value)
             };

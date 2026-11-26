@@ -102,6 +102,13 @@ fn stored_space_uris_move_to_the_new_form_once() {
         0,
     )
     .unwrap();
+    conn.put_account_meta(
+        "application_send:c1:m1",
+        &json!({ "archive": { "space_uri": old(SEQ, convo) }, "request": old(SEQ, convo) })
+            .to_string(),
+        0,
+    )
+    .unwrap();
 
     db.write_tx(|tx| tx.rewrite_legacy_space_uris(7)).unwrap();
 
@@ -176,6 +183,19 @@ fn stored_space_uris_move_to_the_new_form_once() {
     .unwrap();
     assert_eq!(opening["space_uri"], new(SEQ, convo));
     assert_eq!(opening["frame"], old(SEQ, convo));
+    let journal: Value = serde_json::from_str(
+        &conn
+            .get_account_meta("application_send:c1:m1")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(journal["archive"]["space_uri"], new(SEQ, convo));
+    assert_eq!(
+        journal["request"],
+        old(SEQ, convo),
+        "the signed request is not touched"
+    );
 
     // Once marked, a later open leaves old-form values alone: the rewrite runs once.
     conn.exec_with_text_params(

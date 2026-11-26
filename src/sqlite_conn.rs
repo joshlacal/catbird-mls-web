@@ -586,8 +586,20 @@ impl SqliteConn {
         conn.exec_raw("SELECT count(*) FROM sqlite_master;")?;
         // Ensure the unified 15-table schema (`Spec §6.1`).
         conn.exec_raw(catbird_mls::storage::UNIFIED_SCHEMA_DDL)?;
+        conn.rewrite_legacy_space_uris_on_open()?;
 
         Ok(conn)
+    }
+
+    /// Runs the one-time stored Space URI rewrite ([`Self::rewrite_legacy_space_uris`]) when the
+    /// database is opened, before anything reads a stored URI. The rewrite and its marker
+    /// commit together, so an interrupted run starts again on the next open.
+    /// TODO: remove before beta.
+    fn rewrite_legacy_space_uris_on_open(&self) -> Result<(), WasmSqliteError> {
+        self.transaction(|| {
+            self.rewrite_legacy_space_uris(0)
+                .map_err(|e| WasmSqliteError::Serialization(e.to_string()))
+        })
     }
 
     /// Open an isolated in-memory unified SQLite database (`:memory:`) for
@@ -1515,8 +1527,8 @@ impl SqliteConn {
     /// once per browser database. The browser counterpart of the native driver's rewrite in
     /// `catbird_mls::storage::driver_native`: same rows, plus the browser's own `wasm.*`
     /// bookkeeping and the backup status. Only local bookkeeping changes; signed or encrypted
-    /// bytes, MLS state and message content are never touched. The caller commits the rewrite
-    /// and its marker together, so an interrupted run starts again on the next open.
+    /// bytes, MLS state and message content are never touched. `open` runs it inside one
+    /// transaction; any other caller must likewise commit the rewrite and its marker together.
     /// TODO: remove before beta.
     pub fn rewrite_legacy_space_uris(&self, ts: i64) -> Result<(), catbird_mls::MLSError> {
         use catbird_mls::storage::driver_wasm::WasmSqlBackend;

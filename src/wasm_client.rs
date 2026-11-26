@@ -1242,7 +1242,6 @@ impl WasmMlsClient {
         let ts = now_ms();
         db.write_tx(|tx| {
             tx.repair_legacy_erasure_evidence(ts)?;
-            tx.rewrite_legacy_space_uris(ts)?;
             tx.put_account_meta("owner_did", &normalized_did, ts)?;
             tx.put_account_meta("device_id", &device_id, ts)?;
             tx.put_account_meta("home_ds_did", &home_ds_did, ts)?;

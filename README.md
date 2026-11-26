@@ -2,6 +2,10 @@
 
 Universal browser WASM package wrapping `catbird-mls` for web apps.
 
+## Documentation
+
+Rust API documentation: <https://joshlacal.github.io/catbird-mls-web/> (rustdoc, rebuilt from `main`; start at `catbird_mls_web`).
+
 ## Build
 
 ```bash

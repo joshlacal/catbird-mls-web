@@ -354,6 +354,28 @@ fn verify_own_close_answer(
         .ok_or_else(|| refused("entry seq".into()))
 }
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    /// The global `setTimeout`: this crate runs in a Web Worker, where there is no `Window`.
+    #[wasm_bindgen(js_name = setTimeout)]
+    fn js_set_timeout(handler: &js_sys::Function, timeout_ms: f64) -> f64;
+}
+
+async fn sleep_ms(ms: f64) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let _ = js_set_timeout(&resolve, ms);
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// `account_meta` key set (to the device ID) from the moment `mls-ds` holds this device until its
+/// PDS device and declaration records are both written.
+const ENROLLMENT_PDS_RECORDS_PENDING: &str = "enrollment_pds_records_pending";
+/// Prefix of the error `enrollDevice` returns while those PDS writes are still owed.
+const DEVICE_RECORD_PENDING_ERROR: &str = "DeviceRecordPending";
+/// Waits between attempts to write the PDS device record within one `enrollDevice` call.
+const DEVICE_RECORD_RETRY_DELAYS_MS: [f64; 3] = [400.0, 1_200.0, 3_600.0];
+
 impl WasmMlsClient {
     /// `mls-ds` bootstrap, mirroring catbird-mls `enroll_device_live`: completion is bound to
     /// `auth_generation`, the canonical device ID and signer key. A retry after a lost response
@@ -372,6 +394,10 @@ impl WasmMlsClient {
         let key_id = derive_key_id(pub_key);
         let enrollment_status = db.backend().get_account_meta("enrollment_status")?;
         let was_pending_approval = enrollment_status.as_deref() == Some("pending_approval");
+        let pds_records_pending = db
+            .backend()
+            .get_account_meta(ENROLLMENT_PDS_RECORDS_PENDING)?
+            .is_some();
         if let Some(auth_generation) = db.backend().get_account_meta("auth_generation")? {
             let bound_device = db.backend().get_account_meta("enrolled_device_id")?;
             let bound_key = db.backend().get_account_meta("enrolled_signer_key_id")?;
@@ -389,6 +415,7 @@ impl WasmMlsClient {
             if bound_device.as_deref() == Some(canonical_dev_id)
                 && bound_key.as_deref() == Some(key_id.as_str())
                 && !was_pending_approval
+                && !pds_records_pending
             {
                 return Ok(());
             }
@@ -565,46 +592,14 @@ impl WasmMlsClient {
         }
         let is_pending_approval = status_str == "pending_approval";
 
-        let dev_rec = chat_wire::build_pds_device_put_record_body(
-            &self.account_did,
-            canonical_dev_id,
-            pub_key,
-        )?;
-        let (st1, b1) = self
-            .pds_post_json(
-                session_token,
-                "/xrpc/com.atproto.repo.createRecord",
-                dev_rec,
-            )
+        // `mls-ds` now holds this device, so the enrollment cannot be abandoned: the marker
+        // survives a reload until both PDS records exist, and the next `enrollDevice` call
+        // (answered `DeviceAlreadyExists`, adopted above) resumes the writes.
+        db.write_tx(|tx| {
+            tx.put_account_meta(ENROLLMENT_PDS_RECORDS_PENDING, canonical_dev_id, now_ms())
+        })?;
+        self.write_pds_device_record_with_backoff(session_token, canonical_dev_id, pub_key)
             .await?;
-        if !(200..300).contains(&st1) {
-            if matches!(st1, 400 | 409 | 500) {
-                let get_path = format!(
-                    "/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.device&rkey={}",
-                    chat_wire::urlencode_form_component(&self.account_did),
-                    chat_wire::urlencode_form_component(canonical_dev_id),
-                );
-                let (get_status, _, get_bytes) = self.pds_get(session_token, &get_path).await?;
-                if (200..300).contains(&get_status) {
-                    let existing: Value = serde_json::from_slice(&get_bytes).map_err(|e| {
-                        MLSError::Internal(format!("parse existing chat.device record: {e}"))
-                    })?;
-                    if !chat_wire::pds_device_record_matches(&existing["value"], pub_key) {
-                        return Err(MLSError::InvalidState("EnrollmentPdsRecordConflict".into()));
-                    }
-                } else {
-                    return Err(MLSError::Internal(format!(
-                        "createRecord blue.catbird.chat.device HTTP {st1}: {}",
-                        String::from_utf8_lossy(&b1)
-                    )));
-                }
-            } else {
-                return Err(MLSError::Internal(format!(
-                    "createRecord blue.catbird.chat.device HTTP {st1}: {}",
-                    String::from_utf8_lossy(&b1)
-                )));
-            }
-        }
 
         let decl_rec = chat_wire::build_pds_chat_declaration_put_record_body(
             &self.account_did,
@@ -615,10 +610,11 @@ impl WasmMlsClient {
             .await?;
         if !(200..300).contains(&st2) {
             return Err(MLSError::Internal(format!(
-                "putRecord blue.catbird.chat.declaration HTTP {st2}: {}",
+                "{DEVICE_RECORD_PENDING_ERROR}: putRecord blue.catbird.chat.declaration HTTP {st2}: {}",
                 String::from_utf8_lossy(&b2)
             )));
         }
+        db.write_tx(|tx| tx.delete_account_meta(ENROLLMENT_PDS_RECORDS_PENDING))?;
 
         let ts = now_ms();
         // Real `mls-ds` rejects `publishDirectRequestKeys` (400 PreparationConflict) and
@@ -682,6 +678,101 @@ impl WasmMlsClient {
             .get_account_meta("enrollment_status")?
             .as_deref()
             == Some("pending_approval"))
+    }
+
+    /// Whether `mls-ds` holds this device while its PDS device or declaration record is still
+    /// unwritten. Other devices verify the PDS device record before approving this one, so the
+    /// caller keeps calling `enrollDevice` until this clears.
+    pub(crate) fn is_device_record_pending_impl(&self) -> Result<bool, MLSError> {
+        Ok(self
+            .require_db_mls()?
+            .backend()
+            .get_account_meta(ENROLLMENT_PDS_RECORDS_PENDING)?
+            .is_some())
+    }
+
+    /// Write `blue.catbird.chat.device/{device_id}`, retrying a failed write after each of
+    /// `DEVICE_RECORD_RETRY_DELAYS_MS`. A record already holding this key counts as written; one
+    /// holding another key is `EnrollmentPdsRecordConflict`, which no retry can fix, so it
+    /// drops the pending marker. Running out of attempts leaves the marker for the next call.
+    async fn write_pds_device_record_with_backoff(
+        &self,
+        session_token: &str,
+        canonical_dev_id: &str,
+        pub_key: &[u8],
+    ) -> Result<(), MLSError> {
+        let mut delays = DEVICE_RECORD_RETRY_DELAYS_MS.iter();
+        loop {
+            match self
+                .write_pds_device_record_once(session_token, canonical_dev_id, pub_key)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(conflict @ MLSError::InvalidState(_)) => {
+                    self.require_db_mls()?
+                        .write_tx(|tx| tx.delete_account_meta(ENROLLMENT_PDS_RECORDS_PENDING))?;
+                    return Err(conflict);
+                }
+                Err(error) => match delays.next() {
+                    Some(delay_ms) => sleep_ms(*delay_ms).await,
+                    None => {
+                        return Err(MLSError::Internal(format!(
+                            "{DEVICE_RECORD_PENDING_ERROR}: {error}"
+                        )))
+                    }
+                },
+            }
+        }
+    }
+
+    /// One `createRecord` attempt. `InvalidState` is the only failure a retry cannot fix.
+    async fn write_pds_device_record_once(
+        &self,
+        session_token: &str,
+        canonical_dev_id: &str,
+        pub_key: &[u8],
+    ) -> Result<(), MLSError> {
+        let dev_rec = chat_wire::build_pds_device_put_record_body(
+            &self.account_did,
+            canonical_dev_id,
+            pub_key,
+        )?;
+        let (status, body) = self
+            .pds_post_json(
+                session_token,
+                "/xrpc/com.atproto.repo.createRecord",
+                dev_rec,
+            )
+            .await?;
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        let create_failed = || {
+            MLSError::Internal(format!(
+                "createRecord blue.catbird.chat.device HTTP {status}: {}",
+                String::from_utf8_lossy(&body)
+            ))
+        };
+        // A PDS answers a duplicate `createRecord` with 400, 409 or 500: an earlier attempt
+        // whose answer was lost may already have written the record.
+        if !matches!(status, 400 | 409 | 500) {
+            return Err(create_failed());
+        }
+        let get_path = format!(
+            "/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.device&rkey={}",
+            chat_wire::urlencode_form_component(&self.account_did),
+            chat_wire::urlencode_form_component(canonical_dev_id),
+        );
+        let (get_status, _, get_bytes) = self.pds_get(session_token, &get_path).await?;
+        if !(200..300).contains(&get_status) {
+            return Err(create_failed());
+        }
+        let existing: Value = serde_json::from_slice(&get_bytes)
+            .map_err(|e| MLSError::Internal(format!("parse existing chat.device record: {e}")))?;
+        if !chat_wire::pds_device_record_matches(&existing["value"], pub_key) {
+            return Err(MLSError::InvalidState("EnrollmentPdsRecordConflict".into()));
+        }
+        Ok(())
     }
 
     pub(crate) async fn approve_device_impl(&self, target_device_id: &str) -> Result<(), MLSError> {

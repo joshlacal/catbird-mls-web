@@ -408,6 +408,13 @@ impl WasmMlsClient {
             .map_err(mls_to_js_err)
     }
 
+    /// `true` while `mls-ds` holds this device but its PDS records are not written yet: call
+    /// `enrollDevice` again (now or after a reload) until it clears.
+    #[wasm_bindgen(js_name = isDeviceRecordPending)]
+    pub fn is_device_record_pending(&self) -> Result<bool, JsValue> {
+        self.is_device_record_pending_impl().map_err(mls_to_js_err)
+    }
+
     #[wasm_bindgen(js_name = approveDevice)]
     pub async fn approve_device(&self, target_device_id: String) -> Result<(), JsValue> {
         self.approve_device_impl(&target_device_id)

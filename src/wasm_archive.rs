@@ -1381,6 +1381,7 @@ impl WasmMlsClient {
                     .map_err(|e| MLSError::Internal(e.to_string()))?,
                 None => LabyrinthBackupStatus {
                     backup_enabled: true,
+                    archive_established: false,
                     mailbox_space_uri: catbird_mls::client::personal_mailbox_space_uri(
                         &self.account_did,
                     ),
@@ -1399,6 +1400,8 @@ impl WasmMlsClient {
                 },
             };
             let had_pending_publication = status.pending_directory_epoch.is_some();
+            // A session exists only after it opened or created the archive on the server.
+            status.archive_established = true;
             status.epoch_seq = session.latest_epoch();
             status.recovery_method_stale |= session.recovery_method_stale();
             status.has_recovery_code |= recovery_code;

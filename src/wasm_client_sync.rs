@@ -3445,8 +3445,10 @@ impl WasmMlsClient {
                         None,
                     ),
                 };
-            let space_uri = Some(format!(
-                "at://{effective_seq_did}/space/blue.catbird.labyrinth.conversation/{cid}-0"
+            let space_uri = Some(crate::wasm_client::conversation_space_uri(
+                &effective_seq_did,
+                cid,
+                0,
             ));
             tx.upsert_conversation(&ConversationRow {
                 conversation_id: cid.to_string(),
@@ -4093,8 +4095,10 @@ impl WasmMlsClient {
                 epoch: group.epoch().as_u64() as i64,
                 last_seq: transition_seq,
                 sequencer_did: sequencer_did.to_string(),
-                space_uri: Some(format!(
-                    "at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{cid}-{generation}"
+                space_uri: Some(crate::wasm_client::conversation_space_uri(
+                    sequencer_did,
+                    cid,
+                    generation,
                 )),
                 title,
                 unread_count: retired.map_or(0, |row| row.unread_count),

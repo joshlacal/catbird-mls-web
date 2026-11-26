@@ -41,6 +41,11 @@ fn to_js_val<T: serde::Serialize>(val: &T) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(val).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// The conversation Space of `cid` at `generation`, hosted by its sequencer.
+pub(crate) fn conversation_space_uri(sequencer_did: &str, cid: &str, generation: i64) -> String {
+    format!("at:space/{sequencer_did}/blue.catbird.labyrinth.conversation/{cid}-{generation}")
+}
+
 pub(crate) fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
@@ -357,6 +362,7 @@ impl WasmMlsClient {
                 if tx.get_labyrinth_state("status_json")?.is_none() {
                     let status = LabyrinthBackupStatus {
                         backup_enabled: true,
+                        archive_established: false,
                         mailbox_space_uri: mailbox_uri.clone(),
                         has_recovery_code: false,
                         has_passkey_prf: false,
@@ -785,6 +791,7 @@ impl WasmMlsClient {
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
             None => LabyrinthBackupStatus {
                 backup_enabled: true,
+                archive_established: false,
                 mailbox_space_uri: personal_mailbox_space_uri(&self.account_did),
                 has_recovery_code: false,
                 has_passkey_prf: false,
@@ -1228,6 +1235,7 @@ impl WasmMlsClient {
         let ts = now_ms();
         db.write_tx(|tx| {
             tx.repair_legacy_erasure_evidence(ts)?;
+            tx.rewrite_legacy_space_uris(ts)?;
             tx.put_account_meta("owner_did", &normalized_did, ts)?;
             tx.put_account_meta("device_id", &device_id, ts)?;
             tx.put_account_meta("home_ds_did", &home_ds_did, ts)?;

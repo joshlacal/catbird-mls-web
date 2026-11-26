@@ -1227,7 +1227,7 @@ fn dispatch_fetch_inner(
             let b: Value = serde_json::from_slice(body).unwrap();
             let space_type = b["spaceType"].as_str().unwrap_or("");
             let skey = b["skey"].as_str().unwrap_or("self");
-            let uri = format!("at://{account}/space/{space_type}/{skey}");
+            let uri = format!("at:space/{account}/{space_type}/{skey}");
             WireResponse::json(200, json!({ "uri": uri }))
         }
         "com.atproto.space.getDelegationToken" => {
@@ -2784,7 +2784,7 @@ async fn live_d4_otc_pairing_and_read_and_circle_owner_state() {
     assert_eq!(all_rs.len(), 1);
     assert_eq!(all_rs[0].read_through_seq, 12);
 
-    let circle_space = format!("at://{did}/space/blue.catbird.circles.circle/friends");
+    let circle_space = format!("at:space/{did}/blue.catbird.circles.circle/friends");
     let circle_dto = CircleOwnerStateDto {
         circle_id: "friends".into(),
         space_uri: circle_space.clone(),

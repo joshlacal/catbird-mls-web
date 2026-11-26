@@ -1333,9 +1333,10 @@ impl WasmMlsClient {
                 epoch,
                 last_seq: server_seq,
                 sequencer_did: pending.sequencer_did.clone(),
-                space_uri: Some(format!(
-                    "at://{}/space/blue.catbird.labyrinth.conversation/{conversation_id}-{generation}",
-                    pending.sequencer_did
+                space_uri: Some(crate::wasm_client::conversation_space_uri(
+                    &pending.sequencer_did,
+                    conversation_id,
+                    generation,
                 )),
                 title: pending.title.clone(),
                 unread_count: 0,

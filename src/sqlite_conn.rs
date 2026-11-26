@@ -1511,6 +1511,186 @@ impl SqliteConn {
         self.put_account_meta(DONE, "1", ts)
     }
 
+    /// Rewrites stored alpha-form Space URIs (`at://{did}/space/...`) to `at:space/{did}/...`
+    /// once per browser database. The browser counterpart of the native driver's rewrite in
+    /// `catbird_mls::storage::driver_native`: same rows, plus the browser's own `wasm.*`
+    /// bookkeeping and the backup status. Only local bookkeeping changes; signed or encrypted
+    /// bytes, MLS state and message content are never touched. The caller commits the rewrite
+    /// and its marker together, so an interrupted run starts again on the next open.
+    /// TODO: remove before beta.
+    pub fn rewrite_legacy_space_uris(&self, ts: i64) -> Result<(), catbird_mls::MLSError> {
+        use catbird_mls::storage::driver_wasm::WasmSqlBackend;
+        use catbird_mls::storage::space_uri_rewrite::{
+            from_legacy_space_uri, rewrite_json_space_uris, SPACE_URI_REWRITE_MARKER_KEY,
+        };
+        use catbird_mls::MLSError;
+        use serde_json::Value;
+
+        if self.get_account_meta(SPACE_URI_REWRITE_MARKER_KEY)?.is_some() {
+            return Ok(());
+        }
+        let encode = |value: &Value| {
+            serde_json::to_vec(value)
+                .map_err(|e| MLSError::Internal(format!("space uri rewrite: {e}")))
+        };
+        // Rewrites one named top-level or nested string field, leaving the rest of the JSON alone.
+        let rewrite_field = |value: &mut Value, pointer: &str| -> bool {
+            let Some(slot) = value.pointer_mut(pointer) else {
+                return false;
+            };
+            match slot.as_str().and_then(from_legacy_space_uri) {
+                Some(new) => {
+                    *slot = Value::String(new);
+                    true
+                }
+                None => false,
+            }
+        };
+
+        // conversations.space_uri: a plain Space URI column.
+        let rows = self
+            .query_text(
+                "SELECT conversation_id, space_uri FROM conversations \
+                 WHERE space_uri LIKE 'at://%/space/%'",
+                &[],
+                2,
+            )
+            .map_err(map_wasm_mls_err)?;
+        for row in rows {
+            let (Some(cid), Some(uri)) = (row[0].as_deref(), row[1].as_deref()) else {
+                continue;
+            };
+            if let Some(new_uri) = from_legacy_space_uri(uri) {
+                self.exec_with_text_params(
+                    "UPDATE conversations SET space_uri = ?2 WHERE conversation_id = ?1",
+                    &[(1, cid), (2, &new_uri)],
+                )
+                .map_err(map_wasm_mls_err)?;
+            }
+        }
+
+        // pending_ops: the queued archive's `$.archive.space_uri`, nothing else in the payload.
+        let rows = self
+            .query_text(
+                "SELECT op_kind, op_key, payload_json FROM pending_ops \
+                 WHERE payload_json LIKE '%at://%/space/%'",
+                &[],
+                3,
+            )
+            .map_err(map_wasm_mls_err)?;
+        for row in rows {
+            let (Some(kind), Some(key), Some(raw)) =
+                (row[0].as_deref(), row[1].as_deref(), row[2].as_deref())
+            else {
+                continue;
+            };
+            let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+                continue;
+            };
+            if rewrite_field(&mut value, "/archive/space_uri") {
+                self.exec_with_text_params(
+                    "UPDATE pending_ops SET payload_json = ?3 WHERE op_kind = ?1 AND op_key = ?2",
+                    &[(1, kind), (2, key), (3, &value.to_string())],
+                )
+                .map_err(map_wasm_mls_err)?;
+            }
+        }
+
+        // labyrinth_queue: the outbox envelope's top-level `space_uri` only.
+        let rows = self
+            .query_text_int_blob(
+                "SELECT item_id, payload_bytes FROM labyrinth_queue",
+                &[],
+                &[],
+                2,
+                &[1],
+            )
+            .map_err(map_wasm_mls_err)?;
+        for row in rows {
+            let (Some(item_id), Some(raw)) = (row[0].0.as_deref(), row[1].1.as_deref()) else {
+                continue;
+            };
+            let Ok(mut value) = serde_json::from_slice::<Value>(raw) else {
+                continue;
+            };
+            if rewrite_field(&mut value, "/space_uri") {
+                self.exec_with_text_and_blob_params(
+                    "UPDATE labyrinth_queue SET payload_bytes = ?2 WHERE item_id = ?1",
+                    &[(1, item_id)],
+                    &[(2, &encode(&value)?)],
+                )
+                .map_err(map_wasm_mls_err)?;
+            }
+        }
+
+        // Space pins and writer revision floors (JSON keyed or valued by Space URI), and the
+        // backup status, whose `mailbox_space_uri` is shown to the owner.
+        let rows = self
+            .query_text_int_blob(
+                "SELECT state_key, value_bytes FROM labyrinth_state \
+                 WHERE state_key = 'status_json' \
+                 OR state_key LIKE 'wasm.placements:%' \
+                 OR state_key LIKE 'wasm.writer_rev_floors:%' \
+                 OR state_key LIKE 'native.placements:%' \
+                 OR state_key LIKE 'native.writer_rev_floors:%'",
+                &[],
+                &[],
+                2,
+                &[1],
+            )
+            .map_err(map_wasm_mls_err)?;
+        for row in rows {
+            let (Some(state_key), Some(raw)) = (row[0].0.as_deref(), row[1].1.as_deref()) else {
+                continue;
+            };
+            let Ok(mut value) = serde_json::from_slice::<Value>(raw) else {
+                continue;
+            };
+            if rewrite_json_space_uris(&mut value) {
+                self.exec_with_text_and_blob_params(
+                    "UPDATE labyrinth_state SET value_bytes = ?2 WHERE state_key = ?1",
+                    &[(1, state_key)],
+                    &[(2, &encode(&value)?)],
+                )
+                .map_err(map_wasm_mls_err)?;
+            }
+        }
+
+        // account_meta: mailbox placement request values (whole JSON), and staged C33
+        // openings, whose top-level `space_uri` is enqueued unchanged once accepted.
+        let rows = self
+            .query_text(
+                "SELECT key, value_json FROM account_meta \
+                 WHERE key LIKE 'direct_request_value_v2:labyrinthMailboxPlacement:%' \
+                 OR key LIKE 'c33_pending_opening:%'",
+                &[],
+                2,
+            )
+            .map_err(map_wasm_mls_err)?;
+        for row in rows {
+            let (Some(key), Some(raw)) = (row[0].as_deref(), row[1].as_deref()) else {
+                continue;
+            };
+            let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+                continue;
+            };
+            let changed = if key.starts_with("c33_pending_opening:") {
+                rewrite_field(&mut value, "/space_uri")
+            } else {
+                rewrite_json_space_uris(&mut value)
+            };
+            if changed {
+                self.exec_with_text_params(
+                    "UPDATE account_meta SET value_json = ?2 WHERE key = ?1",
+                    &[(1, key), (2, &value.to_string())],
+                )
+                .map_err(map_wasm_mls_err)?;
+            }
+        }
+
+        self.put_account_meta(SPACE_URI_REWRITE_MARKER_KEY, "1", ts)
+    }
+
     pub fn all_conversation_ids(&self) -> Result<Vec<String>, catbird_mls::MLSError> {
         self.query_text(
             "SELECT conversation_id FROM conversations ORDER BY conversation_id",

@@ -586,8 +586,154 @@ impl SqliteConn {
         conn.exec_raw("SELECT count(*) FROM sqlite_master;")?;
         // Ensure the unified 15-table schema (`Spec §6.1`).
         conn.exec_raw(catbird_mls::storage::UNIFIED_SCHEMA_DDL)?;
+        conn.rewrite_legacy_space_uris()?;
 
         Ok(conn)
+    }
+
+    /// Rewrites stored alpha-form Space URIs (`at://{did}/space/...`) to `at:space/{did}/...`
+    /// once per database: `conversations.space_uri`, `pending_ops` `$.archive.space_uri`, the
+    /// `account_meta` send journals' `$.archive.space_uri` (`application_send:`) and staged C33
+    /// openings' `$.space_uri` (`c33_pending_opening:`), the `labyrinth_queue` envelope's
+    /// `space_uri`, and the Space pin / writer revision floor JSON
+    /// under `wasm.placements:` and `wasm.writer_rev_floors:`. Only old-form values change, so an
+    /// interrupted run finishes on the next open; MLS state and message content are untouched.
+    /// TODO: remove before beta.
+    fn rewrite_legacy_space_uris(&self) -> Result<(), WasmSqliteError> {
+        use catbird_mls::storage::space_uri_rewrite::{
+            from_legacy_space_uri, rewrite_json_space_uris, SPACE_URI_REWRITE_MARKER_KEY,
+        };
+        let done = self.query_text(
+            "SELECT 1 FROM account_meta WHERE key = ?1",
+            &[(1, SPACE_URI_REWRITE_MARKER_KEY)],
+            1,
+        )?;
+        if !done.is_empty() {
+            return Ok(());
+        }
+        let encode = |value: &serde_json::Value| {
+            serde_json::to_vec(value).map_err(|e| WasmSqliteError::Serialization(e.to_string()))
+        };
+        self.transaction(|| -> Result<(), WasmSqliteError> {
+            for row in self.query_text(
+                "SELECT conversation_id, space_uri FROM conversations \
+                 WHERE space_uri LIKE 'at://%/space/%'",
+                &[],
+                2,
+            )? {
+                if let [Some(id), Some(uri)] = row.as_slice() {
+                    if let Some(new_uri) = from_legacy_space_uri(uri) {
+                        self.exec_with_text_params(
+                            "UPDATE conversations SET space_uri = ?2 WHERE conversation_id = ?1",
+                            &[(1, id.as_str()), (2, new_uri.as_str())],
+                        )?;
+                    }
+                }
+            }
+            for row in self.query_text(
+                "SELECT op_kind, op_key, uri FROM (\
+                 SELECT op_kind, op_key, CASE WHEN json_valid(payload_json) \
+                 THEN json_extract(payload_json, '$.archive.space_uri') END AS uri \
+                 FROM pending_ops) WHERE uri LIKE 'at://%/space/%'",
+                &[],
+                3,
+            )? {
+                if let [Some(kind), Some(key), Some(uri)] = row.as_slice() {
+                    if let Some(new_uri) = from_legacy_space_uri(uri) {
+                        self.exec_with_text_params(
+                            "UPDATE pending_ops SET payload_json = \
+                             json_set(payload_json, '$.archive.space_uri', ?3) \
+                             WHERE op_kind = ?1 AND op_key = ?2",
+                            &[(1, kind.as_str()), (2, key.as_str()), (3, new_uri.as_str())],
+                        )?;
+                    }
+                }
+            }
+            // `account_meta` journals that later become archive queue items: a send journal's
+            // `$.archive.space_uri` and a staged C33 opening's `$.space_uri`. The signed request
+            // body, frame, receipt and attestation are left as they are.
+            for (pattern, path) in [
+                ("application_send:*", "$.archive.space_uri"),
+                ("c33_pending_opening:*", "$.space_uri"),
+            ] {
+                for row in self.query_text(
+                    "SELECT key, uri FROM (\
+                     SELECT key, CASE WHEN json_valid(value_json) \
+                     THEN json_extract(value_json, ?2) END AS uri \
+                     FROM account_meta WHERE key GLOB ?1) WHERE uri LIKE 'at://%/space/%'",
+                    &[(1, pattern), (2, path)],
+                    2,
+                )? {
+                    if let [Some(key), Some(uri)] = row.as_slice() {
+                        if let Some(new_uri) = from_legacy_space_uri(uri) {
+                            self.exec_with_text_params(
+                                "UPDATE account_meta SET value_json = \
+                                 json_set(value_json, ?2, ?3) WHERE key = ?1",
+                                &[(1, key.as_str()), (2, path), (3, new_uri.as_str())],
+                            )?;
+                        }
+                    }
+                }
+            }
+            for row in self.query_text(
+                "SELECT item_id, hex(payload_bytes) FROM labyrinth_queue",
+                &[],
+                2,
+            )? {
+                let [Some(id), Some(raw_hex)] = row.as_slice() else {
+                    continue;
+                };
+                let Some(mut value) = hex::decode(raw_hex)
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+                else {
+                    continue;
+                };
+                let Some(new_uri) = value
+                    .get("space_uri")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(from_legacy_space_uri)
+                else {
+                    continue;
+                };
+                value["space_uri"] = serde_json::Value::String(new_uri);
+                self.exec_with_text_and_blob_params(
+                    "UPDATE labyrinth_queue SET payload_bytes = ?2 WHERE item_id = ?1",
+                    &[(1, id.as_str())],
+                    &[(2, encode(&value)?.as_slice())],
+                )?;
+            }
+            for row in self.query_text(
+                "SELECT state_key, hex(value_bytes) FROM labyrinth_state \
+                 WHERE state_key LIKE 'wasm.placements:%' \
+                 OR state_key LIKE 'wasm.writer_rev_floors:%'",
+                &[],
+                2,
+            )? {
+                let [Some(key), Some(raw_hex)] = row.as_slice() else {
+                    continue;
+                };
+                let Some(mut value) = hex::decode(raw_hex)
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+                else {
+                    continue;
+                };
+                if !rewrite_json_space_uris(&mut value) {
+                    continue;
+                }
+                self.exec_with_text_and_blob_params(
+                    "UPDATE labyrinth_state SET value_bytes = ?2 WHERE state_key = ?1",
+                    &[(1, key.as_str())],
+                    &[(2, encode(&value)?.as_slice())],
+                )?;
+            }
+            self.exec_with_text_params(
+                "INSERT OR REPLACE INTO account_meta(key, value_json, updated_at_ms) \
+                 VALUES(?1, '1', 0)",
+                &[(1, SPACE_URI_REWRITE_MARKER_KEY)],
+            )
+        })
     }
 
     /// Open an isolated in-memory unified SQLite database (`:memory:`) for

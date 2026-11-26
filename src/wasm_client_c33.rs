@@ -673,8 +673,9 @@ impl WasmMlsClient {
         let display_json = json!({ "text": intro_text }).to_string();
         let coords_json = serde_json::to_string(&bootstrap.coordinates)?;
         let attestation_json = serde_json::to_string(&bootstrap.original_sender_attestation)?;
-        let space_uri = Some(format!(
-            "at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-0"
+        let space_uri = Some(crate::wasm_client::conversation_space_uri(
+            &sequencer_did,
+            &format!("{conversation_id}-0"),
         ));
         let key = creation_key(peer_did);
         let ts = now_ms();

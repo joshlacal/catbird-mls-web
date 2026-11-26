@@ -41,6 +41,15 @@ fn to_js_val<T: serde::Serialize>(val: &T) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(val).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Conversation Space URI (`at:space/{sequencerDid}/blue.catbird.labyrinth.conversation/{skey}`).
+pub(crate) fn conversation_space_uri(sequencer_did: &str, skey: &str) -> String {
+    atproto_spaces::SpaceUri::conversation(sequencer_did, skey)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| {
+            format!("at:space/{sequencer_did}/blue.catbird.labyrinth.conversation/{skey}")
+        })
+}
+
 pub(crate) fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }

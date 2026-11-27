@@ -2,13 +2,13 @@
 //!
 //! Port of catmos/src-tauri/src/api_client.rs (ReqwestApiClient) for WASM.
 //! reqwest with WASM features uses the browser fetch API under the hood.
-//! Uses shared catbird-atproto types for request/response serialization.
+//! Uses the Petrel Rust `blue.catbird.chat` types (via `catbird_mls::atproto`) for request/response serialization.
 //! Non-lexicon delivery status lookups intentionally degrade to a local fallback.
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use catbird_atproto::blue_catbird;
+use catbird_mls::atproto::chat;
 use reqwest::Client;
 use std::sync::RwLock;
 
@@ -524,9 +524,8 @@ impl MLSAPIClient for WasmApiClient {
         }
         let mut conversations = Vec::new();
         for item in output.items {
-            if let blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(
-                state_item,
-            ) = item
+            if let chat::defs::ConversationInventoryItem::ConversationInventoryState(state_item) =
+                item
             {
                 conversations.push(canonical_conversation_view(&state_item.state));
             }
@@ -629,12 +628,12 @@ impl MLSAPIClient for WasmApiClient {
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
         let actor = self.actor_device()?;
-        let active_status: blue_catbird::chat::DeviceStatus<&str> = "active";
+        let active_status = chat::defs::DeviceStatus::Active;
         let device = self
             .list_devices(&actor)
             .await?
             .into_iter()
-            .find(|d| d.device_id == actor && d.status.as_deref() == Some(active_status))
+            .find(|d| d.device_id == actor && d.status.as_deref() == Some(active_status.as_str()))
             .ok_or_else(|| {
                 OrchestratorError::Api("Current enrolled device is unavailable".into())
             })?;
@@ -691,9 +690,8 @@ impl MLSAPIClient for WasmApiClient {
                 .bytes()
                 .await
                 .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-            let output: blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String> =
-                serde_json::from_slice(&body)
-                    .map_err(|e| OrchestratorError::Api(format!("getOwnDevices parse: {e}")))?;
+            let output: chat::get_own_devices::Output = serde_json::from_slice(&body)
+                .map_err(|e| OrchestratorError::Api(format!("getOwnDevices parse: {e}")))?;
             for d in output.items {
                 let device_id = d.device.device_id.to_string();
                 if !seen.insert(device_id.clone()) {
@@ -705,7 +703,7 @@ impl MLSAPIClient for WasmApiClient {
                     device_id,
                     created_at: None,
                     key_id: Some(d.device.key_id.to_string()),
-                    signature_public_key: Some(d.device.signature_public_key.to_vec()),
+                    signature_public_key: Some(d.device.signature_public_key.0.clone()),
                     auth_generation: Some(d.device.auth_generation),
                     status: Some(d.device.status.to_string()),
                     available_package_count: Some(d.device.available_package_count.max(0) as u32),
@@ -749,10 +747,9 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String> =
-            serde_json::from_slice(&body)
-                .map_err(|e| OrchestratorError::Api(format!("getConversationState parse: {e}")))?;
-        Ok(output.state.coordinates.group_id.as_ref().to_vec())
+        let output: chat::get_conversation_state::Output = serde_json::from_slice(&body)
+            .map_err(|e| OrchestratorError::Api(format!("getConversationState parse: {e}")))?;
+        Ok(output.state.coordinates.group_id.0)
     }
 
     async fn get_welcome(&self, _convo_id: &str) -> Result<Vec<u8>> {
@@ -797,11 +794,11 @@ impl MLSAPIClient for WasmApiClient {
 }
 
 fn canonical_conversation_view(
-    state: &catbird_atproto::blue_catbird::chat::ConversationState,
+    state: &catbird_mls::atproto::chat::defs::ConversationState,
 ) -> ConversationView {
     ConversationView {
         canonical_state: Some(state.clone()),
-        group_id: hex::encode(state.coordinates.group_id.as_ref()),
+        group_id: hex::encode(&state.coordinates.group_id.0),
         conversation_id: state.coordinates.conversation_id.to_string(),
         epoch: state.coordinates.epoch as u64,
         members: state
@@ -809,7 +806,7 @@ fn canonical_conversation_view(
             .iter()
             .map(|participant| MemberView {
                 did: participant.user_did.to_string(),
-                role: if participant.role == "admin" {
+                role: if participant.role == chat::defs::MemberRole::Admin {
                     MemberRole::Admin
                 } else {
                     MemberRole::Member
@@ -865,16 +862,13 @@ mod canonical_admission_projection_tests {
             assert_eq!(page.next_page_cursor.as_deref(), Some("page-2"));
             assert_eq!(page.inventory_session_id, "inventory-session");
             assert_eq!(page.snapshot_event_cursor, "event-fence");
-            let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(item) = page.items.remove(0) else { panic!("missing canonical state") };
+            let catbird_mls::atproto::chat::defs::ConversationInventoryItem::ConversationInventoryState(item) = page.items.remove(0) else { panic!("missing canonical state") };
             let state = item.state;
             assert_eq!(state, expected);
             let view = canonical_conversation_view(&state);
             assert_eq!(view.canonical_state.as_ref(), Some(&state));
             assert_eq!(view.epoch, state.coordinates.epoch as u64);
-            assert_eq!(
-                view.group_id,
-                hex::encode(state.coordinates.group_id.as_ref())
-            );
+            assert_eq!(view.group_id, hex::encode(&state.coordinates.group_id.0));
             let persisted: ConversationView =
                 serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
             let retained = persisted.canonical_state.unwrap();
@@ -882,7 +876,7 @@ mod canonical_admission_projection_tests {
                 decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(),
                 state
             );
-            assert_eq!(retained.participants[1].status, status);
+            assert_eq!(retained.participants[1].status.as_str(), status);
             assert_eq!(retained.participants[1].leaf_count, 0);
             assert_eq!(
                 retained.participants[1].invitation_provenance,

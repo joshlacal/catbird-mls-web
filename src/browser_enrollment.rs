@@ -59,11 +59,11 @@ impl EnrollmentJournal {
 
     fn validate_server(
         &self,
-        device: &catbird_atproto::blue_catbird::chat::DeviceView<String>,
+        device: &catbird_mls::atproto::chat::defs::DeviceView,
     ) -> Result<i64> {
         if device.device_id.as_ref() != self.device_id
             || device.key_id.as_ref() != self.key_id
-            || device.signature_public_key.as_ref() != self.public_key
+            || device.signature_public_key.0 != self.public_key
             || device.auth_generation <= 0
             || device.status.as_str() != "active"
             || self
@@ -191,7 +191,7 @@ pub async fn initialize_enrollment(
                 body: String::from_utf8_lossy(&response.body).into_owned(),
             });
         }
-        let output: catbird_atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String> =
+        let output: catbird_mls::atproto::chat::enroll_device::Output =
             serde_json::from_slice(&response.body).map_err(|error| {
                 OrchestratorError::Credential(format!("invalid enrollment response: {error}"))
             })?;

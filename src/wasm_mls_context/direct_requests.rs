@@ -534,7 +534,7 @@ impl WasmMLSContext {
         &self,
         owner: &str,
         cid: &str,
-    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
+    ) -> Result<Option<catbird_mls::atproto::chat::defs::ConversationState>, MLSError> {
         self.bind_request_owner(owner)?;
         self.request_value("policy", cid)?
             .map(|raw| {
@@ -546,7 +546,7 @@ impl WasmMLSContext {
     pub(super) fn protect_policy(
         &self,
         owner: &str,
-        state: &catbird_atproto::blue_catbird::chat::ConversationState,
+        state: &catbird_mls::atproto::chat::defs::ConversationState,
     ) -> Result<bool, MLSError> {
         self.bind_request_owner(owner)?;
         let cid = state.coordinates.conversation_id.as_str();
@@ -582,8 +582,7 @@ impl WasmMLSContext {
         &self,
         owner: &str,
         cid: &str,
-    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError>
-    {
+    ) -> Result<Option<catbird_mls::atproto::chat::defs::ConversationCoordinates>, MLSError> {
         self.bind_request_owner(owner)?;
         self.request_value("departure", cid)?
             .map(|raw| {
@@ -597,7 +596,7 @@ impl WasmMLSContext {
     pub(super) fn protect_departure(
         &self,
         owner: &str,
-        state: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+        state: &catbird_mls::atproto::chat::defs::ConversationCoordinates,
     ) -> Result<bool, MLSError> {
         self.bind_request_owner(owner)?;
         let cid = state.conversation_id.as_str();
@@ -625,7 +624,7 @@ impl WasmMLSContext {
             self.put_request_value(
                 "departure",
                 cid,
-                &serde_json::to_vec(&next).map_err(failure)?,
+                &catbird_mls::atproto::json::to_vec(&next).map_err(failure)?,
             )?;
             Ok(true)
         })?;

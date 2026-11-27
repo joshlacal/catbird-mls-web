@@ -29,9 +29,7 @@ use atproto_spaces::{
     SpaceUri,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use catbird_atproto::com_atproto::space::{
-    get_record::GetRecordOutput, list_records::ListRecordsOutput, list_repo_ops::ListRepoOpsOutput,
-};
+use catbird_mls::atproto::petrel_core;
 use catbird_mls::client::chat_wire;
 use catbird_mls::labyrinth::space::{thread_placement_key, ThreadPlacement};
 use catbird_mls::labyrinth::{LabyrinthSpaceRequest, LabyrinthSpaceResponse};
@@ -155,8 +153,48 @@ struct Commit {
     repo: String,
     rev: String,
     ver: u64,
-    #[serde(with = "catbird_atproto::jacquard_common::serde_bytes_helper")]
-    data: catbird_atproto::jacquard_common::deps::bytes::Bytes,
+    #[serde(with = "catbird_mls::atproto_bytes")]
+    data: Vec<u8>,
+}
+
+// Read shapes of `com.atproto.space.{getRecord,listRecords,listRepoOps}` as the
+// deployed Space hosts serve them. Petrel's generated outputs follow the newer
+// lexicon (`at:space/` Space refs, a required nullable `prev`), which deployed
+// hosts do not send yet, so these mirror the pre-Petrel decoding: unknown
+// fields are dropped and record values are AT Protocol data-model values.
+#[derive(Clone, Debug, Deserialize)]
+struct GetRecordOutput {
+    uri: String,
+    cid: String,
+    value: petrel_core::Value,
+}
+#[derive(Clone, Debug, Deserialize)]
+struct ListRecordsOutput {
+    records: Vec<ListRecordsRecord>,
+}
+#[derive(Clone, Debug, Deserialize)]
+struct ListRecordsRecord {
+    #[serde(default)]
+    value: Option<petrel_core::Value>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ListRepoOpsOutput {
+    commit: Commit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+    ops: Vec<ListRepoOpsEntry>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ListRepoOpsEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cid: Option<String>,
+    collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prev: Option<String>,
+    rev: String,
+    rkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<petrel_core::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -167,8 +205,8 @@ enum InventoryWriterItem {
         repo: String,
         repo_rev: String,
         space_rev: String,
-        #[serde(with = "catbird_atproto::jacquard_common::serde_bytes_helper")]
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes,
+        #[serde(with = "catbird_mls::atproto_bytes")]
+        data: Vec<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prev_space_rev: Option<String>,
     },
@@ -463,8 +501,8 @@ impl WebArchiveGateway {
             .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
         if !has_auth {
             if let Some(auth) = self.client.petrel_auth.borrow().clone() {
-                let http_method = http::Method::from_bytes(method.as_bytes())
-                    .map_err(|e| e.to_string())?;
+                let http_method =
+                    http::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
                 let (nsid, params) = crate::wasm_auth::split_xrpc_path(path)?;
                 let mut header_map = http::HeaderMap::new();
                 let mut content_type = None;
@@ -1169,7 +1207,7 @@ impl WebArchiveGateway {
             let _: [u8; 32] = page
                 .commit
                 .data
-                .as_ref()
+                .as_slice()
                 .try_into()
                 .map_err(|_| "wasm_space_invalid_inventory_commitment")?;
             if expected_commit.is_none() {
@@ -1207,7 +1245,7 @@ impl WebArchiveGateway {
                             return Err("wasm_space_invalid_inventory_row".into());
                         }
                         let data_32: [u8; 32] = data
-                            .as_ref()
+                            .as_slice()
                             .try_into()
                             .map_err(|_| "wasm_space_invalid_inventory_repo_commitment")?;
                         active_repos.push(ActiveInventoryRepo {
@@ -1260,7 +1298,7 @@ impl WebArchiveGateway {
         let commit = expected_commit.ok_or("wasm_space_inventory_commit_missing")?;
         let expected_data: [u8; 32] = commit
             .data
-            .as_ref()
+            .as_slice()
             .try_into()
             .map_err(|_| "wasm_space_invalid_inventory_commitment")?;
         let mut inventory_hash = LtHash::empty();
@@ -1367,7 +1405,7 @@ impl WebArchiveGateway {
                     .ok_or("wasm_space_missing_request_secret")?,
             )
             .await?;
-        if head.rev != row.repo_rev || head.data.as_ref() != expected_data.as_slice() {
+        if head.rev != row.repo_rev || head.data.as_slice() != expected_data.as_slice() {
             return Err("wasm_space_inventory_oplog_head_mismatch".into());
         }
         let mut records = Vec::with_capacity(repo.records.len());
@@ -1806,7 +1844,7 @@ impl WebArchiveGateway {
                 continue;
             }
             let head = envelope.commit.ok_or("wasm_space_missing_head_commit")?;
-            if state.lt_hash.commitment().as_slice() != head.data.as_ref()
+            if state.lt_hash.commitment().as_slice() != head.data.as_slice()
                 || state
                     .latest_rev
                     .as_ref()
@@ -1822,12 +1860,11 @@ impl WebArchiveGateway {
             if found.len() != wanted.len() {
                 return Err("wasm_space_requested_ops_not_found".into());
             }
-            let mut full: ListRepoOpsOutput =
+            let full: ListRepoOpsOutput =
                 decode(&response.body, "authenticated listRepoOps values")?;
-            for op in &mut full.ops {
-                op.extra_data = None;
+            for op in &full.ops {
                 if let Some(value) = &op.value {
-                    let path = format!("{}/{}", op.collection.as_str(), op.rkey.as_ref());
+                    let path = format!("{}/{}", op.collection, op.rkey);
                     let current = state
                         .cid_by_path
                         .get(&path)
@@ -1836,13 +1873,12 @@ impl WebArchiveGateway {
                         .cid
                         .as_ref()
                         .ok_or("wasm_space_stale_op_value")?
-                        .as_str()
                         .parse()
                         .map_err(|_| "wasm_space_invalid_op_cid")?;
                     if current != &claimed {
                         return Err("wasm_space_stale_op_value".into());
                     }
-                    let bytes = serde_ipld_dagcbor::to_vec(value)
+                    let bytes = petrel_core::to_dag_cbor(value)
                         .map_err(|e| format!("wasm_space_encode_op_value: {e}"))?;
                     validate_canonical_dagcbor_record(&bytes)
                         .map_err(|e| format!("wasm_space_invalid_op_value: {e}"))?;
@@ -1851,8 +1887,6 @@ impl WebArchiveGateway {
                     }
                 }
             }
-            full.extra_data = None;
-            full.commit.extra_data = None;
             let mut body =
                 serde_json::to_value(&full).map_err(|e| format!("wasm_space_encode_ops: {e}"))?;
             let served: ServedOps = decode(&response.body, "authenticated listRepoOps JSON")?;
@@ -1909,15 +1943,14 @@ fn verify_record(
     let headers = mac_headers(response, RECORD_MAC_HEADER)?;
     verify_record_mac(secret, key_share, &headers, &envelope.uri, &envelope.cid)
         .map_err(|e| format!("wasm_space_record_mac: {e}"))?;
-    let mut full: GetRecordOutput = decode(&response.body, "authenticated getRecord value")?;
-    let bytes = serde_ipld_dagcbor::to_vec(&full.value)
+    let full: GetRecordOutput = decode(&response.body, "authenticated getRecord value")?;
+    let bytes = petrel_core::to_dag_cbor(&full.value)
         .map_err(|e| format!("wasm_space_encode_record_value: {e}"))?;
     validate_canonical_dagcbor_record(&bytes)
         .map_err(|e| format!("wasm_space_invalid_record_value: {e}"))?;
     if compute_dagcbor_cid(&bytes).to_bytes() != cid {
         return Err("wasm_space_record_value_cid_mismatch".into());
     }
-    full.extra_data = None;
     let served: ServedValue = decode(&response.body, "authenticated getRecord JSON")?;
     Ok((full, served.value.ok_or("wasm_space_missing_record_value")?))
 }
@@ -1938,7 +1971,7 @@ fn verify_commit(
     }
     let data: [u8; 32] = commit
         .data
-        .as_ref()
+        .as_slice()
         .try_into()
         .map_err(|_| "wasm_space_invalid_commit_data")?;
     let headers = mac_headers(response, COMMIT_MAC_HEADER)?;

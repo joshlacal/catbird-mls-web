@@ -29,16 +29,16 @@ use catbird_mls::chat_v2::transcript::{
     decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
 };
 use catbird_mls::client::{
-    chat_wire, CircleOwnerStateDto, EnrollmentReceipt,
-    LabyrinthBackupStatus, LabyrinthRevocationOutcome, LeaveConversationOutcome,
-    MailboxReadStateRecord, OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer,
-    RegisteredDeviceInfo, UploadedConversationAttachment, REQUIRED_LABYRINTH_OAUTH_SCOPES,
+    chat_wire, CircleOwnerStateDto, EnrollmentReceipt, LabyrinthBackupStatus,
+    LabyrinthRevocationOutcome, LeaveConversationOutcome, MailboxReadStateRecord,
+    OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer, RegisteredDeviceInfo,
+    UploadedConversationAttachment, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
+use catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1;
 use catbird_mls::metadata::{
     decrypt_metadata_snapshot_plaintext, derive_metadata_key_from_group,
     encrypt_metadata_snapshot_plaintext_with_nonce,
 };
-use catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1;
 use catbird_mls::storage::driver_wasm::{WasmAccountDb, WasmSqlBackend as _};
 use catbird_mls::storage::MessageRow;
 use catbird_mls::MLSMessagePayload;
@@ -264,9 +264,11 @@ fn tid(seq: u64) -> String {
 }
 
 fn canonical_record(value: &Value) -> Result<StoredRecord, String> {
-    let typed: catbird_atproto::types::value::Data =
-        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    let dagcbor = serde_ipld_dagcbor::to_vec(&typed).map_err(|e| e.to_string())?;
+    let raw = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    let typed: catbird_mls::atproto::petrel_core::Value =
+        catbird_mls::atproto::petrel_core::from_json(&raw).map_err(|e| e.to_string())?;
+    let dagcbor =
+        catbird_mls::atproto::petrel_core::to_dag_cbor(&typed).map_err(|e| e.to_string())?;
     validate_canonical_dagcbor_record(&dagcbor).map_err(|e| e.to_string())?;
     Ok(StoredRecord {
         value: value.clone(),
@@ -846,9 +848,7 @@ fn dispatch_fetch_inner(
             doc["verificationMethod"]
                 .as_array_mut()
                 .unwrap()
-                .retain(|method| {
-                    method["id"].as_str() != Some(format!("{did}#atproto").as_str())
-                });
+                .retain(|method| method["id"].as_str() != Some(format!("{did}#atproto").as_str()));
         }
         return WireResponse::json(200, doc);
     }
@@ -1148,7 +1148,10 @@ fn dispatch_fetch_inner(
             WORLD.with(|cell| {
                 let w = cell.borrow();
                 if let Some((status, code)) = w.pds_repo_status_for.get(repo) {
-                    return WireResponse::json(*status, json!({ "error": code, "message": "mock PDS repo status" }));
+                    return WireResponse::json(
+                        *status,
+                        json!({ "error": code, "message": "mock PDS repo status" }),
+                    );
                 }
                 let mut records = Vec::new();
                 if collection == labyrinth::records::nsid::MAILBOX_KEYS {
@@ -1547,10 +1550,9 @@ fn dispatch_fetch_inner(
                 "keyId": "wave2-recovery-share-key-1",
             }),
         ),
-        "blue.catbird.labyrinth.getRecoveryShare" => WireResponse::json(
-            400,
-            json!({"error": "RecoveryShareUnavailable"}),
-        ),
+        "blue.catbird.labyrinth.getRecoveryShare" => {
+            WireResponse::json(400, json!({"error": "RecoveryShareUnavailable"}))
+        }
         "blue.catbird.labyrinth.deleteRecoveryShare" => {
             let input: Value = serde_json::from_slice(body).unwrap();
             WireResponse::json(200, json!({"vdeviceId": input["vdeviceId"]}))
@@ -2223,7 +2225,6 @@ fn seed_fake_v3_bundle(did: &str, code: &RecoveryCode) {
     });
 }
 
-
 /// `#87`/`#89` `pending_approval` 2nd-device enrollment seam + `D-1` CARv1 `repo_proof` tamper
 /// rejection + sibling `approveDevice` + post-approval promotion + `listDevices` + `revokeDevice`.
 #[wasm_bindgen_test]
@@ -2316,8 +2317,7 @@ async fn pending_approval_second_device_car_v1_approval_and_device_revocation() 
     // 4. `dev2` re-runs `enrollDevice` -> promotes to active, publishes DR keys + replenishes KPs!
     let _ = enroll(&dev2).await;
     let _: LabyrinthBackupStatus = serde_wasm_bindgen::from_value(
-        dev2
-            .restore_with_recovery_code_live(bootstrap_recovery_code)
+        dev2.restore_with_recovery_code_live(bootstrap_recovery_code)
             .await
             .unwrap(),
     )
@@ -2339,10 +2339,8 @@ async fn pending_approval_second_device_car_v1_approval_and_device_revocation() 
     // 5. A replacement recovery code must survive the unified revoke return. An unproven
     // home-service route fails before the DS mutation, and the durable reminder is explicit.
     let _old_recovery_code = dev1.create_recovery_code_live().await.unwrap();
-    let acknowledged: LabyrinthBackupStatus = serde_wasm_bindgen::from_value(
-        dev1.acknowledge_recovery_attention().unwrap(),
-    )
-    .unwrap();
+    let acknowledged: LabyrinthBackupStatus =
+        serde_wasm_bindgen::from_value(dev1.acknowledge_recovery_attention().unwrap()).unwrap();
     assert!(!acknowledged.recovery_needs_attention);
 
     let revoke_calls_before = call_count("blue.catbird.chat.revokeDevice");
@@ -2382,7 +2380,10 @@ async fn pending_approval_second_device_car_v1_approval_and_device_revocation() 
         .expect_err("archive rotation failure must not be reported as revoke success")
         .as_string()
         .unwrap();
-    assert!(archive_err.contains("injected archive failure"), "{archive_err}");
+    assert!(
+        archive_err.contains("injected archive failure"),
+        "{archive_err}"
+    );
     assert_eq!(
         call_count("blue.catbird.chat.revokeDevice"),
         revoke_calls_before + 1
@@ -2477,11 +2478,7 @@ async fn recovery_code_and_passkey_prf_live_restore_promote_pending_approval_dev
         cell.borrow()
             .ds_devices
             .get(&did)
-            .and_then(|devices| {
-                devices
-                    .iter()
-                    .find(|device| device.device_id == dev2_id)
-            })
+            .and_then(|devices| devices.iter().find(|device| device.device_id == dev2_id))
             .map(|device| device.status.clone())
     });
     assert_eq!(directory_status.as_deref(), Some("active"));
@@ -2587,8 +2584,7 @@ async fn v3_recovery_uses_only_the_proven_home_share_service() {
     let dev2 = open_client(&did, dev2_id).await;
     let _ = enroll(&dev2).await;
     set_declared_home(&did, "did:web:other.catbird.test");
-    let capabilities_before =
-        call_count("blue.catbird.labyrinth.getRecoveryShareCapabilities");
+    let capabilities_before = call_count("blue.catbird.labyrinth.getRecoveryShareCapabilities");
     let unproven = dev2
         .restore_with_recovery_code_live(v3_code.to_string())
         .await
@@ -2645,8 +2641,7 @@ async fn labyrinth_only_revoke_returns_replacement_code_and_durable_attention() 
     dev1.approve_device(dev2_id.into()).await.unwrap();
     let _ = enroll(&dev2).await;
     let _: LabyrinthBackupStatus = serde_wasm_bindgen::from_value(
-        dev2
-            .restore_with_recovery_code_live(bootstrap_recovery_code)
+        dev2.restore_with_recovery_code_live(bootstrap_recovery_code)
             .await
             .unwrap(),
     )
@@ -2660,15 +2655,12 @@ async fn labyrinth_only_revoke_returns_replacement_code_and_durable_attention() 
         .and_then(|device| device.labyrinth_device_key_hex.clone())
         .expect("active sibling Labyrinth device key");
     let _old_code = dev1.create_recovery_code_live().await.unwrap();
-    let _: LabyrinthBackupStatus = serde_wasm_bindgen::from_value(
-        dev1.acknowledge_recovery_attention().unwrap(),
-    )
-    .unwrap();
+    let _: LabyrinthBackupStatus =
+        serde_wasm_bindgen::from_value(dev1.acknowledge_recovery_attention().unwrap()).unwrap();
 
-    let outcome: LabyrinthRevocationOutcome = serde_wasm_bindgen::from_value(
-        dev1.revoke_labyrinth_device(target).await.unwrap(),
-    )
-    .unwrap();
+    let outcome: LabyrinthRevocationOutcome =
+        serde_wasm_bindgen::from_value(dev1.revoke_labyrinth_device(target).await.unwrap())
+            .unwrap();
     assert!(outcome.rekeyed_recovery_code.is_some());
     assert!(outcome.status.recovery_needs_attention);
 
@@ -3058,7 +3050,8 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
                      sender_device_id, plaintext_json, created_at_ms, is_own)
                  SELECT 'old-' || i, ?1, X'00', 1, 0, ?2, 'legacy-device', '{}', 0, 0 FROM n",
                 &[(1, cid), (2, &alice)],
-            ).map_err(|e| catbird_mls::MLSError::Internal(e.to_string()))?;
+            )
+            .map_err(|e| catbird_mls::MLSError::Internal(e.to_string()))?;
             Ok(())
         })
         .unwrap();
@@ -3074,11 +3067,17 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
         serde_wasm_bindgen::from_value(alice_client.list_messages(cid.into(), None, 10).unwrap())
             .unwrap();
     assert_eq!(repaired.len(), 2);
-    let image = repaired.iter().find(|row| row.message_id == img_mid).unwrap();
+    let image = repaired
+        .iter()
+        .find(|row| row.message_id == img_mid)
+        .unwrap();
     assert_eq!(image.sender_device_id, img_row.sender_device_id);
     assert_eq!(image.group_id, img_row.group_id);
     assert_eq!(image.epoch, img_row.epoch);
-    let voice = repaired.iter().find(|row| row.message_id == voice_mid).unwrap();
+    let voice = repaired
+        .iter()
+        .find(|row| row.message_id == voice_mid)
+        .unwrap();
     assert_eq!(voice.sender_device_id, voice_row.sender_device_id);
     WORLD.with(|c| {
         let mut world = c.borrow_mut();
@@ -3331,7 +3330,6 @@ async fn space_attachments_voice_reindex_leave_and_fail_closed_d3_delete() {
     );
     alice_client = open_client(&alice, alice_dev).await;
 
-
     // 5. `D-3` fail-closed `deleteAccountData`:
     //    Inject remote 500 error -> `deleteAccountData` MUST return `Err` AND preserve local OPFS!
     WORLD.with(|c| c.borrow_mut().delete_account_fault = true);
@@ -3456,10 +3454,9 @@ fn stored_metadata_snapshot_and_plaintext(
     .unwrap();
     let convo = db.backend().get_conversation(cid).unwrap().unwrap();
     let provider = db.openmls_provider().unwrap();
-    let mut group =
-        MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
-            .unwrap()
-            .unwrap();
+    let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+        .unwrap()
+        .unwrap();
     let epoch = snapshot["coordinate"]["epoch"].as_u64().unwrap();
     assert_eq!(group.epoch().as_u64(), epoch);
     let version = snapshot["metadataVersion"].as_u64().unwrap();
@@ -3577,8 +3574,7 @@ fn add_bob_leaf_to_local_group(alice: &str, alice_dev: &str, bob: &str, bob_dev:
         );
         let mut next_snapshot = prior_snapshot.clone();
         next_snapshot["ciphertext"] = json!({ "$bytes": STANDARD.encode(&ciphertext) });
-        next_snapshot["ciphertextSha256"] =
-            json!(STANDARD.encode(Sha256::digest(&ciphertext)));
+        next_snapshot["ciphertextSha256"] = json!(STANDARD.encode(Sha256::digest(&ciphertext)));
         next_snapshot["ciphertextSize"] = json!(ciphertext.len());
         next_snapshot["nonce"] = json!({ "$bytes": STANDARD.encode(nonce) });
         let coordinate = next_snapshot["coordinate"].as_object_mut().unwrap();

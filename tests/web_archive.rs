@@ -6,12 +6,12 @@
 //! `applyWrites`. The queued row is Alice's own send with a real frame nonce, `I13` receipt and
 //! original sender attestation, stored as `finish_application_send` stores it.
 #![cfg(target_arch = "wasm32")]
-use std::rc::Rc;
 use atproto_spaces::{
     kem::{encode_p256_did_key, P256SecretKey},
     lthash::compute_dagcbor_cid,
     tokens::SpaceSigningKey,
 };
+use std::rc::Rc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_mls::client::{
@@ -229,12 +229,11 @@ fn publish_did_document(did: &str) {
 }
 
 fn publish_record_proof(did: &str, collection: &str, rkey: &str, value: &Value) -> String {
-    let typed: catbird_atproto::types::value::Data =
-        serde_json::from_value(value.clone()).unwrap();
-    let dagcbor = serde_ipld_dagcbor::to_vec(&typed).unwrap();
+    let typed: catbird_mls::atproto::petrel_core::Value =
+        catbird_mls::atproto::petrel_core::from_json(&serde_json::to_vec(value).unwrap()).unwrap();
+    let dagcbor = catbird_mls::atproto::petrel_core::to_dag_cbor(&typed).unwrap();
     let cid = compute_dagcbor_cid(&dagcbor).to_string();
-    let signing_key =
-        SpaceSigningKey::from_p256_secret(&p256_key(did, b"sign"), "#atproto");
+    let signing_key = SpaceSigningKey::from_p256_secret(&p256_key(did, b"sign"), "#atproto");
     let (_, car) = build_repo_proof_car_v1(
         did,
         "3lb2zzzzzzzzz",
@@ -246,7 +245,6 @@ fn publish_record_proof(did: &str, collection: &str, rkey: &str, value: &Value) 
     publishRepoProof(&uri, &cid, &STANDARD.encode(car));
     cid
 }
-
 
 fn install() -> RestoreFetch {
     installArchiveFixture();
@@ -329,18 +327,8 @@ fn publish_epoch(
     let epoch = EpochPublic::sign(did, 0, &keys, [seed; 32], None, None, &Device(device)).unwrap();
     let record = MailboxKeysRecord::from_public(&epoch, None, "2026-11-07T00:00:00.000Z".into());
     let value = serde_json::to_value(&record).unwrap();
-    let cid = publish_record_proof(
-        did,
-        labyrinth::records::nsid::MAILBOX_KEYS,
-        "self",
-        &value,
-    );
-    publishMailboxKeys(
-        did,
-        &serde_json::to_string(&record).unwrap(),
-        &cid,
-        own_pds,
-    );
+    let cid = publish_record_proof(did, labyrinth::records::nsid::MAILBOX_KEYS, "self", &value);
+    publishMailboxKeys(did, &serde_json::to_string(&record).unwrap(), &cid, own_pds);
     if ds_head {
         let head = EpochPublicDef::from_public(&epoch);
         publishEpochHead(did, &serde_json::to_string(&head).unwrap());
@@ -630,10 +618,7 @@ async fn flush_distributes_a_transport_mek_every_member_epoch_opens() {
     let resolve_calls_before = callCount("com.atproto.identity.resolveDid");
 
     let mut client = open(&alice, ALICE_DEVICE).await;
-    for (fault_did, fault) in [
-        (&bob, "malformed"),
-        (&alice, "missing_atproto"),
-    ] {
+    for (fault_did, fault) in [(&bob, "malformed"), (&alice, "missing_atproto")] {
         publish_did_document(fault_did);
         faultDidDoc(fault_did, fault);
         assert!(

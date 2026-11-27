@@ -39,7 +39,7 @@ python3 scripts/sync-chat-artifacts.py --core-revision <catbird-mls revision>
 ./build.sh
 ```
 
-The same fixture's `wasmPackage` entry records which `catbird-mls`, `labyrinth` and `catbird-atproto` commits the local `pkg/` was built from and the SHA-256 of each built file; update it after every `./build.sh` and confirm with `python3 scripts/check-pkg-provenance.py`, which checks the file hashes and that the three sibling checkouts are clean and still at the recorded commits. `pkg/` is not a published or release-qualified artifact; re-sync and rebuild after any source change. The browser build uses `catbird_mls` with `default-features = false, features = ["browser"]` (Labyrinth on, `sim` off), so `buggify!` is `false` and planted bugs cannot activate.
+The same fixture's `wasmPackage` entry records which `catbird-mls`, `labyrinth`, `catbird-atproto`, `Petrel` and `PetrelCatbird` commits the local `pkg/` was built from and the SHA-256 of each built file; update it after every `./build.sh` and confirm with `python3 scripts/check-pkg-provenance.py`, which checks the file hashes and that the five sibling checkouts are clean and still at the recorded commits. `pkg/` is not a published or release-qualified artifact; re-sync and rebuild after any source change. The browser build uses `catbird_mls` with `default-features = false, features = ["browser"]` (Labyrinth on, `sim` off), so `buggify!` is `false` and planted bugs cannot activate.
 
 ## JS Integration: Recovery Loop
 

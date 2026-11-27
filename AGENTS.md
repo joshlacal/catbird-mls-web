@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with `c
 
 - Crate: `catbird-mls-web` (`crate-type = ["cdylib"]`), edition 2021.
 - Core dependency: `catbird_mls = { path = "../catbird-mls", default-features = false, features = ["browser"] }`. `browser` enables `labyrinth`; the deterministic-simulation features (`sim`, `plant_*`, `test-utils`) are never enabled here, so `buggify!` compiles to `false` and planted bugs cannot activate. This crate is a **thin adapter** — it does NOT reimplement MLS. It provides browser-native implementations of the orchestrator's traits (storage, credentials, API client) and re-exports the orchestrator surface as WASM functions. For MLS internals (epoch handling, recovery policy, OpenMLS), see `../catbird-mls/AGENTS.md`.
-- ATProto request/response types come from `catbird-atproto` (shared generated Jacquard types).
+- ATProto request and response types use the shared `catbird_mls::atproto::chat` Petrel Rust overlay.
 
 Don't duplicate orchestrator logic here. If a behavior should be shared across iOS/desktop/web, it belongs in `catbird-mls`; this crate only owns the browser adapters and the JS-facing ABI.
 

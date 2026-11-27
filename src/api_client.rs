@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use catbird_atproto::blue_catbird;
+use catbird_mls::atproto::chat;
 use reqwest::Client;
 use std::sync::RwLock;
 
@@ -524,7 +524,7 @@ impl MLSAPIClient for WasmApiClient {
         }
         let mut conversations = Vec::new();
         for item in output.items {
-            if let blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(
+            if let chat::defs::ConversationInventoryItem::ConversationInventoryState(
                 state_item,
             ) = item
             {
@@ -629,7 +629,7 @@ impl MLSAPIClient for WasmApiClient {
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
         let actor = self.actor_device()?;
-        let active_status: blue_catbird::chat::DeviceStatus<&str> = "active";
+        let active_status = chat::defs::DeviceStatus::Active.as_str();
         let device = self
             .list_devices(&actor)
             .await?
@@ -691,7 +691,7 @@ impl MLSAPIClient for WasmApiClient {
                 .bytes()
                 .await
                 .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-            let output: blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String> =
+            let output: chat::get_own_devices::Output =
                 serde_json::from_slice(&body)
                     .map_err(|e| OrchestratorError::Api(format!("getOwnDevices parse: {e}")))?;
             for d in output.items {
@@ -749,7 +749,7 @@ impl MLSAPIClient for WasmApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output: blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String> =
+        let output: chat::get_conversation_state::Output =
             serde_json::from_slice(&body)
                 .map_err(|e| OrchestratorError::Api(format!("getConversationState parse: {e}")))?;
         Ok(output.state.coordinates.group_id.as_ref().to_vec())
@@ -797,7 +797,7 @@ impl MLSAPIClient for WasmApiClient {
 }
 
 fn canonical_conversation_view(
-    state: &catbird_atproto::blue_catbird::chat::ConversationState,
+    state: &catbird_mls::atproto::chat::defs::ConversationState,
 ) -> ConversationView {
     ConversationView {
         canonical_state: Some(state.clone()),
@@ -865,7 +865,7 @@ mod canonical_admission_projection_tests {
             assert_eq!(page.next_page_cursor.as_deref(), Some("page-2"));
             assert_eq!(page.inventory_session_id, "inventory-session");
             assert_eq!(page.snapshot_event_cursor, "event-fence");
-            let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(item) = page.items.remove(0) else { panic!("missing canonical state") };
+            let catbird_mls::atproto::chat::defs::ConversationInventoryItem::ConversationInventoryState(item) = page.items.remove(0) else { panic!("missing canonical state") };
             let state = item.state;
             assert_eq!(state, expected);
             let view = canonical_conversation_view(&state);

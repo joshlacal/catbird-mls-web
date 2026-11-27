@@ -21,7 +21,7 @@ use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use uuid::{Uuid, Variant, Version};
 
-use catbird_mls::atproto::blue_catbird::chat::CanonicalDatetime;
+use catbird_mls::atproto::chat::defs::CanonicalDatetime;
 use catbird_mls::canonical_transport::{
     canonical_route, CanonicalOperation, CleanChatSigningContext, PreparedRequest, TransportError,
 };
@@ -1329,21 +1329,23 @@ pub(crate) fn parse_generated_request(
                 .map_err(|error| format!("generated request is invalid: {error}"))
         };
     }
-    use catbird_mls::atproto::blue_catbird::chat::{
-        get_conversations::GetConversations, get_entries::GetEntries,
-    };
+    macro_rules! query {
+        ($variant:ident) => {
+            catbird_mls::canonical_transport::query_params_from_json(body)
+                .map(CleanChatRequest::$variant)
+                .map_err(|error| format!("generated query is invalid: {error}"))
+        };
+    }
     use catbird_mls::canonical_transport::{
         AcceptConversationRequestBody, AcknowledgeEntriesRequestBody,
         AcknowledgeWelcomeRequestBody, ActivateResetRequestBody, ApproveDeviceRequestBody,
         CancelLeafRecoveryRequestBody, CancelLeaveRequestBody, CloseConversationRequestBody,
-        CreateConversationRequestBody, EnrollDeviceRequestBody, GetConversationStateRequestBody,
-        GetDeviceKeyRequestBody, GetDevicesRequestBody, GetLeafRecoveryInboxRequestBody,
-        GetOwnDevicesRequestBody, GetPendingWelcomesRequestBody, GetSubscriptionTicketRequestBody,
+        CreateConversationRequestBody, EnrollDeviceRequestBody, GetSubscriptionTicketRequestBody,
         PublishTypingRequestBody, RegisterPushGatewayRequestBody, RejectWelcomeRequestBody,
         RelaySpaceCredentialRequestBody, RelaySpaceReadRequestBody,
         ReplenishKeyPackagesRequestBody, RequestLeafRecoveryRequestBody, RequestLeaveRequestBody,
         RequestResetRequestBody, RevokeDeviceRequestBody, SendMessageRequestBody,
-        SubmitTransitionRequestBody, SubscribeEventsRequestBody,
+        SubmitTransitionRequestBody,
     };
     match operation {
         CanonicalOperation::PrepareDirectRequest
@@ -1371,23 +1373,23 @@ pub(crate) fn parse_generated_request(
         CanonicalOperation::CloseConversation => {
             parse!(CloseConversationRequestBody, CloseConversation)
         }
-        CanonicalOperation::GetConversations => parse!(GetConversations<String>, GetConversations),
+        CanonicalOperation::GetConversations => query!(GetConversations),
         CanonicalOperation::CreateConversation => {
             parse!(CreateConversationRequestBody, CreateConversation)
         }
         CanonicalOperation::SendMessage => parse!(SendMessageRequestBody, SendMessage),
         CanonicalOperation::GetConversationState => {
-            parse!(GetConversationStateRequestBody, GetConversationState)
+            query!(GetConversationState)
         }
-        CanonicalOperation::GetDevices => parse!(GetDevicesRequestBody, GetDevices),
-        CanonicalOperation::GetDeviceKey => parse!(GetDeviceKeyRequestBody, GetDeviceKey),
-        CanonicalOperation::GetEntries => parse!(GetEntries<String>, GetEntries),
+        CanonicalOperation::GetDevices => query!(GetDevices),
+        CanonicalOperation::GetDeviceKey => query!(GetDeviceKey),
+        CanonicalOperation::GetEntries => query!(GetEntries),
         CanonicalOperation::GetLeafRecoveryInbox => {
-            parse!(GetLeafRecoveryInboxRequestBody, GetLeafRecoveryInbox)
+            query!(GetLeafRecoveryInbox)
         }
-        CanonicalOperation::GetOwnDevices => parse!(GetOwnDevicesRequestBody, GetOwnDevices),
+        CanonicalOperation::GetOwnDevices => query!(GetOwnDevices),
         CanonicalOperation::GetPendingWelcomes => {
-            parse!(GetPendingWelcomesRequestBody, GetPendingWelcomes)
+            query!(GetPendingWelcomes)
         }
         CanonicalOperation::GetSubscriptionTicket => {
             parse!(GetSubscriptionTicketRequestBody, GetSubscriptionTicket)
@@ -1416,7 +1418,7 @@ pub(crate) fn parse_generated_request(
         CanonicalOperation::SubmitTransition => {
             parse!(SubmitTransitionRequestBody, SubmitTransition)
         }
-        CanonicalOperation::SubscribeEvents => parse!(SubscribeEventsRequestBody, SubscribeEvents),
+        CanonicalOperation::SubscribeEvents => query!(SubscribeEvents),
         CanonicalOperation::ApproveDevice => parse!(ApproveDeviceRequestBody, ApproveDevice),
     }
 }

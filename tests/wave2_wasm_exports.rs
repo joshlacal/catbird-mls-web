@@ -264,9 +264,9 @@ fn tid(seq: u64) -> String {
 }
 
 fn canonical_record(value: &Value) -> Result<StoredRecord, String> {
-    let typed: catbird_atproto::types::value::Data =
+    let typed: petrel_core::Value =
         serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    let dagcbor = serde_ipld_dagcbor::to_vec(&typed).map_err(|e| e.to_string())?;
+    let dagcbor = petrel_core::to_dag_cbor(&typed).map_err(|e| e.to_string())?;
     validate_canonical_dagcbor_record(&dagcbor).map_err(|e| e.to_string())?;
     Ok(StoredRecord {
         value: value.clone(),

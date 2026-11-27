@@ -1743,13 +1743,13 @@ impl MlsCryptoContext for WasmMLSContext {
         &self,
         owner: &str,
         cid: &str,
-    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
+    ) -> Result<Option<catbird_mls::atproto::chat::defs::ConversationState>, MLSError> {
         self.protected_policy(owner, cid)
     }
     fn put_conversation_policy(
         &self,
         owner: &str,
-        state: &catbird_atproto::blue_catbird::chat::ConversationState,
+        state: &catbird_mls::atproto::chat::defs::ConversationState,
     ) -> Result<bool, MLSError> {
         self.protect_policy(owner, state)
     }
@@ -1757,14 +1757,14 @@ impl MlsCryptoContext for WasmMLSContext {
         &self,
         owner: &str,
         cid: &str,
-    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError>
+    ) -> Result<Option<catbird_mls::atproto::chat::defs::ConversationCoordinates>, MLSError>
     {
         self.protected_departure(owner, cid)
     }
     fn put_conversation_departure(
         &self,
         owner: &str,
-        state: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+        state: &catbird_mls::atproto::chat::defs::ConversationCoordinates,
     ) -> Result<bool, MLSError> {
         self.protect_departure(owner, state)
     }

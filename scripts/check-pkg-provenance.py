@@ -21,7 +21,7 @@ parser.add_argument('--fixture', default=str(root / 'tests/fixtures/chat-artifac
                     help='provenance fixture to check against (default: the vendored one)')
 parser.add_argument('--no-siblings', action='store_true',
                     help='skip comparing the recorded revisions with ../catbird-mls, '
-                         '../labyrinth and ../catbird-atproto')
+                         '../labyrinth, ../catbird-atproto, ../Petrel and ../PetrelCatbird')
 args = parser.parse_args()
 pkg = Path(args.pkg_dir).resolve()
 manifest = json.loads(Path(args.fixture).read_bytes())
@@ -34,7 +34,7 @@ failures = []
 
 
 def sibling_head(repo):
-    """Last content-bearing sealed commit of a clean sibling checkout."""
+    """Sealed parent commit of a clean sibling checkout."""
     if (repo / '.jj').exists():
         # Normal jj secondary workspaces have no .git working tree. Snapshot the current
         # files before checking the empty working-copy commit; --ignore-working-copy alone
@@ -42,7 +42,7 @@ def sibling_head(repo):
         if subprocess.check_output(['jj', 'diff', '--summary'], cwd=repo, text=True).strip():
             return None, f'{repo} has unsealed working-copy changes'
         return subprocess.check_output(
-            ['jj', '--ignore-working-copy', 'log', '--no-graph', '-r', 'heads(ancestors(@-) ~ empty())', '-T', 'commit_id'],
+            ['jj', '--ignore-working-copy', 'log', '--no-graph', '-r', '@-', '-T', 'commit_id'],
             cwd=repo, text=True).strip(), None
     if subprocess.check_output(['git', 'status', '--porcelain'], cwd=repo, text=True).strip():
         return None, f'{repo} has uncommitted changes'
@@ -52,7 +52,9 @@ def sibling_head(repo):
 if not args.no_siblings:
     for key, name in (('coreRevision', 'catbird-mls'),
                       ('labyrinthRevision', 'labyrinth'),
-                      ('catbirdAtprotoRevision', 'catbird-atproto')):
+                      ('catbirdAtprotoRevision', 'catbird-atproto'),
+                      ('petrelRevision', 'Petrel'),
+                      ('petrelCatbirdRevision', 'PetrelCatbird')):
         repo = root.parent / name
         head, problem = sibling_head(repo)
         if problem:

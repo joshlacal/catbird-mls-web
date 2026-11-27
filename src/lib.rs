@@ -49,6 +49,7 @@ mod strict_projection;
 mod wasm_archive;
 mod wasm_archive_policy;
 mod wasm_archive_space;
+pub mod wasm_auth;
 pub mod wasm_client;
 mod wasm_client_c33;
 mod wasm_client_mutations;
@@ -109,6 +110,7 @@ pub use mls_storage::WasmSqliteStorage;
 #[cfg(feature = "legacy-orchestrator")]
 pub use mls_storage::WasmStorageBackend as WasmStorageBackendExport;
 pub use sqlite_conn::{SqliteConn, WasmSqliteError};
+pub use wasm_auth::WasmAuthClient;
 pub use wasm_client::{verify_golden_manifest, verify_golden_transcript_json, WasmMlsClient};
 #[cfg(feature = "legacy-orchestrator")]
 pub use wasm_mls_context::WasmMLSContext as WasmMLSContextExport;
@@ -2408,8 +2410,6 @@ pub fn catbird_mls_get_profiles(
             return Err(js_err!("profile request exceeded the item ceiling"));
         }
 
-        let (_, auth_token, _) = public_api_credentials()?;
-
         let client = reqwest::Client::new();
         let mut profiles = Vec::with_capacity(dids.len());
         // app.bsky.actor.getProfiles has a hard 25-actor request limit. Chunking
@@ -2424,7 +2424,6 @@ pub fn catbird_mls_get_profiles(
 
             let resp = client
                 .get(url)
-                .bearer_auth(&auth_token)
                 .send()
                 .await
                 .map_err(|e| js_err!("Profile fetch failed: {}", e))?;
@@ -2468,8 +2467,6 @@ pub fn catbird_mls_search_users(
             return to_js(&Vec::<SearchResult>::new());
         }
 
-        let (_, auth_token, _) = public_api_credentials()?;
-
         let client = reqwest::Client::new();
         let url = reqwest::Url::parse_with_params(
             "https://public.api.bsky.app/xrpc/app.bsky.actor.searchActorsTypeahead",
@@ -2479,7 +2476,6 @@ pub fn catbird_mls_search_users(
 
         let resp = client
             .get(url)
-            .bearer_auth(&auth_token)
             .send()
             .await
             .map_err(|e| js_err!("Search failed: {}", e))?;

@@ -41,13 +41,9 @@ fn to_js_val<T: serde::Serialize>(val: &T) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(val).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-/// Conversation Space URI (`at:space/{sequencerDid}/blue.catbird.labyrinth.conversation/{skey}`).
-pub(crate) fn conversation_space_uri(sequencer_did: &str, skey: &str) -> String {
-    atproto_spaces::SpaceUri::conversation(sequencer_did, skey)
-        .map(|u| u.to_string())
-        .unwrap_or_else(|_| {
-            format!("at:space/{sequencer_did}/blue.catbird.labyrinth.conversation/{skey}")
-        })
+/// The conversation Space of `cid` at `generation`, hosted by its sequencer.
+pub(crate) fn conversation_space_uri(sequencer_did: &str, cid: &str, generation: i64) -> String {
+    format!("at:space/{sequencer_did}/blue.catbird.labyrinth.conversation/{cid}-{generation}")
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -75,6 +71,7 @@ pub struct WasmMlsClient {
     pub(crate) home_ds_endpoint: String,
     pub(crate) pds_endpoint: String,
     pub(crate) auth_token: RefCell<Option<String>>,
+    pub(crate) petrel_auth: RefCell<Option<Rc<crate::wasm_auth::WasmAuthInner>>>,
     pub(crate) http: reqwest::Client,
     pub(crate) db: Option<WasmAccountDb<Rc<SqliteConn>>>,
     pub(crate) pending_otc_initiator: RefCell<Option<PendingOtcInitiator>>,
@@ -139,6 +136,7 @@ impl WasmMlsClient {
 
     fn wipe_and_close_local_storage(&mut self) -> Result<(), MLSError> {
         *self.auth_token.borrow_mut() = None;
+        *self.petrel_auth.borrow_mut() = None;
         crate::sync_public_api_state(&self.home_ds_endpoint, &self.home_ds_did, None);
         *self.pending_otc_initiator.borrow_mut() = None;
         *self.pending_otc_offer_digits.borrow_mut() = None;
@@ -151,7 +149,7 @@ impl WasmMlsClient {
         Ok(())
     }
 
-    /// Inject or refresh the `nest` BFF / OAuth bearer session token for live XRPC dispatches.
+    /// Inject or refresh the legacy bearer session token for live XRPC dispatches.
     #[wasm_bindgen(js_name = setAuthToken)]
     pub fn set_auth_token(&self, token: Option<String>) {
         let cleaned = token.filter(|s| !s.trim().is_empty());
@@ -161,6 +159,24 @@ impl WasmMlsClient {
             cleaned.as_deref(),
         );
         *self.auth_token.borrow_mut() = cleaned;
+    }
+
+    /// Attach Petrel's direct DPoP-bound OAuth session for PDS XRPC and service auth.
+    #[wasm_bindgen(js_name = setPetrelAuth)]
+    pub fn set_petrel_auth(&self, auth: Option<crate::wasm_auth::WasmAuthClient>) {
+        let inner = auth.map(|a| Rc::clone(&a.inner));
+        *self.petrel_auth.borrow_mut() = inner;
+    }
+
+    /// Attach Petrel's direct DPoP-bound OAuth session by reference (without consuming the JS handle).
+    #[wasm_bindgen(js_name = bindPetrelAuth)]
+    pub fn bind_petrel_auth(&self, auth: &crate::wasm_auth::WasmAuthClient) {
+        *self.petrel_auth.borrow_mut() = Some(Rc::clone(&auth.inner));
+    }
+
+    #[wasm_bindgen(js_name = clearPetrelAuth)]
+    pub fn clear_petrel_auth(&self) {
+        *self.petrel_auth.borrow_mut() = None;
     }
 
     #[wasm_bindgen(js_name = accountDid)]
@@ -346,6 +362,7 @@ impl WasmMlsClient {
                 if tx.get_labyrinth_state("status_json")?.is_none() {
                     let status = LabyrinthBackupStatus {
                         backup_enabled: true,
+                        archive_established: false,
                         mailbox_space_uri: mailbox_uri.clone(),
                         has_recovery_code: false,
                         has_passkey_prf: false,
@@ -395,6 +412,13 @@ impl WasmMlsClient {
     pub fn is_device_pending_approval(&self) -> Result<bool, JsValue> {
         self.is_device_pending_approval_impl()
             .map_err(mls_to_js_err)
+    }
+
+    /// `true` while `mls-ds` holds this device but its PDS records are not written yet: call
+    /// `enrollDevice` again (now or after a reload) until it clears.
+    #[wasm_bindgen(js_name = isDeviceRecordPending)]
+    pub fn is_device_record_pending(&self) -> Result<bool, JsValue> {
+        self.is_device_record_pending_impl().map_err(mls_to_js_err)
     }
 
     #[wasm_bindgen(js_name = approveDevice)]
@@ -774,6 +798,7 @@ impl WasmMlsClient {
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
             None => LabyrinthBackupStatus {
                 backup_enabled: true,
+                archive_established: false,
                 mailbox_space_uri: personal_mailbox_space_uri(&self.account_did),
                 has_recovery_code: false,
                 has_passkey_prf: false,
@@ -1234,6 +1259,7 @@ impl WasmMlsClient {
             home_ds_endpoint,
             pds_endpoint,
             auth_token: RefCell::new(None),
+            petrel_auth: RefCell::new(None),
             http: reqwest::Client::new(),
             db: Some(db),
             pending_otc_initiator: RefCell::new(None),

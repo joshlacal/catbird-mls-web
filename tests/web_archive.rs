@@ -229,9 +229,9 @@ fn publish_did_document(did: &str) {
 }
 
 fn publish_record_proof(did: &str, collection: &str, rkey: &str, value: &Value) -> String {
-    let typed: catbird_atproto::types::value::Data =
+    let typed: petrel_core::Value =
         serde_json::from_value(value.clone()).unwrap();
-    let dagcbor = serde_ipld_dagcbor::to_vec(&typed).unwrap();
+    let dagcbor = petrel_core::to_dag_cbor(&typed).unwrap();
     let cid = compute_dagcbor_cid(&dagcbor).to_string();
     let signing_key =
         SpaceSigningKey::from_p256_secret(&p256_key(did, b"sign"), "#atproto");

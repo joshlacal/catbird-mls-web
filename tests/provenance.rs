@@ -117,7 +117,13 @@ fn wasm_package_provenance_names_the_vendored_core_revision() {
         package["coreRevision"], manifest["coreRevision"],
         "pkg/ build provenance must name the same catbird-mls revision as the vendored artifacts"
     );
-    for key in ["coreRevision", "labyrinthRevision", "catbirdAtprotoRevision"] {
+    for key in [
+        "coreRevision",
+        "labyrinthRevision",
+        "catbirdAtprotoRevision",
+        "petrelRevision",
+        "petrelCatbirdRevision",
+    ] {
         let id = package[key].as_str().unwrap_or_else(|| panic!("missing {key}"));
         assert!(
             id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()),

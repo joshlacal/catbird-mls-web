@@ -18,7 +18,8 @@ let originalFetch;
 let ds;
 export function installDs() {
   originalFetch = globalThis.fetch;
-  ds = {keys: {}, revisions: {}, calls: {}, loseEnroll: false, loseKeys: false, answerKey: null};
+  ds = {keys: {}, revisions: {}, calls: {}, loseEnroll: false, loseKeys: false, answerKey: null,
+    pdsDevices: {}, failDeviceWrites: 0, loseDeviceWrite: false};
   globalThis.fetch = async (request) => {
     const reply = (body, status = 200) => {
       const r = new Response(JSON.stringify(body), {status, headers: {'content-type': 'application/json'}});
@@ -29,7 +30,20 @@ export function installDs() {
     const nsid = new URL(request.url).pathname.replace('/xrpc/', '');
     ds.calls[nsid] = (ds.calls[nsid] || 0) + 1;
     if (nsid === 'com.atproto.server.getServiceAuth') return reply({token: 'service-auth'});
-    if (nsid === 'com.atproto.repo.putRecord' || nsid === 'com.atproto.repo.createRecord') return reply({uri: 'at://fixture', cid: 'bafyfixture'});
+    if (nsid === 'com.atproto.repo.putRecord') return reply({uri: 'at://fixture', cid: 'bafyfixture'});
+    // The PDS device record: create-only like a real PDS, which refuses a duplicate rkey.
+    if (nsid === 'com.atproto.repo.createRecord') {
+      const body = JSON.parse(await request.clone().text());
+      if (ds.failDeviceWrites > 0) { ds.failDeviceWrites -= 1; return fail('UpstreamFailure', 503); }
+      if (ds.pdsDevices[body.rkey]) return fail('InvalidRequest');
+      ds.pdsDevices[body.rkey] = body.record;
+      if (ds.loseDeviceWrite) { ds.loseDeviceWrite = false; throw new Error('createRecord response lost'); }
+      return reply({uri: 'at://fixture', cid: 'bafyfixture'});
+    }
+    if (nsid === 'com.atproto.repo.getRecord') {
+      const value = ds.pdsDevices[new URL(request.url).searchParams.get('rkey')];
+      return value ? reply({uri: 'at://fixture', cid: 'bafyfixture', value}) : fail('RecordNotFound');
+    }
     if (nsid === 'blue.catbird.chat.getOwnDevices') {
       const header = request.headers.get('catbird-chat-read');
       if (!header || !request.headers.get('catbird-chat-read-signature')) return fail('InvalidSignature', 401);
@@ -74,6 +88,12 @@ export function loseNextEnrollResponse() { ds.loseEnroll = true; }
 export function loseNextRequestKeysResponse() { ds.loseKeys = true; }
 export function holdDeviceKey(deviceId, key) { ds.keys[deviceId] = key; }
 export function answerEnrollWithKey(key) { ds.answerKey = key; }
+export function failDeviceRecordWrites(count) { ds.failDeviceWrites = count; }
+export function loseNextDeviceRecordResponse() { ds.loseDeviceWrite = true; }
+export function holdPdsDeviceKey(deviceId, key) {
+  ds.pdsDevices[deviceId] = {$type: 'blue.catbird.chat.device', algorithm: 'ed25519', mlsSignaturePublicKey: {$bytes: key}};
+}
+export function pdsDeviceKey(deviceId) { return ds.pdsDevices[deviceId]?.mlsSignaturePublicKey.$bytes; }
 export function dsKey(deviceId) { return ds.keys[deviceId]; }
 export function dsRevision(deviceId) { return ds.revisions[deviceId] || 0; }
 export function dsCalls(nsid) { return ds.calls[nsid] || 0; }
@@ -85,6 +105,10 @@ extern "C" {
     fn loseNextRequestKeysResponse();
     fn holdDeviceKey(device_id: &str, key: &str);
     fn answerEnrollWithKey(key: &str);
+    fn failDeviceRecordWrites(count: u32);
+    fn loseNextDeviceRecordResponse();
+    fn holdPdsDeviceKey(device_id: &str, key: &str);
+    fn pdsDeviceKey(device_id: &str) -> Option<String>;
     fn dsKey(device_id: &str) -> Option<String>;
     fn dsRevision(device_id: &str) -> u32;
     fn dsCalls(nsid: &str) -> u32;
@@ -99,6 +123,8 @@ impl Drop for RestoreFetch {
 
 const ENROLL: &str = "blue.catbird.chat.enrollDevice";
 const REQUEST_KEYS: &str = "blue.catbird.chat.publishDirectRequestKeys";
+const CREATE_RECORD: &str = "com.atproto.repo.createRecord";
+const PUT_RECORD: &str = "com.atproto.repo.putRecord";
 
 async fn open(did: &str, device_id: &str) -> WasmMlsClient {
     let client = WasmMlsClient::open_async(
@@ -263,6 +289,107 @@ async fn a_key_mismatch_refuses_before_any_pds_write() {
     assert_eq!(dsCalls("com.atproto.repo.putRecord"), 0, "{error}");
     assert_eq!(dsCalls("com.atproto.repo.createRecord"), 0, "{error}");
     assert_eq!(dsKey(held).as_deref(), Some(other_key.as_str()));
+}
+
+/// The PDS refuses the device record twice after `mls-ds` enrolled the device: the same
+/// `enrollDevice` call waits and writes it again, so enrollment completes without a second DS
+/// enrollment.
+///
+/// Fail-before: the first failed `createRecord` failed the whole enrollment.
+#[wasm_bindgen_test]
+async fn a_failed_device_record_write_is_retried_until_it_succeeds() {
+    installDs();
+    let _restore = RestoreFetch;
+    let device = "00000000-0000-4000-8000-00000000e006";
+    let client = open("did:plc:recordretryaaaaaaaaaaaaa", device).await;
+    failDeviceRecordWrites(2);
+    let key = enroll(&client)
+        .await
+        .expect("the device record write is retried");
+    assert_eq!(pdsDeviceKey(device), Some(key));
+    assert_eq!((dsCalls(CREATE_RECORD), dsCalls(ENROLL)), (3, 1));
+    assert_eq!((dsCalls(PUT_RECORD), dsCalls(REQUEST_KEYS)), (1, 1));
+    assert!(!client.is_device_record_pending().unwrap());
+}
+
+/// Every attempt of one call fails: the error names `DeviceRecordPending`, and the marker
+/// outlives the reload. The next `enrollDevice` is answered `DeviceAlreadyExists` by `mls-ds`,
+/// adopts that enrollment and writes the owed PDS records.
+///
+/// Fail-before: no state recorded that the DS enrollment had succeeded, so the caller dropped
+/// the opt-in and the device stayed on `mls-ds` with no PDS record.
+#[wasm_bindgen_test]
+async fn a_pending_device_record_resumes_after_reload() {
+    installDs();
+    let _restore = RestoreFetch;
+    let (did, device) = (
+        "did:plc:recordresumeaaaaaaaaaaaa",
+        "00000000-0000-4000-8000-00000000e007",
+    );
+    let client = open(did, device).await;
+    assert!(!client.is_device_record_pending().unwrap());
+    failDeviceRecordWrites(100);
+    let error = enroll(&client)
+        .await
+        .expect_err("the PDS refuses every attempt")
+        .as_string()
+        .unwrap();
+    assert!(error.contains("DeviceRecordPending"), "{error}");
+    assert_eq!((dsCalls(CREATE_RECORD), dsCalls(PUT_RECORD)), (4, 0));
+    assert!(client.is_device_record_pending().unwrap());
+    let registered = dsKey(device).expect("mls-ds enrolled the device");
+    drop(client);
+
+    let client = open(did, device).await;
+    assert!(
+        client.is_device_record_pending().unwrap(),
+        "the marker survives a reload"
+    );
+    failDeviceRecordWrites(0);
+    let key = enroll(&client)
+        .await
+        .expect("DeviceAlreadyExists is adopted and the record written");
+    assert_eq!(key, registered);
+    assert_eq!(pdsDeviceKey(device), Some(key));
+    assert_eq!((dsCalls(ENROLL), dsCalls(REQUEST_KEYS)), (2, 1));
+    assert_eq!(dsCalls(PUT_RECORD), 1);
+    assert!(!client.is_device_record_pending().unwrap());
+    enroll(&client)
+        .await
+        .expect("a completed enrollment is a local no-op");
+    assert_eq!(dsCalls(ENROLL), 2);
+}
+
+/// A device record that already exists on the PDS is adopted when it holds this device's key
+/// (the write landed, its answer was lost) and refused, without retries or a pending marker,
+/// when it holds another key.
+#[wasm_bindgen_test]
+async fn an_existing_device_record_is_adopted_only_under_the_same_key() {
+    installDs();
+    let _restore = RestoreFetch;
+    let device = "00000000-0000-4000-8000-00000000e008";
+    let client = open("did:plc:recordexistsaaaaaaaaaaaa", device).await;
+    loseNextDeviceRecordResponse();
+    let key = enroll(&client)
+        .await
+        .expect("the record written by the lost attempt is adopted");
+    assert_eq!(pdsDeviceKey(device), Some(key));
+    assert_eq!((dsCalls(CREATE_RECORD), dsCalls(ENROLL)), (2, 1));
+    assert!(!client.is_device_record_pending().unwrap());
+
+    let other_key = STANDARD.encode([7_u8; 32]);
+    let held = "00000000-0000-4000-8000-00000000e009";
+    holdPdsDeviceKey(held, &other_key);
+    let client = open("did:plc:recordconflictaaaaaaaaaa", held).await;
+    let error = enroll(&client)
+        .await
+        .expect_err("the PDS holds the record under another key")
+        .as_string()
+        .unwrap();
+    assert!(error.contains("EnrollmentPdsRecordConflict"), "{error}");
+    assert_eq!(dsCalls(CREATE_RECORD), 3, "a conflict is not retried");
+    assert_eq!(pdsDeviceKey(held), Some(other_key));
+    assert!(!client.is_device_record_pending().unwrap());
 }
 
 /// A non-UUIDv4 ID, or a missing session, once selected a local-only group, a receiptless queued

@@ -1,5 +1,5 @@
 {
-  "coreRevision": "bea537375ae07fed39f281750cd0f8b560c015ee",
+  "coreRevision": "ae1f1a1605912e0d4c8287aaac299f167ef0ee45",
   "artifacts": [
     {
       "target": "src/generated/blue.catbird.chat.defs.json",
@@ -23,15 +23,18 @@
     }
   ],
   "wasmPackage": {
-    "coreRevision": "bea537375ae07fed39f281750cd0f8b560c015ee",
-    "labyrinthRevision": "a484e9ef14ddb42d7d7212f1c9eb468ee152acd7",
-    "catbirdAtprotoRevision": "e3356fd4f3349de1d647e3558964d08449c03b13",
-    "build": "Frozen source revisions built with ./build.sh, wasm-pack 0.14.0 and bundled wasm-opt, rustc 1.97.1 (8bab26f4f), cargo 1.97.1 (c980f4866), release for wasm32-unknown-unknown",
+    "coreRevision": "ae1f1a1605912e0d4c8287aaac299f167ef0ee45",
+    "labyrinthRevision": "9e457eff07373969de4240b849a900e46d42a122",
+    "catbirdAtprotoRevision": "aed64f2c6decd58696f482b9d024dafc407d3aa2",
+    "petrelRevision": "76bf7c8beb83fbb861183d04948fa5a061698772",
+    "petrelCatbirdRevision": "7658265cdc4eebd6cbb37b30fc1f385892168b19",
+    "build": "./build.sh, wasm-pack 0.14.0, wasm-opt 133, rustc 1.99.1 (58cf8f9c3), cargo 1.99.1 (5f94df478), release for wasm32-unknown-unknown",
     "files": {
-      "catbird_mls_web_bg.wasm": "9d085b66b30044307baa24670d7bc644f219ece79c4ebe7f767f4abb7b61e869",
-      "catbird_mls_web.js": "0000026bd8c80d9ab5219d362467a6565ae22c16aabb0d44018f0ef640ffce0d",
-      "catbird_mls_web.d.ts": "1701b71f306c4d70a6d38c9b55e5177f76f777540821e042790f3f78428c4a6a",
-      "catbird_mls_web_bg.wasm.d.ts": "c2e3e312d2aaf83cdddc294ad0e9c93a8f6d9522c016d86f376fda2ef808b164"
+      "catbird_mls_web.d.ts": "ded9cf0d68068933bd1479d8f5b4e106a9210ea22a841468f123b501af49efbd",
+      "catbird_mls_web.js": "f0a09eb36bfbc0ef390cb5919f653f4f8b4cf87203917f5df182dffd88e4537b",
+      "catbird_mls_web_bg.wasm": "7175ef533b083ce3318b938e097166059595cd9b672c47f2bba5b94b2cd779aa",
+      "catbird_mls_web_bg.wasm.d.ts": "63edb87e4f5fb2d2bce747f3c22039762a81139258bf0619626a24d5a3adc15d",
+      "package.json": "b01dc8457828e7c84fdb0e40ce68365cafdc9b9141595e6365b600af7f1c6213"
     }
   }
 }

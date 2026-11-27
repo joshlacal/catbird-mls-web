@@ -430,16 +430,22 @@ impl PublicRepoBackend for WebArchiveGateway {
     ) -> labyrinth::Result<Option<(Vec<u8>, String)>> {
         let enc = chat_wire::urlencode_form_component;
         if did == self.client.account_did {
-            let url = format!(
-                "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
-                self.client.pds_base(),
+            let path = format!(
+                "/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
                 enc(did),
                 nsid::MAILBOX_KEYS,
                 enc(rkey),
             );
-            let response = Self::send(self.client.http.get(url).bearer_auth(&self.session_token))
+            let (status, content_type, body) = self
+                .client
+                .pds_get(&self.session_token, &path)
                 .await
-                .map_err(labyrinth::Error::Backend)?;
+                .map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
+            let response = GatewayResponse {
+                status,
+                content_type,
+                body,
+            };
             return mailbox_keys_record_with_json(response, did, rkey)
                 .map(|opt| opt.map(|(pair, _)| pair));
         }
@@ -494,18 +500,24 @@ impl PublicRepoBackend for WebArchiveGateway {
         let mut cursor: Option<String> = None;
         let mut seen = BTreeSet::new();
         loop {
-            let mut url = format!(
-                "{}/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit=100",
-                self.client.pds_base(),
+            let mut path = format!(
+                "/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit=100",
                 enc(did),
                 nsid::MAILBOX_KEYS,
             );
             if let Some(ref cur) = cursor {
-                url.push_str(&format!("&cursor={}", enc(cur)));
+                path.push_str(&format!("&cursor={}", enc(cur)));
             }
-            let resp = Self::send(self.client.http.get(url).bearer_auth(&self.session_token))
+            let (status, content_type, body) = self
+                .client
+                .pds_get(&self.session_token, &path)
                 .await
-                .map_err(labyrinth::Error::Backend)?;
+                .map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
+            let resp = GatewayResponse {
+                status,
+                content_type,
+                body,
+            };
             if matches!(resp.status, 400 | 404)
                 && serde_json::from_slice::<Value>(&resp.body)
                     .ok()
@@ -1369,6 +1381,7 @@ impl WasmMlsClient {
                     .map_err(|e| MLSError::Internal(e.to_string()))?,
                 None => LabyrinthBackupStatus {
                     backup_enabled: true,
+                    archive_established: false,
                     mailbox_space_uri: catbird_mls::client::personal_mailbox_space_uri(
                         &self.account_did,
                     ),
@@ -1387,6 +1400,8 @@ impl WasmMlsClient {
                 },
             };
             let had_pending_publication = status.pending_directory_epoch.is_some();
+            // A session exists only after it opened or created the archive on the server.
+            status.archive_established = true;
             status.epoch_seq = session.latest_epoch();
             status.recovery_method_stale |= session.recovery_method_stale();
             status.has_recovery_code |= recovery_code;
@@ -2714,12 +2729,9 @@ impl WasmMlsClient {
         iv: &[u8],
         expected_sha256: Option<&[u8]>,
     ) -> Result<Vec<u8>, MLSError> {
-        let mut parts = locator.splitn(3, '|');
-        let (Some(space_uri), Some(repo_did), Some(cid)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
+        let Some((space_uri, repo_did, cid)) = split_attachment_locator(locator) else {
             return Err(MLSError::invalid_input(
-                "attachment locator must be \"{spaceURI}|{repoDID}|{cid}\"",
+                "attachment locator must be \"{spaceURI}|{repoDID}|{cid}\" or \"{spaceURI}/{repoDID}#{cid}\"",
             ));
         };
         if cid.trim().is_empty() || cid.contains('|') {
@@ -3267,35 +3279,24 @@ impl WasmMlsClient {
             None => {
                 // Probe PDS for an existing deviceRevocation record (e.g. sibling revocation)
                 // before persisting local retry state so `RETRY_META_KEY` is never poisoned.
-                let probe_url = format!(
-                    "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
-                    self.pds_base(),
+                let probe_path = format!(
+                    "/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
                     chat_wire::urlencode_form_component(&self.account_did),
                     chat_wire::urlencode_form_component(
                         deletion_authority::DEVICE_REVOCATION_COLLECTION,
                     ),
                     chat_wire::urlencode_form_component(&own_device_id),
                 );
-                if let Ok(probe_resp) = self
-                    .http
-                    .get(&probe_url)
-                    .bearer_auth(&session_token)
-                    .send()
-                    .await
-                {
-                    if probe_resp.status().as_u16() == 200 {
-                        if let Ok(bytes) = probe_resp.bytes().await {
-                            if serde_json::from_slice::<Value>(&bytes)
-                                .ok()
-                                .and_then(|v| v.get("value").cloned())
-                                .is_some()
-                            {
-                                return Err(MLSError::InvalidState(format!(
-                                    "EnrollmentPdsRecordConflict:{}/{own_device_id}",
-                                    deletion_authority::DEVICE_REVOCATION_COLLECTION
-                                )));
-                            }
-                        }
+                if let Ok((200, _, bytes)) = self.pds_get(&session_token, &probe_path).await {
+                    if serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .and_then(|v| v.get("value").cloned())
+                        .is_some()
+                    {
+                        return Err(MLSError::InvalidState(format!(
+                            "EnrollmentPdsRecordConflict:{}/{own_device_id}",
+                            deletion_authority::DEVICE_REVOCATION_COLLECTION
+                        )));
                     }
                 }
                 let mut op_id = [0u8; 16];
@@ -3912,6 +3913,7 @@ impl WasmMlsClient {
             home_ds_endpoint: self.home_ds_endpoint.clone(),
             pds_endpoint: self.pds_endpoint.clone(),
             auth_token: self.auth_token.clone(),
+            petrel_auth: self.petrel_auth.clone(),
             http: self.http.clone(),
             db: self
                 .db
@@ -3921,4 +3923,21 @@ impl WasmMlsClient {
             pending_otc_offer_digits: RefCell::new(None),
         }
     }
+}
+
+/// Split a Space attachment locator into `(spaceURI, repoDID, cid)`.
+///
+/// Accepts both shapes Catbird iOS reads (`MLSSpaceBlobLocator.parse`):
+/// `"{spaceURI}|{repoDID}|{cid}"` and `"{spaceURI}/{repoDID}#{cid}"`.
+pub(crate) fn split_attachment_locator(locator: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = locator.trim();
+    if trimmed.contains('|') {
+        let mut parts = trimmed.splitn(3, '|');
+        let (space, repo, cid) = (parts.next()?, parts.next()?, parts.next()?);
+        return (!space.trim().is_empty() && !repo.trim().is_empty() && !cid.trim().is_empty())
+            .then_some((space, repo, cid));
+    }
+    let (before_hash, cid) = trimmed.split_once('#')?;
+    let (space, repo) = before_hash.rsplit_once('/')?;
+    (!space.is_empty() && !repo.is_empty() && !cid.is_empty()).then_some((space, repo, cid))
 }
